@@ -112,7 +112,9 @@ public:
   virtual int reuse() override;
   int adjust_cell_size();
   void after_process() override;
-  int try_extract_query_range(bool &has_extract, ObIArray<ObNewRange> &ranges) override;
+  int try_extract_query_range(bool &has_extract, ObIArray<ObNewRange> &ranges,
+                              bool need_deep_copy = false,
+                              common::ObIAllocator *allocator = nullptr) override;
   inline int init_query_range_info(const ObPxQueryRangeInfo &query_range_info)
   {
     return query_range_info_.assign(query_range_info);
@@ -285,10 +287,20 @@ public:
       const ObExpr *calc_tablet_id_expr,
       ObEvalCtx &eval_ctx,
       uint64_t *batch_hash_values) override final;
+
+  int insert_by_row_vector_without_calc_hash_value(
+      const ObBatchRows *child_brs,
+      const common::ObIArray<ObExpr *> &expr_array,
+      const common::ObHashFuncs &hash_funcs,
+      ObEvalCtx &eval_ctx,
+      uint64_t *batch_hash_values);
+
   virtual int reuse() override;
   void check_finish_receive() override final;
   void after_process() override;
-  int try_extract_query_range(bool &has_extract, ObIArray<ObNewRange> &ranges) override;
+  int try_extract_query_range(bool &has_extract, ObIArray<ObNewRange> &ranges,
+                              bool need_deep_copy = false,
+                              common::ObIAllocator *allocator = nullptr) override;
   inline int init_query_range_info(const ObPxQueryRangeInfo &query_range_info)
   {
     return query_range_info_.assign(query_range_info);
@@ -296,6 +308,9 @@ public:
   int prepare_storage_white_filter_data(ObDynamicFilterExecutor &dynamic_filter,
                                         ObEvalCtx &eval_ctx, ObRuntimeFilterParams &params,
                                         bool &is_data_prepared) override;
+
+  inline void set_use_hash_join_seed(bool value) { use_hash_join_seed_ = value; }
+  inline bool use_hash_join_seed() const { return use_hash_join_seed_; }
 
 private:
   // for merge
@@ -306,18 +321,14 @@ private:
   int try_insert_node(ObRFInFilterNode &node, const common::ObIArray<ObExpr *> &exprs,
       ObEvalCtx &ctx);
   int try_merge_node(ObRFInFilterNode &node, int64_t row_size);
-  int do_might_contain_batch(const ObExpr &expr,
-      ObEvalCtx &ctx,
-      const ObBitVector &skip,
-      const int64_t batch_size,
-      ObExprJoinFilter::ObExprJoinFilterContext &filter_ctx);
-  int do_might_contain_vector(
-      const ObExpr &expr,
-      ObEvalCtx &ctx,
-      const ObBitVector &skip,
-      const EvalBound &bound,
-      ObExprJoinFilter::ObExprJoinFilterContext &filter_ctx);
 
+  int do_insert_by_row_vector(const ObBatchRows *child_brs,
+                              const common::ObIArray<ObExpr *> &expr_array,
+                              const common::ObHashFuncs &hash_funcs, ObEvalCtx &eval_ctx,
+                              uint64_t *batch_hash_values, bool need_calc_hash_values = true);
+  int do_might_contain_batch(const ObExpr &expr, ObEvalCtx &ctx, const ObBitVector &skip,
+                             const int64_t batch_size,
+                             ObExprJoinFilter::ObExprJoinFilterContext &filter_ctx);
   template <typename ResVec>
   int do_might_contain_vector_impl(const ObExpr &expr, ObEvalCtx &ctx, const ObBitVector &skip,
                                    const EvalBound &bound,
@@ -356,7 +367,13 @@ public:
   bool is_query_range_ready_;             // not need to serialize
   common::ObArenaAllocator query_range_allocator_;
   // ---end---
-  ObSmallHashSet<false> sm_hash_set_;
+  ObSmallHashSet<true> sm_hash_set_;
+  bool use_hash_join_seed_ {false};
+
+  // if enable
+  // 1. only insert hash value if can't extract query range
+  // 2. insert hash value and data if can extract query range
+  bool build_send_opt_{false};
 };
 
 

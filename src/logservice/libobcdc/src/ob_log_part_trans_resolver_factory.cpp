@@ -16,7 +16,6 @@
 
 #include "ob_log_part_trans_resolver_factory.h"
 
-#include "lib/allocator/ob_mod_define.h"            // ObNewModIds
 #include "storage/tx/ob_trans_define.h"    // MAX_ELR_TRANS_INTERVAL
 
 
@@ -122,8 +121,9 @@ bool ObLogPartTransResolverFactory::TransInfoClearerByCheckpoint::operator()(con
 
   if (need_purge) {
 		purge_count_++;
+    ObCStringHelper helper;
     _LOG_DEBUG("[STAT] [TRANS_COMMIT_INFO] [PURGE] PART_TRANS_ID=%s CHECKPOINT=%ld/%ld(%ld) DELTA=%ld/%ld",
-        to_cstring(key), log_ts, checkpoint_, log_lsn.val_,
+        helper.convert(key), log_ts, checkpoint_, log_lsn.val_,
         checkpoint_ - log_ts, transaction::MAX_ELR_TRANS_INTERVAL);
   }
 

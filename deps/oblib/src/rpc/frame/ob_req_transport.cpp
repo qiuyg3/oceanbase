@@ -12,20 +12,12 @@
 
 #define USING_LOG_PREFIX RPC_FRAME
 
-#include "rpc/frame/ob_req_transport.h"
 
-#include <byteswap.h>
-#include <arpa/inet.h>
+#include "ob_req_transport.h"
 #include "util/easy_mod_stat.h"
-#include "lib/ob_errno.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "lib/worker.h"
-#include "lib/net/ob_addr.h"
-#include "rpc/obrpc/ob_rpc_packet.h"
 #include "rpc/obrpc/ob_rpc_stat.h"
-#include "rpc/obrpc/ob_net_keepalive.h"
 #include "rpc/frame/ob_net_easy.h"
+#include "lib/stat/ob_diagnostic_info_guard.h"
 
 namespace easy
 {
@@ -97,6 +89,7 @@ int async_cb(easy_request_t *r)
 
       ret = OB_LIBEASY_ERROR;
     } else if (OB_FAIL(cb->decode(r->ipacket))) {
+      cb->set_error(ret);
       cb->on_invalid();
       LOG_WARN("decode failed", K(ret), K(pcode));
     } else if (OB_PACKET_CLUSTER_ID_NOT_MATCH == cb->get_rcode()) {

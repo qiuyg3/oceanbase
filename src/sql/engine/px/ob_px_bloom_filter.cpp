@@ -11,11 +11,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
-//#include <immintrin.h>
 #include "ob_px_bloom_filter.h"
-#include "lib/hash_func/murmur_hash.h"
-#include "lib/container/ob_se_array.h"
-#include "share/config/ob_server_config.h"
 #include "share/ob_rpc_share.h"
 #include "storage/blocksstable/encoding/ob_encoding_query_util.h"
 
@@ -104,7 +100,7 @@ int ObPxBloomFilter::init(int64_t data_length, ObIAllocator &allocator, int64_t 
       MEMSET(bits_array_, 0, bits_array_length_ * sizeof(int64_t));
       is_inited_ = true;
       LOG_TRACE("init px bloom filter", K(data_length_), K(bits_array_buf),
-                 K(bits_array_), K(hash_func_count_), K(simd_support));
+                 K(bits_array_), K_(bits_array_length), K(hash_func_count_), K(simd_support));
     }
   }
   return ret;
@@ -166,12 +162,28 @@ int ObPxBloomFilter::init(const ObPxBloomFilter *filter)
   }
   return ret;
 }
+
 void ObPxBloomFilter::reset_filter()
 {
   MEMSET(bits_array_, 0, bits_array_length_ * sizeof(int64_t));
   px_bf_recieve_count_ = 0;
   px_bf_recieve_size_ = 0;
 }
+
+void ObPxBloomFilter::reset_for_rescan()
+{
+  // all the member inited should be reset
+  data_length_ = 0;
+  max_bit_count_ = 0;
+  bits_count_ = 0;
+  fpp_ = 0;
+  hash_func_count_ = 0;
+  is_inited_ = false;
+  bits_array_length_ = 0;
+  bits_array_ = nullptr;
+  allocator_.reset();
+}
+
 // previous version bits_num = - data_length * ln(p) / (ln2)^2
 // close-to 2^n
 // blocked bloom filter: fpp = (1 - (1 - 1 / w) ^ x) ^ 4.  x = n / block_count
@@ -353,7 +365,7 @@ int ObPxBloomFilter::process_recieve_count(int64_t whole_expect_size, int64_t cu
     ATOMIC_AAF(&px_bf_recieve_count_, cur_buf_size);
     if (px_bf_recieve_count_ > px_bf_recieve_size_) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("fail to process recieve count", K(ret), K(px_bf_recieve_count_),
+      LOG_WARN("fail to process receive count", K(ret), K(px_bf_recieve_count_),
          K(px_bf_recieve_size_));
     }
   }
@@ -375,7 +387,7 @@ int ObPxBloomFilter::process_first_phase_recieve_count(int64_t whole_expect_size
     ATOMIC_INC(&px_bf_recieve_count_);
     if (px_bf_recieve_count_ > px_bf_recieve_size_) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("fail to process recieve count", K(ret), K(px_bf_recieve_count_),
+      LOG_WARN("fail to process receive count", K(ret), K(px_bf_recieve_count_),
          K(px_bf_recieve_size_));
     } else if (receive_count_array_.empty()) {
       ret = OB_ERR_UNEXPECTED;
@@ -866,13 +878,13 @@ int ObSendBloomFilterP::process_px_bloom_filter_data()
     } else if (!arg_.is_first_phase() &&
         OB_FAIL(filter->process_recieve_count(arg_.expect_bloom_filter_count_,
         arg_.current_bloom_filter_count_))) {
-      LOG_WARN("fail to process recieve count", K(ret));
+      LOG_WARN("fail to process receive count", K(ret));
     } else if (arg_.is_first_phase() && OB_FAIL(filter->process_first_phase_recieve_count(
         arg_.expect_bloom_filter_count_,
         arg_.expect_phase_count_,
         arg_.bloom_filter_.get_begin_idx(),
         phase_end))) {
-      LOG_WARN("fail to process recieve count", K(ret));
+      LOG_WARN("fail to process receive count", K(ret));
     }
   }
 

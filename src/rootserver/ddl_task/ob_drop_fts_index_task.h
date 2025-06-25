@@ -48,8 +48,10 @@ public:
       const ObFTSDDLChildTaskInfo &doc_rowkey,
       const ObFTSDDLChildTaskInfo &domain_index,
       const ObFTSDDLChildTaskInfo &fts_doc_word,
+      const ObString &ddl_stmt_str,
       const int64_t schema_version,
-      const int64_t consumer_group_id);
+      const int64_t consumer_group_id,
+      const int64_t target_object_id);
   int init(const ObDDLTaskRecord &task_record);
   virtual int process() override;
   virtual int serialize_params_to_message(
@@ -63,8 +65,6 @@ public:
       int64_t &pos) override;
   virtual int64_t get_serialize_param_size() const override;
 
-  virtual void flt_set_task_span_tag() const override;
-  virtual void flt_set_status_span_tag() const override;
   virtual int on_child_task_finish(const uint64_t child_task_key, const int ret_code) override { return OB_SUCCESS; }
 
   INHERIT_TO_STRING_KV("ObDDLTask", ObDDLTask, K_(rowkey_doc), K_(doc_rowkey), K_(domain_index), K_(fts_doc_word));
@@ -92,6 +92,12 @@ private:
   int succ();
   int fail();
   virtual int cleanup_impl() override;
+  virtual bool is_error_need_retry(const int ret_code) override
+  {
+    UNUSED(ret_code);
+    // we should always retry on drop index task
+    return task_status_ < share::ObDDLTaskStatus::WAIT_CHILD_TASK_FINISH;
+  }
   bool is_fts_task() const { return share::ObDDLType::DDL_DROP_FTS_INDEX == task_type_; }
 
 private:

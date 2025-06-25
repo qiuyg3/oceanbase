@@ -13,11 +13,10 @@
 #ifndef OB_STORAGE_BLOCKSSTABLE_DATUM_ROWKEY_H
 #define OB_STORAGE_BLOCKSSTABLE_DATUM_ROWKEY_H
 
-#include "ob_datum_row.h"
+#include "ob_storage_datum.h"
 #include "lib/utility/ob_print_kv.h"
 //to be removed
 #include "common/rowkey/ob_store_rowkey.h"
-#include "share/schema/ob_table_param.h"
 
 namespace oceanbase
 {
@@ -27,6 +26,7 @@ struct ObDatumRange;
 class ObRowkeyVector;
 struct ObDiscreteDatumRowkey;
 struct ObCommonDatumRowkey;
+struct ObDatumRow;
 
 struct ObDatumRowkey
 {
@@ -123,6 +123,10 @@ public:
   int convert_store_rowkey(const ObDatumRowkey &datum_rowkey,
                            const common::ObIArray<share::schema::ObColDesc> &col_descs,
                            common::ObStoreRowkey &rowkey);
+  int prepare_datum_rowkey(const ObDatumRow &datum_row,
+                           const int key_datum_cnt,
+                           const ObIArray<share::schema::ObColDesc> &col_descs,
+                           ObDatumRowkey &datum_rowkey);
   int reserve(const int64_t rowkey_cnt);
   OB_INLINE ObStorageDatum *get_datums() { return datum_buffer_.get_datums(); }
   OB_INLINE int64_t get_capacity() const { return datum_buffer_.get_capacity(); }
@@ -146,7 +150,6 @@ public:
   const ObDatumRowkey *get_rowkey() const { return rowkey_; }
   int compare(const ObDatumRowkeyWrapper &other, int &cmp) const { return rowkey_->compare(*(other.get_rowkey()), *datum_utils_, cmp); }
   const ObStorageDatum *get_ptr() const { return rowkey_->get_datum_ptr(); }
-  const char *repr() const { return to_cstring(rowkey_); }
   TO_STRING_KV(KPC_(rowkey), KPC_(datum_utils));
   const ObDatumRowkey *rowkey_;
   const ObStorageDatumUtils *datum_utils_;
@@ -175,6 +178,10 @@ public:
   {
     return checked_;
   }
+  inline bool is_row_duplicate() const
+  {
+    return is_row_duplicate_;
+  }
   inline bool is_row_bf_checked() const
   {
     return row_bf_checked_;
@@ -189,6 +196,10 @@ public:
   {
     row_lock_checked_ = 1;
   };
+  inline void mark_row_duplicate()
+  {
+    is_row_duplicate_ = 1;
+  }
   inline void mark_row_exist_checked()
   {
     row_exist_checked_ = 1;
@@ -216,14 +227,15 @@ public:
   }
   TO_STRING_KV(K_(row_mark), K_(rowkey));
 private:
-  union {
+  union { // FARM COMPAT WHITELIST
     struct {
       uint8_t row_lock_checked_  : 1;
       uint8_t row_exist_checked_ : 1;
       uint8_t row_bf_checked_    : 1;
       uint8_t skipped_this_time_ : 1;
       uint8_t checked_           : 1;
-      uint8_t reserved_          : 3;
+      uint8_t is_row_duplicate_  : 1;
+      uint8_t reserved_          : 2;
     };
     uint8_t row_mark_;
   };

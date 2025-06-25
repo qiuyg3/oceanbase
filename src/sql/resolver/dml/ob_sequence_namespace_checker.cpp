@@ -12,12 +12,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_sequence_namespace_checker.h"
-#include "lib/charset/ob_charset.h"
-#include "sql/resolver/dml/ob_dml_stmt.h"
-#include "sql/resolver/dml/ob_select_stmt.h"
-#include "sql/resolver/ob_resolver_define.h"
 #include "sql/resolver/ob_resolver_utils.h"
-#include "sql/resolver/ob_schema_checker.h"
 #include "sql/resolver/ob_stmt_resolver.h"
 
 namespace oceanbase
@@ -292,7 +287,8 @@ int ObSequenceNamespaceChecker::check_link_sequence_exists(const ObDbLinkSchema 
                                 sequence_name.length(), sequence_name.ptr()))) {
         LOG_WARN("append sql failed", K(ret), K(database_name), K(sequence_name));
       } else if (OB_FAIL(dblink_proxy->create_dblink_pool(param_ctx,
-                                                    dblink_schema->get_host_addr(),
+                                                    dblink_schema->get_host_name(),
+                                                    dblink_schema->get_host_port(),
                                                     dblink_schema->get_tenant_name(),
                                                     dblink_schema->get_user_name(),
                                                     dblink_schema->get_plain_password(),

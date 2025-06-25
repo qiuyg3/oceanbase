@@ -10,11 +10,7 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "share/config/ob_server_config.h"
-#include "share/ob_cluster_version.h"
-#include "share/ob_task_define.h"
-#include "lib/ob_define.h"
-#include "lib/string/ob_string.h"
+#include "ob_cluster_version.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 namespace oceanbase
 {
@@ -251,6 +247,20 @@ int ObClusterVersion::get_tenant_data_version(
     data_version = ATOMIC_LOAD(&cluster_version_);
   } else {
     ret = ODV_MGR.get(tenant_id, data_version);
+  }
+  return ret;
+}
+
+int ObClusterVersion::tenant_need_upgrade(
+    const uint64_t tenant_id,
+    bool &need_upgrade)
+{
+  int ret = OB_SUCCESS;
+  uint64_t data_version = 0;
+  if (OB_FAIL(get_tenant_data_version(tenant_id, data_version))) {
+    COMMON_LOG(WARN, "fail to get tenant data version", KR(ret), K(tenant_id));
+  } else {
+    need_upgrade = (data_version < DATA_CURRENT_VERSION);
   }
   return ret;
 }

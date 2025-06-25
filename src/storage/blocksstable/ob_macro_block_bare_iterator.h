@@ -50,11 +50,17 @@ public:
   int set_end_iter_idx(const bool is_start);
   int get_curr_start_row_offset(int64_t &row_offset);
   int get_next_micro_block_data(ObMicroBlockData &micro_block);
+  int get_next_micro_block_data_and_offset(ObMicroBlockData &micro_block, int64_t &offset);
+  int get_next_micro_block_desc(ObMicroBlockDesc &micro_block_desc,
+                                const ObDataStoreDesc &data_store_desc,
+                                ObIAllocator &allocator,
+                                const bool need_check_sum);
   int get_next_micro_block_desc(
       ObMicroBlockDesc &micro_block_desc,
       ObMicroIndexInfo &micro_index_info,
       ObIAllocator &rowkey_allocator);
   int get_macro_block_header(ObSSTableMacroBlockHeader &macro_header);
+  int get_macro_meta(ObDataMacroBlockMeta *&macro_meta, ObIAllocator &allocator);
   int get_micro_block_count(int64_t &micro_block_count);
   int get_index_block(ObMicroBlockData &micro_block, const bool force_deserialize, const bool is_macro_meta_block = false);
   int get_macro_meta_block(ObMicroBlockData &micro_block);
@@ -63,7 +69,7 @@ public:
   TO_STRING_KV(KP_(macro_block_buf), K_(macro_block_buf_size), K_(common_header),
       K_(macro_block_header), K_(begin_idx), K_(end_idx), K_(iter_idx), K_(read_pos),
       K_(need_deserialize), K_(is_inited));
-private:
+protected:
   int check_macro_block_data_integrity(const char *payload_buf, const int64_t payload_size);
   int locate_range(
       const ObDatumRange &range,
@@ -71,7 +77,7 @@ private:
       const bool is_left_border,
       const bool is_right_border);
   int set_reader(const ObRowStoreType store_type);
-private:
+protected:
   ObArenaAllocator allocator_;
   const char *macro_block_buf_;
   int64_t macro_block_buf_size_;

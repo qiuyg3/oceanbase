@@ -32,9 +32,12 @@ namespace common
                       uint64_t seed,                \
                       uint64_t &res
 
+typedef int (*HashFuncTypeForTc) (HASH_ARG_LIST);
+typedef int (*NullHashFuncTypeForTc) (uint64_t seed, uint64_t &res);
+
 template<VecValueTypeClass value_tc, typename HashMethod, bool hash_v2>
 struct VecTCHashCalc {
-  inline static int hash(HASH_ARG_LIST) {
+  OB_INLINE static int hash(HASH_ARG_LIST) {
     UNUSED(meta);
     res = HashMethod::hash(data, len, seed);
     return OB_SUCCESS;
@@ -43,10 +46,15 @@ struct VecTCHashCalc {
 
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_FIXED_DOUBLE, HashMethod, hash_v2> {
-  inline static int hash(HASH_ARG_LIST) {
-    const double *d_val = reinterpret_cast<const double *>(data);
+  OB_INLINE static int hash(HASH_ARG_LIST) {
+    double d_val = *reinterpret_cast<const double *>(data);
+    // zero distinguishes positive and negative zeros, formatted as positive zero to calculate
+    // hash value
+    if (d_val == 0.0) {
+      d_val = 0.0;
+    }
     char buf[OB_CAST_TO_VARCHAR_MAX_LENGTH] = {0};
-    int64_t length = ob_fcvt(*d_val, static_cast<int>(meta.get_scale()),
+    int64_t length = ob_fcvt(d_val, static_cast<int>(meta.get_scale()),
                              sizeof(buf) - 1, buf, NULL);
     res = HashMethod::hash(buf, static_cast<int32_t>(length), seed);
     return OB_SUCCESS;
@@ -55,7 +63,7 @@ struct VecTCHashCalc<VEC_TC_FIXED_DOUBLE, HashMethod, hash_v2> {
 
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_TIMESTAMP_TZ, HashMethod, hash_v2> {
-  inline static int hash(HASH_ARG_LIST) {
+  OB_INLINE static int hash(HASH_ARG_LIST) {
     if (hash_v2) {
       res = HashMethod::hash(data, len, seed);
     } else {
@@ -70,7 +78,7 @@ struct VecTCHashCalc<VEC_TC_TIMESTAMP_TZ, HashMethod, hash_v2> {
 
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_TIMESTAMP_TINY, HashMethod, hash_v2> {
-  inline static int hash(HASH_ARG_LIST) {
+  OB_INLINE static int hash(HASH_ARG_LIST) {
     if (hash_v2) {
       res = HashMethod::hash(data, len, seed);
     } else {
@@ -86,7 +94,7 @@ struct VecTCHashCalc<VEC_TC_TIMESTAMP_TINY, HashMethod, hash_v2> {
 template <VecValueTypeClass vec_tc, typename HashMethod, bool hash_v2>
 struct VecRealTCHashCalc
 {
-  inline static int hash(HASH_ARG_LIST)
+  OB_INLINE static int hash(HASH_ARG_LIST)
   {
     UNUSED(meta);
     using ValueType = RTCType<vec_tc>;
@@ -112,7 +120,7 @@ struct VecTCHashCalc<VEC_TC_DOUBLE, HashMethod, hash_v2>
 
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_INTERVAL_DS, HashMethod, hash_v2> {
-  inline static int hash(HASH_ARG_LIST) {
+  OB_INLINE static int hash(HASH_ARG_LIST) {
     if (hash_v2) {
       res = HashMethod::hash(data, len, seed);
     } else {
@@ -128,7 +136,7 @@ struct VecTCHashCalc<VEC_TC_INTERVAL_DS, HashMethod, hash_v2> {
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_ENUM_SET_INNER, HashMethod, hash_v2>
 {
-  inline static int hash(HASH_ARG_LIST)
+  OB_INLINE static int hash(HASH_ARG_LIST)
   {
     int ret = OB_SUCCESS;
     if (hash_v2) {
@@ -144,7 +152,7 @@ struct VecTCHashCalc<VEC_TC_ENUM_SET_INNER, HashMethod, hash_v2>
 
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_INTERVAL_YM, HashMethod, hash_v2> {
-  inline static int hash(HASH_ARG_LIST) {
+  OB_INLINE static int hash(HASH_ARG_LIST) {
     if (hash_v2) {
       res = HashMethod::hash(data, len, seed);
     } else {
@@ -157,7 +165,7 @@ struct VecTCHashCalc<VEC_TC_INTERVAL_YM, HashMethod, hash_v2> {
 
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_NUMBER, HashMethod, hash_v2> {
-  inline static int hash(HASH_ARG_LIST) {
+  OB_INLINE static int hash(HASH_ARG_LIST) {
     if (hash_v2) {
       res = HashMethod::hash(data, len, seed);
     } else {
@@ -174,7 +182,7 @@ struct VecTCHashCalc<VEC_TC_NUMBER, HashMethod, hash_v2> {
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_LOB, HashMethod, hash_v2>
 {
-  inline static int lob_locator_get_string(const char *data, int32_t data_len,
+  OB_INLINE static int lob_locator_get_string(const char *data, int32_t data_len,
                                            ObIAllocator &allocator, ObString &in_data)
   {
     int ret = OB_SUCCESS;
@@ -202,7 +210,7 @@ struct VecTCHashCalc<VEC_TC_LOB, HashMethod, hash_v2>
     }
     return ret;
   }
-  inline static int hash(HASH_ARG_LIST)
+  OB_INLINE static int hash(HASH_ARG_LIST)
   {
     int ret = OB_SUCCESS;
     if (hash_v2 && CS_TYPE_UTF8MB4_BIN == meta.get_collation_type()) {
@@ -217,7 +225,7 @@ struct VecTCHashCalc<VEC_TC_LOB, HashMethod, hash_v2>
           const uchar *key = reinterpret_cast<const uchar *>(char_data);
           const uchar *pos = key;
           int length = char_len;
-          key = skip_trailing_space(key, char_len, 0);
+          key = skip_trailing_space(&ob_charset_utf8mb4_bin, key, char_len);
           length = (int)(key - pos);
           res = HashMethod::hash((void*)pos, length, seed);
         }
@@ -256,7 +264,7 @@ struct VecTCHashCalc<VEC_TC_LOB, HashMethod, hash_v2>
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_GEO, HashMethod, hash_v2>
 {
-  inline static int hash(HASH_ARG_LIST)
+  OB_INLINE static int hash(HASH_ARG_LIST)
   {
     int ret = OB_SUCCESS;
     common::ObString wkb;
@@ -283,7 +291,7 @@ struct VecTCHashCalc<VEC_TC_GEO, HashMethod, hash_v2>
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_JSON, HashMethod, hash_v2>
 {
-  inline static int hash(HASH_ARG_LIST)
+  OB_INLINE static int hash(HASH_ARG_LIST)
   {
     int ret = OB_SUCCESS;
     ObString j_bin_str;
@@ -313,10 +321,55 @@ struct VecTCHashCalc<VEC_TC_JSON, HashMethod, hash_v2>
   }
 };
 
+extern int calc_collection_hash_val(const ObObjMeta &meta, const void *data, ObLength len, hash_algo hash_func, uint64_t seed, uint64_t &hash_val);
+extern int collection_compare(const ObObjMeta &l_meta, const ObObjMeta &r_meta,
+                              const void *l_v, const ObLength l_len,
+                              const void *r_v, const ObLength r_len,
+                              int &cmp_ret);
+template<typename HashMethod, bool hash_v2>
+struct VecTCHashCalc<VEC_TC_COLLECTION, HashMethod, hash_v2>
+{
+  OB_INLINE static int hash(HASH_ARG_LIST)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(calc_collection_hash_val(meta, data, len, HashMethod::is_varchar_hash ? HashMethod::hash : NULL, seed, res))) {
+      COMMON_LOG(WARN, "Lob: str iter init failed", K(ret));
+    }
+    return ret;
+  }
+};
+
+template<typename HashMethod, bool hash_v2>
+struct VecTCHashCalc<VEC_TC_ROARINGBITMAP, HashMethod, hash_v2>
+{
+  OB_INLINE static int hash(HASH_ARG_LIST)
+  {
+    int ret = OB_SUCCESS;
+    ObString bin_str;
+    res = 0;
+    const char *in_str = reinterpret_cast<const char *>(data);
+    ObLobLocatorV2 loc(in_str, false);
+    if (!loc.is_valid()) {
+      COMMON_LOG(WARN, "invalid lob", K(ret));
+    } else if (!loc.has_inrow_data()) {
+      COMMON_LOG(WARN, "meet outrow lob do calc hash value", K(loc));
+    } else if (OB_FAIL(loc.get_inrow_data(bin_str))) {
+      COMMON_LOG(WARN, "fail to get inrow data", K(ret), K(loc));
+    } else {
+      res = seed;
+      if (bin_str.length() > 0) {
+        res = ObCharset::hash(CS_TYPE_BINARY, bin_str.ptr(), bin_str.length(), seed, false,
+                              HashMethod::is_varchar_hash ? HashMethod::hash : NULL);
+      }
+    }
+    return ret;
+  }
+};
+
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_ROWID, HashMethod, hash_v2>
 {
-  inline static int hash(HASH_ARG_LIST)
+  OB_INLINE static int hash(HASH_ARG_LIST)
   {
     int ret = OB_SUCCESS;
     if (hash_v2) {
@@ -332,7 +385,7 @@ struct VecTCHashCalc<VEC_TC_ROWID, HashMethod, hash_v2>
 template<VecValueTypeClass vec_type, typename HashMethod, bool hash_v2,  typename hash_type>
 struct VecTCHashCalcWithHashType
 {
-  inline static int hash(HASH_ARG_LIST)
+  OB_INLINE static int hash(HASH_ARG_LIST)
   {
     if (hash_v2) {
       res = HashMethod::hash(data, len, seed);
@@ -374,12 +427,16 @@ template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_ENUM_SET, HashMethod, hash_v2>
   : public VecTCHashCalcWithHashType<VEC_TC_ENUM_SET, HashMethod, hash_v2, uint64_t> {};
 
+template <typename HashMethod, bool hash_v2>
+struct VecTCHashCalc<VEC_TC_MYSQL_DATE, HashMethod, hash_v2>
+  : public VecTCHashCalcWithHashType<VEC_TC_UINTEGER, HashMethod, hash_v2, int32_t> {};
+
 
 // string data hash
 
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_STRING, HashMethod, hash_v2> {
-  inline static int hash(HASH_ARG_LIST) {
+  OB_INLINE static int hash(HASH_ARG_LIST) {
     bool calc_end_space = meta.is_calc_end_space();
     if (hash_v2 && CS_TYPE_UTF8MB4_BIN == meta.get_collation_type()) {
       if (calc_end_space) {
@@ -388,7 +445,7 @@ struct VecTCHashCalc<VEC_TC_STRING, HashMethod, hash_v2> {
         const uchar *key = reinterpret_cast<const uchar *>(data);
         const uchar *pos = key;
         int length = len;
-        key = skip_trailing_space(key, len, 0);
+        key = skip_trailing_space(&ob_charset_utf8mb4_bin, key, len);
         length = (int)(key - pos);
         res = HashMethod::hash((void*)pos, length, seed);
       }
@@ -408,7 +465,7 @@ struct VecTCHashCalc<VEC_TC_RAW, HashMethod, hash_v2>
 
 template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_UDT, HashMethod, hash_v2> {
-  inline static int hash(HASH_ARG_LIST) {
+  OB_INLINE static int hash(HASH_ARG_LIST) {
     int ret = OB_SUCCESS;
     if (hash_v2 || meta.get_collation_type() != CS_TYPE_BINARY || meta.is_calc_end_space()) {
       ret = OB_ERR_UNEXPECTED;
@@ -434,7 +491,7 @@ struct VecTCHashCalc<VEC_TC_UDT, HashMethod, hash_v2> {
 template<VecValueTypeClass l_tc, VecValueTypeClass r_tc>
 struct VecTCCmpCalc {
   static const constexpr bool defined_ = false;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     int ret =  OB_NOT_IMPLEMENT;
     OB_ASSERT_MSG(false, "not implemented cmp func");
@@ -445,7 +502,7 @@ struct VecTCCmpCalc {
 template<VecValueTypeClass l_tc, VecValueTypeClass r_tc>
 struct BasicCmpCalc {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST) {
+  OB_INLINE static int cmp(CMP_ARG_LIST) {
     UNUSEDx(l_meta, r_meta);
     using LType = RTCType<l_tc>;
     using RType = RTCType<r_tc>;
@@ -469,12 +526,19 @@ struct VecTCCmpCalc<VEC_TC_DATE, VEC_TC_DATE>
   : public BasicCmpCalc<VEC_TC_DATE, VEC_TC_DATE> {};
 
 template<>
+struct VecTCCmpCalc<VEC_TC_MYSQL_DATE, VEC_TC_MYSQL_DATE>
+  : public BasicCmpCalc<VEC_TC_MYSQL_DATE, VEC_TC_MYSQL_DATE> {};
+template<>
 struct VecTCCmpCalc<VEC_TC_TIME, VEC_TC_TIME>
   : public BasicCmpCalc<VEC_TC_TIME, VEC_TC_TIME> {};
 
 template<>
 struct VecTCCmpCalc<VEC_TC_DATETIME, VEC_TC_DATETIME>
   : public BasicCmpCalc<VEC_TC_DATETIME, VEC_TC_DATETIME> {};
+
+template<>
+struct VecTCCmpCalc<VEC_TC_MYSQL_DATETIME, VEC_TC_MYSQL_DATETIME>
+  : public BasicCmpCalc<VEC_TC_MYSQL_DATETIME, VEC_TC_MYSQL_DATETIME> {};
 
 template<>
 struct VecTCCmpCalc<VEC_TC_YEAR, VEC_TC_YEAR>
@@ -516,7 +580,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_TIMESTAMP_TINY, VEC_TC_TIMESTAMP_TINY>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST) {
+  OB_INLINE static int cmp(CMP_ARG_LIST) {
     const ObOTimestampTinyData *l_tiny_data = reinterpret_cast<const ObOTimestampTinyData *>(l_v);
     const ObOTimestampTinyData *r_tiny_data = reinterpret_cast<const ObOTimestampTinyData *>(r_v);
 
@@ -537,7 +601,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_TIMESTAMP_TZ, VEC_TC_TIMESTAMP_TZ>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     const ObOTimestampData *l_data = reinterpret_cast<const ObOTimestampData *>(l_v);
     const ObOTimestampData *r_data = reinterpret_cast<const ObOTimestampData *>(r_v);
@@ -550,7 +614,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_INTERVAL_DS, VEC_TC_INTERVAL_DS>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     const ObIntervalDSValue *l_data = reinterpret_cast<const ObIntervalDSValue *>(l_v);
     const ObIntervalDSValue *r_data = reinterpret_cast<const ObIntervalDSValue *>(r_v);
@@ -564,7 +628,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_NUMBER, VEC_TC_NUMBER>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     const number::ObCompactNumber *l_data = reinterpret_cast<const number::ObCompactNumber *>(l_v);
     const number::ObCompactNumber *r_data = reinterpret_cast<const number::ObCompactNumber *>(r_v);
@@ -580,7 +644,7 @@ struct VecTCCmpCalc<VEC_TC_FLOAT, VEC_TC_FLOAT>
   static const constexpr bool defined_ = true;
   template<typename T>
   // copy from ObDatumTCCmp<ObFloatTC, ObFloatTC>
-  inline static int real_value_cmp(T l, T r, int &cmp_ret)
+  OB_INLINE static int real_value_cmp(T l, T r, int &cmp_ret)
   {
     cmp_ret = 0;
     // Note: For NaN, we can't use C language compare logic, which is not compatible
@@ -601,7 +665,7 @@ struct VecTCCmpCalc<VEC_TC_FLOAT, VEC_TC_FLOAT>
     }
     return OB_SUCCESS;
   }
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     return real_value_cmp<float>(*reinterpret_cast<const float *>(l_v),
                                  *reinterpret_cast<const float *>(r_v), cmp_ret);
@@ -612,7 +676,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_DOUBLE, VEC_TC_DOUBLE>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     return VecTCCmpCalc<VEC_TC_FLOAT, VEC_TC_FLOAT>::real_value_cmp(
       *reinterpret_cast<const double *>(l_v), *reinterpret_cast<const double *>(r_v), cmp_ret);
@@ -631,7 +695,7 @@ struct VecTCCmpCalc<VEC_TC_FIXED_DOUBLE, VEC_TC_FIXED_DOUBLE>
     1e016, 1e017, 1e018, 1e019, 1e020, 1e021, 1e022, 1e023,
     1e024, 1e025, 1e026, 1e027, 1e028, 1e029, 1e030, 1e031
   };
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     OB_ASSERT(l_meta.get_scale() == r_meta.get_scale());
     OB_ASSERT(l_meta.get_scale() <= OB_MAX_DOUBLE_FLOAT_SCALE);
@@ -662,7 +726,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_ROWID, VEC_TC_ROWID>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     const ObURowIDData l_data(l_len, reinterpret_cast<const uint8_t *>(l_v));
     const ObURowIDData r_data(r_len, reinterpret_cast<const uint8_t *>(r_v));
@@ -675,7 +739,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_JSON, VEC_TC_JSON>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     OB_ASSERT(l_meta.get_collation_type() == r_meta.get_collation_type());
     int ret = OB_SUCCESS;
@@ -722,7 +786,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_GEO, VEC_TC_GEO>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     int ret = OB_SUCCESS;
     cmp_ret = 0;
@@ -753,10 +817,24 @@ struct VecTCCmpCalc<VEC_TC_GEO, VEC_TC_GEO>
 };
 
 template<>
+struct VecTCCmpCalc<VEC_TC_COLLECTION, VEC_TC_COLLECTION>
+{
+  static const constexpr bool defined_ = true;
+  OB_INLINE static int cmp(CMP_ARG_LIST)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(collection_compare(l_meta, r_meta, l_v, l_len, r_v, r_len, cmp_ret))) {
+      COMMON_LOG(WARN, "collection compare failed ", K(ret));
+    }
+    return ret;
+  }
+};
+
+template<>
 struct VecTCCmpCalc<VEC_TC_EXTEND, VEC_TC_EXTEND>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     int64_t lv = *reinterpret_cast<const int64_t *>(l_v);
     int64_t rv = *reinterpret_cast<const int64_t *>(r_v);
@@ -772,7 +850,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_UDT, VEC_TC_UDT>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     cmp_ret = 0;
     int ret = OB_SUCCESS;
@@ -792,13 +870,24 @@ struct VecTCCmpCalc<VEC_TC_UDT, VEC_TC_UDT>
   }
 };
 
+template<>
+struct VecTCCmpCalc<VEC_TC_ROARINGBITMAP, VEC_TC_ROARINGBITMAP>
+{
+  static const constexpr bool defined_ = true;
+  inline static int cmp(CMP_ARG_LIST)
+  {
+    int ret = OB_SUCCESS;
+    // not used
+    return ret;
+  }
+};
 
 // null type comparison
 
 struct VecDummyCmpCalc
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     UNUSEDx(l_meta, r_meta, l_v, r_v, l_len, r_len);
     cmp_ret = 0;
@@ -826,7 +915,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_INTEGER, VEC_TC_UINTEGER>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     int64_t lv = *reinterpret_cast<const int64_t *>(l_v);
     uint64_t rv = *reinterpret_cast<const uint64_t *>(r_v);
@@ -839,7 +928,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_UINTEGER, VEC_TC_INTEGER>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     int ret = VecTCCmpCalc<VEC_TC_INTEGER, VEC_TC_UINTEGER>::cmp(r_meta, l_meta, r_v, r_len, l_v,
                                                                  l_len, cmp_ret);
@@ -874,7 +963,7 @@ template<VecValueTypeClass r_tc>
 struct VecTCCmpCalc<VEC_TC_EXTEND, r_tc>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     cmp_ret = (ObObj::MIN_OBJECT_VALUE == *reinterpret_cast<const int64_t *>(l_v)) ? -1 : 1;
     return OB_SUCCESS;
@@ -885,7 +974,7 @@ template<VecValueTypeClass l_tc>
 struct VecTCCmpCalc<l_tc, VEC_TC_EXTEND>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     cmp_ret = (ObObj::MIN_OBJECT_VALUE == *reinterpret_cast<const int64_t *>(r_v)) ? -1 : 1;
     return OB_SUCCESS;
@@ -897,7 +986,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_STRING, VEC_TC_STRING>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     OB_ASSERT(l_meta.get_collation_type() == r_meta.get_collation_type());
     bool end_with_space =
@@ -918,7 +1007,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_LOB, VEC_TC_LOB>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     OB_ASSERT(l_meta.get_collation_type() == r_meta.get_collation_type());
     int ret = OB_SUCCESS;
@@ -975,7 +1064,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_STRING, VEC_TC_LOB>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     OB_ASSERT(l_meta.get_collation_type() == r_meta.get_collation_type());
     int ret = OB_SUCCESS;
@@ -1012,7 +1101,7 @@ template<>
 struct VecTCCmpCalc<VEC_TC_LOB, VEC_TC_STRING>
 {
   static const constexpr bool defined_ = true;
-  inline static int cmp(CMP_ARG_LIST)
+  OB_INLINE static int cmp(CMP_ARG_LIST)
   {
     OB_ASSERT(l_meta.get_collation_type() == r_meta.get_collation_type());
     int ret =
@@ -1030,7 +1119,7 @@ struct VecTCCmpCalc<VEC_TC_LOB, VEC_TC_STRING>
   template <VecValueTypeClass vec_tc>
   struct VectorBasicOp {
   template<typename HashMethod, bool hash_v2>
-  inline static int null_hash(uint64_t seed, uint64_t &res) {
+  OB_INLINE static int null_hash(uint64_t seed, uint64_t &res) {
     res = seed;
     if (!hash_v2) {
       const int null_type = ObNullType;
@@ -1040,20 +1129,20 @@ struct VecTCCmpCalc<VEC_TC_LOB, VEC_TC_STRING>
   }
 
   template <typename HashMethod, bool hash_v2>
-  inline static int hash(const ObObjMeta &meta, const void *data, ObLength len, uint64_t seed,
+  OB_INLINE static int hash(const ObObjMeta &meta, const void *data, ObLength len, uint64_t seed,
                          uint64_t &res)
   {
     return VecTCHashCalc<vec_tc, HashMethod, hash_v2>::hash(meta, data, len, seed, res);
   }
 
-  inline static int cmp(const ObObjMeta &meta, const void *l_v,
+  OB_INLINE static int cmp(const ObObjMeta &meta, const void *l_v,
                         ObLength l_len, const void *r_v, ObLength r_len, int &cmp_ret)
   {
     return VecTCCmpCalc<vec_tc, vec_tc>::cmp(meta, meta, l_v, l_len, r_v, r_len, cmp_ret);
   }
 
   template <typename HashMethod>
-  inline static int hash_v2(const ObObjMeta &meta, const void *data, ObLength len, uint64_t seed,
+  OB_INLINE static int hash_v2(const ObObjMeta &meta, const void *data, ObLength len, uint64_t seed,
                             uint64_t &res)
   {
     res = HashMethod::hash(data, len, seed);
@@ -1061,6 +1150,11 @@ struct VecTCCmpCalc<VEC_TC_LOB, VEC_TC_STRING>
   }
 };
 
+#ifndef HashFuncTypeForTcFlag
+#define HashFuncTypeForTcFlag
+HashFuncTypeForTc get_hashfunc_by_tc(VecValueTypeClass tc) ;
+NullHashFuncTypeForTc get_null_hashfunc_by_tc(VecValueTypeClass tc);
+#endif // HashFuncTypeForTcFlag
 } // end namespace common
 } // end namespace oceanbase
 

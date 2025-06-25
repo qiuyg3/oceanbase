@@ -49,9 +49,8 @@ public:
 
   virtual int get_aggregate_result(
       const ObColumnCSDecoderCtx &ctx,
-      const int32_t *row_ids,
-      const int64_t row_cap,
-      storage::ObAggCell &agg_cell) const override;
+      const ObPushdownRowIdCtx &pd_row_id_ctx,
+      storage::ObAggCellBase &agg_cell) const override;
 
 private:
   static int nu_nn_operator(const ObIntegerColumnDecoderCtx &ctx,
@@ -112,7 +111,7 @@ private:
                                      const bool is_col_signed,
                                      const int64_t row_start,
                                      const int64_t row_count,
-                                     storage::ObAggCell &agg_cell);
+                                     storage::ObAggCellBase &agg_cell);
 
 };
 

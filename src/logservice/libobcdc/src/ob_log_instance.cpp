@@ -14,14 +14,14 @@
 
 #define USING_LOG_PREFIX OBLOG
 
-#include "ob_log_instance.h"
 
+#include "ob_log_instance.h"
 #include "lib/oblog/ob_log_module.h"        // LOG_ERROR
-#include "lib/file/file_directory_utils.h"  // FileDirectoryUtils
+#include "share/io/ob_io_manager.h"         // ObIOManager
+#include "share/ob_device_manager.h"        // ObDeviceManager
 #include "share/ob_version.h"               // build_version
 #include "share/system_variable/ob_system_variable.h" // ObPreProcessSysVars
 #include "share/ob_time_utility2.h"         // ObTimeUtility2
-#include "share/ob_get_compat_mode.h"
 #include "sql/ob_sql_init.h"                // init_sql_factories
 #include "observer/omt/ob_tenant_timezone_mgr.h"  // OTTZ_MGR
 #include "common/ob_clock_generator.h"
@@ -34,14 +34,11 @@
 #include "ob_log_sql_server_provider.h"   // ObLogSQLServerProvider (for cluster sync mode)
 #include "ob_cdc_tenant_sql_server_provider.h"  // ObCDCTenantSQLServerProvider(for cluster sync mode)
 #include "ob_cdc_tenant_endpoint_provider.h"    // ObCDCEndpointProvider (for tenant sync mode)
-#include "ob_log_schema_getter.h"         // ObLogSchemaGetter
 #include "ob_log_timezone_info_getter.h"  // ObCDCTimeZoneInfoGetter
 #include "ob_log_committer.h"             // ObLogCommitter
 #include "ob_log_formatter.h"             // ObLogFormatter
 #include "ob_cdc_lob_data_merger.h"       // ObCDCLobDataMerger
-#include "ob_log_batch_buffer.h"          // ObLogBatchBuffer
 #include "ob_log_storager.h"              // ObLogStorager
-#include "ob_log_reader.h"                // ObLogReader
 #include "ob_log_sequencer1.h"            // ObLogSequencer
 #include "ob_log_part_trans_parser.h"     // ObLogPartTransParser
 #include "ob_log_dml_parser.h"            // ObLogDmlParser
@@ -453,7 +450,8 @@ int ObLogInstance::init_logger_()
     _LOG_INFO("BUILD_VERSION: %s", build_version());
     _LOG_INFO("BUILD_TIME: %s %s", build_date(), build_time());
     _LOG_INFO("BUILD_FLAGS: %s%s", build_flags(), extra_flags);
-    _LOG_INFO("Copyright (c) 2022 Ant Group Co., Ltd.");
+    _LOG_INFO("BUILD_INFO: %s", build_info());
+    _LOG_INFO("Copyright (c) 2024 Ant Group Co., Ltd.");
     _LOG_INFO("======================================================");
     _LOG_INFO("\n");
   }
@@ -474,7 +472,8 @@ void ObLogInstance::print_version()
   MPRINT("REVISION: %s", build_version());
   MPRINT("BUILD_TIME: %s %s", build_date(), build_time());
   MPRINT("BUILD_FLAGS: %s%s\n", build_flags(), extra_flags);
-  MPRINT("Copyright (c) 2022 Ant Group Co., Ltd.");
+  MPRINT("BUILD_INFO: %s\n", build_info());
+  MPRINT("Copyright (c) 2024 Ant Group Co., Ltd.");
   MPRINT();
 }
 
@@ -581,6 +580,10 @@ int ObLogInstance::init_common_(uint64_t start_tstamp_ns, ERROR_CALLBACK err_cb)
       LOG_ERROR("dump_config_ fail", KR(ret));
     } else if (OB_FAIL(lib::ThreadPool::set_thread_count(DAEMON_THREAD_COUNT))) {
       LOG_ERROR("set ObLogInstance daemon thread count failed", KR(ret), K(DAEMON_THREAD_COUNT));
+    } else if (OB_FAIL(ObSimpleThreadPoolDynamicMgr::get_instance().init())) {
+      LOG_ERROR("init simple thread pool dynamic mgr failed", KR(ret));
+    } else if (OB_FAIL(ObTimerService::get_instance().start())) {
+      LOG_ERROR("start timer service failed", KR(ret));
     } else if (OB_FAIL(trans_task_pool_alloc_.init(
         TASK_POOL_ALLOCATOR_TOTAL_LIMIT,
         TASK_POOL_ALLOCATOR_HOLD_LIMIT,
@@ -770,6 +773,7 @@ int ObLogInstance::init_components_(const uint64_t start_tstamp_ns)
       : TCONF.tb_black_list.str();
 
   const bool enable_direct_load_inc = (1 == TCONF.enable_direct_load_inc);
+  const bool is_mock_fail_on_init = (0 != TCONF.test_mode_on && 0 != TCONF.test_mode_init_fail);
 
   if (OB_UNLIKELY(! is_working_mode_valid(working_mode))) {
     ret = OB_INVALID_CONFIG;
@@ -811,6 +815,22 @@ int ObLogInstance::init_components_(const uint64_t start_tstamp_ns)
     }
   }
 
+  // init io manager for operate io device directly in obcdc
+  const int64_t io_mgr_memory_limit = 200 * _M_;
+  if (OB_SUCC(ret) && is_direct_fetching_mode(fetching_mode_)) {
+    if (OB_FAIL(ObDeviceManager::get_instance().init_devices_env())) {
+      LOG_ERROR("init device manager failed", KR(ret));
+    } else if (ObIOManager::get_instance().is_inited()) {
+      // do nothing
+    }
+    // mini_mode will start 2 io scheduler threads, !mini_mode will start 16 io scheduler threads
+    else if (OB_FAIL(ObIOManager::get_instance().init(io_mgr_memory_limit))) {
+      LOG_ERROR("init io manager fail", KR(ret));
+    } else if (OB_FAIL(ObIOManager::get_instance().start())) {
+      LOG_ERROR("start io manager fail", KR(ret));
+    }
+  }
+
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(global_info_.init())) {
     LOG_ERROR("global_info_ init fail", KR(ret));
@@ -830,6 +850,8 @@ int ObLogInstance::init_components_(const uint64_t start_tstamp_ns)
     // init self addr
     } else if (OB_FAIL(init_self_addr_())) {
       LOG_ERROR("init self addr error", KR(ret));
+    } else if (OB_FAIL(global_poc_server.start_net_client(TCONF.io_thread_num))) {
+      LOG_ERROR("start net client failed", KR(ret));
     }
   }
 
@@ -1030,6 +1052,9 @@ int ObLogInstance::init_components_(const uint64_t start_tstamp_ns)
     LOG_ERROR("start_tenant_service_ failed", KR(ret));
   }
 
+  if (is_mock_fail_on_init) {
+    ret = OB_ERR_UNEXPECTED;
+  }
   if (OB_SUCC(ret)) {
     LOG_INFO("init all components done", KR(ret), K(start_tstamp_ns), K_(sys_start_schema_version),
         K(max_cached_trans_ctx_count), K_(is_schema_split_mode), K_(enable_filter_sys_tenant));
@@ -1385,6 +1410,7 @@ void ObLogInstance::destroy_components_()
   if (is_data_dict_refresh_mode(refresh_mode_)) {
     ObLogMetaDataService::get_instance().destroy();
   }
+  global_poc_server.destroy();
 
   LOG_INFO("destroy all components end");
 }
@@ -1440,6 +1466,12 @@ void ObLogInstance::do_destroy_(const bool force_destroy)
     ObKVGlobalCache::get_instance().destroy();
     ObMemoryDump::get_instance().destroy();
     ObClockGenerator::destroy();
+    if (OB_LIKELY(!ObTimerService::get_instance().is_stopped())) {
+      ObTimerService::get_instance().stop();
+      ObTimerService::get_instance().wait();
+    }
+    ObTimerService::get_instance().destroy();
+    ObSimpleThreadPoolDynamicMgr::get_instance().destroy();
 
     is_assign_log_dir_valid_ = false;
     MEMSET(assign_log_dir_, 0, sizeof(assign_log_dir_));
@@ -1544,6 +1576,10 @@ void ObLogInstance::do_stop_(const char *stop_reason)
     resource_collector_->stop();
     mysql_proxy_.stop();
     tenant_sql_proxy_.stop();
+    ObTimerService::get_instance().stop();
+    ObSimpleThreadPoolDynamicMgr::get_instance().stop();
+    ObTimerService::get_instance().wait();
+    ObSimpleThreadPoolDynamicMgr::get_instance().wait();
 
     // set global error code
     global_errno_ = (global_errno_ == OB_SUCCESS ? OB_IN_STOP_STATE : global_errno_);

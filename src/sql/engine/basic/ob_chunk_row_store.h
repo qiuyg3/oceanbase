@@ -20,7 +20,7 @@
 #include "lib/list/ob_dlist.h"
 #include "common/row/ob_row.h"
 #include "common/row/ob_row_iterator.h"
-#include "storage/blocksstable/ob_tmp_file.h"
+#include "storage/tmp_file/ob_tmp_file_manager.h"
 #include "sql/engine/basic/ob_sql_mem_callback.h"
 
 namespace oceanbase
@@ -354,7 +354,7 @@ public:
   virtual ~ObChunkRowStore() { reset(); }
 
   int init(int64_t mem_limit,
-      uint64_t tenant_id = common::OB_SERVER_TENANT_ID,
+      uint64_t tenant_id,
       int64_t mem_ctx_id = common::ObCtxIds::DEFAULT_CTX_ID,
       const char *label = common::ObModIds::OB_SQL_CHUNK_ROW_STORE,
       bool enable_dump = true,
@@ -494,7 +494,7 @@ private:
   int64_t dumped_row_cnt_;
 
   //int fd_;
-  blocksstable::ObTmpFileIOInfo io_;
+  tmp_file::ObTmpFileIOInfo io_;
   int64_t file_size_;
   int64_t n_block_in_file_;
 
@@ -535,7 +535,7 @@ inline int ObChunkRowStore::BlockBuffer::advance(int64_t size)
 class ObChunkStoreUtil
 {
 public:
-  static int alloc_dir_id(int64_t &dir_id);
+  static int alloc_dir_id(const uint64_t tenant_id, int64_t &dir_id);
 };
 
 } // end namespace sql

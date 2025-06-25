@@ -13,12 +13,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "ob_create_routine_resolver.h"
 #include "ob_create_routine_stmt.h"
-#include "sql/resolver/ob_resolver_utils.h"
-#include "pl/parser/parse_stmt_item_type.h"
 #include "pl/ob_pl_router.h"
-#include "pl/ob_pl_package.h"
-#include "pl/ob_pl_resolver.h"
-#include "share/schema/ob_trigger_info.h"
 #ifdef OB_BUILD_ORACLE_PL
 #include "pl/ob_pl_udt_object_manager.h"
 #endif
@@ -95,7 +90,7 @@ int ObCreateRoutineResolver::analyze_router_sql(obrpc::ObCreateRoutineArg *crt_r
   if (OB_SUCC(ret)) {
     pl::ObPLRouter router(routine_info, *session_info_, *schema_checker_->get_schema_guard(), *params_.sql_proxy_);
     ObString route_sql;
-    if (OB_FAIL(router.analyze(route_sql, crt_routine_arg->dependency_infos_, routine_info))) {
+    if (OB_FAIL(router.analyze(route_sql, crt_routine_arg->dependency_infos_, routine_info, crt_routine_arg))) {
       LOG_WARN("failed to analyze route sql", K(route_sql), K(ret));
     } else if (OB_FAIL(ObSQLUtils::convert_sql_text_to_schema_for_storing(
                          *allocator_, session_info_->get_dtc_params(), route_sql))) {
@@ -166,7 +161,7 @@ int ObCreateRoutineResolver::resolve_sp_definer(const ParseNode *parse_node,
                                                                          user_info))) {
             LOG_WARN("fail to get_user_info", K(ret));
           } else if (OB_ISNULL(user_info)) {
-            LOG_USER_WARN(OB_ERR_USER_NOT_EXIST);
+            LOG_USER_WARN(OB_ERR_USER_NOT_EXIST, user_name.length(), user_name.ptr());
             ObPL::insert_error_msg(OB_ERR_USER_NOT_EXIST);
             ret = OB_SUCCESS;
           }
@@ -244,6 +239,11 @@ int ObCreateRoutineResolver::collect_ref_obj_info(int64_t ref_obj_id, int64_t re
     OV (ObObjectType::INVALID != dep_obj_type);
     OZ (ObDependencyInfo::collect_dep_info(crt_routine_arg.dependency_infos_, dep_obj_type,
                                            ref_obj_id, ref_timestamp, dependent_type));
+    OZ (ob_add_ddl_dependency(ref_obj_id,
+                              ObSchemaObjVersion::get_schema_type(dependent_type),
+                              ref_timestamp,
+                              pl::get_tenant_id_by_object_id(ref_obj_id),
+                              crt_routine_arg));
   }
   return ret;
 }
@@ -510,6 +510,8 @@ int ObCreateRoutineResolver::resolve_param_type(const ParseNode *type_node,
               OZ (set_routine_param(access_idxs, routine_param));
             } else {
               ret = OB_ERR_TYPE_DECL_ILLEGAL;
+              LOG_USER_ERROR(OB_ERR_TYPE_DECL_ILLEGAL,
+                            access_idxs.at(access_idxs.count() - 1).var_name_.length(), access_idxs.at(access_idxs.count() - 1).var_name_.ptr());
               LOG_WARN("PLS-00206: %TYPE must be applied to a variable, column, field or attribute",
                       K(ret), K(access_idxs));
             }
@@ -518,6 +520,8 @@ int ObCreateRoutineResolver::resolve_param_type(const ParseNode *type_node,
             OZ (set_routine_param(access_idxs, routine_param));
           } else {
             ret = OB_ERR_WRONG_ROWTYPE;
+            LOG_USER_ERROR(OB_ERR_WRONG_ROWTYPE,
+                           access_idxs.at(access_idxs.count() - 1).var_name_.length(), access_idxs.at(access_idxs.count() - 1).var_name_.ptr());
             LOG_WARN("PLS-00310: with %ROWTYPE attribute, ident must name a table, cursor or cursor-variable",
                      K(ret), K(access_idxs));
           }
@@ -605,7 +609,9 @@ int ObCreateRoutineResolver::resolve_param_type(const ParseNode *type_node,
       }
     } else { // Basic Type
       ObPLDataType data_type;
+      pl::ObPLEnumSetCtx enum_set_ctx(*allocator_);
       data_type.reset();
+      OX (data_type.set_enum_set_ctx(&enum_set_ctx));
       OZ (ObPLResolver::resolve_sp_scalar_type(*allocator_,
                                                type_node,
                                                param_name,
@@ -622,8 +628,12 @@ int ObCreateRoutineResolver::resolve_param_type(const ParseNode *type_node,
                        "character set ANY_CS not supported in standalone function/procedure");
         LOG_WARN("character set ANY_CS not supported in standalone function/procedure", K(ret));
       }
+      common::ObIArray<common::ObString>* type_info = NULL;
       CK (OB_NOT_NULL(data_type.get_data_type()));
-      OZ (routine_param.set_extended_type_info(data_type.get_type_info()));
+      OZ (data_type.get_type_info(type_info));
+      if (OB_NOT_NULL(type_info)) {
+        OZ (routine_param.set_extended_type_info(*type_info));
+      }
       OX (routine_param.set_param_type(*(data_type.get_data_type())));
     }
   }
@@ -652,12 +662,14 @@ int ObCreateRoutineResolver::analyze_expr_type(ObRawExpr *&expr,
   return ret;
 }
 
-int ObCreateRoutineResolver::resolve_param_list(const ParseNode *param_list, ObRoutineInfo &routine_info)
+int ObCreateRoutineResolver::resolve_param_list(const ParseNode *param_list, obrpc::ObCreateRoutineArg &crt_routine_arg)
 {
   int ret = OB_SUCCESS;
   ObString param_name;
   ObRoutineParam routine_param;
   ObPLDataType data_type;
+  ObRoutineInfo &routine_info = crt_routine_arg.routine_info_;
+  ObPLDependencyTable deps;
   CK(OB_NOT_NULL(session_info_));
   if (OB_SUCC(ret) && param_list != NULL) {
     CK(OB_LIKELY(T_SP_PARAM_LIST == param_list->type_));
@@ -751,6 +763,8 @@ int ObCreateRoutineResolver::resolve_param_list(const ParseNode *param_list, ObR
             ObObjType src_type = ObMaxType;
             uint64_t src_type_id = OB_INVALID_ID;
             ObRoutineMatchInfo::MatchInfo match_info;
+            pl::ObPLEnumSetCtx enum_set_ctx(*params_.allocator_);
+            pl_type.set_enum_set_ctx(&enum_set_ctx);
             OZ (pl::ObPLDataType::transform_from_iparam(&(routine_param),
                                                         *(schema_checker_->get_schema_guard()),
                                                         *(session_info_),
@@ -761,7 +775,9 @@ int ObCreateRoutineResolver::resolve_param_list(const ParseNode *param_list, ObR
             OZ (pl::ObPLResolver::resolve_raw_expr(*(default_node->children_[0]),
                                                   params_,
                                                   default_expr,
-                                                  false /*for_writer*/));
+                                                  false /*for_writer*/,
+                                                  nullptr,
+                                                  &deps));
             CK (OB_NOT_NULL(default_expr));
             OZ (ObResolverUtils::get_type_and_type_id(default_expr, src_type, src_type_id));
             OZ (ObResolverUtils::check_type_match(
@@ -781,6 +797,12 @@ int ObCreateRoutineResolver::resolve_param_list(const ParseNode *param_list, ObR
       }
     }
   }
+  ObString dep_attr;
+  OZ (ObDependencyInfo::collect_dep_infos(deps,
+                                          crt_routine_arg.dependency_infos_,
+                                          routine_info.get_object_type(),
+                                          0, dep_attr, dep_attr));
+  OZ (ObDDLResolver::ob_add_ddl_dependency(deps, crt_routine_arg));
   return ret;
 }
 
@@ -799,9 +821,11 @@ int ObCreateRoutineResolver::resolve_clause_list(
     ObPLDataType ret_type;
     if (func_info.is_function()) {
       const ObRoutineParam *routine_param = NULL;
+      pl::ObPLEnumSetCtx enum_set_ctx(*(params_.allocator_));
       CK (OB_NOT_NULL(func_info.get_ret_info()));
       OX (routine_param = static_cast<const ObRoutineParam*>(func_info.get_ret_info()));
       CK (OB_NOT_NULL(routine_param));
+      OX (ret_type.set_enum_set_ctx(&enum_set_ctx));
       OZ (pl::ObPLDataType::transform_from_iparam(routine_param,
                                                   *schema_checker_->get_schema_guard(),
                                                   *session_info_,
@@ -1010,7 +1034,7 @@ int ObCreateRoutineResolver::resolve_impl(ObRoutineType routine_type,
   if (OB_SUCC(ret) && ROUTINE_FUNCTION_TYPE == routine_type) {
     OZ (resolve_ret_type(ret_node, crt_routine_arg->routine_info_));
   }
-  OZ (resolve_param_list(param_node, crt_routine_arg->routine_info_));
+  OZ (resolve_param_list(param_node, *crt_routine_arg));
   OZ (resolve_clause_list(clause_list, crt_routine_arg->routine_info_));
   CK (OB_NOT_NULL(body_node));
   if (OB_FAIL(ret)) {
@@ -1088,8 +1112,14 @@ int ObCreateRoutineResolver::resolve(const ParseNode &parse_tree,
 int ObCreateRoutineResolver::resolve(const ParseNode &parse_tree)
 {
   int ret = OB_SUCCESS;
-  obrpc::ObCreateRoutineArg *crt_routine_arg = NULL;
-  OZ (create_routine_arg(crt_routine_arg));
+  obrpc::ObCreateRoutineArg *crt_routine_arg = nullptr;
+  if (OB_NOT_NULL(get_basic_stmt())) {
+    // basic stmt would be set externally in alter routine
+    OX (crt_routine_arg = &(static_cast<ObCreateRoutineStmt *>(get_basic_stmt())->get_routine_arg()));
+    LOG_DEBUG("get basic stmt from alter routine");
+  } else {
+    OZ (create_routine_arg(crt_routine_arg));
+  }
   if (OB_SUCC(ret) && OB_ISNULL(crt_routine_arg)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("allocate memory for create routine stmt failed", K(ret));

@@ -11,9 +11,6 @@
  */
 
 #include "observer/virtual_table/ob_all_virtual_tx_lock_stat.h"
-#include "observer/ob_server.h"
-#include "storage/tx/ob_trans_service.h"
-#include "storage/tx_storage/ob_ls_map.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tx/ob_trans_part_ctx.h"
 
@@ -287,7 +284,7 @@ int ObGVTxLockStat::process_curr_tenant(ObNewRow *&row)
         break;
       case OB_APP_MIN_COLUMN_ID + 8:
         // session_id
-        cur_row_.cells_[i].set_int(tx_lock_stat.get_session_id());
+        cur_row_.cells_[i].set_int(tx_lock_stat.get_client_sid());
         break;
       case OB_APP_MIN_COLUMN_ID + 9:
         // proxy_session_id

@@ -11,10 +11,6 @@
  */
 
 #include "ob_multiple_get_merge.h"
-#include "storage/ob_row_fuse.h"
-#include "storage/ob_storage_schema.h"
-#include "storage/tx_storage/ob_ls_service.h"
-#include "storage/concurrency_control/ob_data_validation_service.h"
 
 namespace oceanbase
 {
@@ -206,6 +202,7 @@ int ObMultipleGetMerge::inner_get_next_row(ObDatumRow &row)
           STORAGE_LOG(WARN, "tmp_row is NULL", K(ret));
         } else {
           // fuse working row and result row
+          REALTIME_MONITOR_INC_READ_ROW_CNT(iters_[i], access_ctx_);
           if (!final_result) {
             if (OB_FAIL(ObRowFuse::fuse_row(*tmp_row, fuse_row, nop_pos_, final_result))) {
               STORAGE_LOG(WARN, "failed to merge rows", K(*tmp_row), K(row), K(ret));
@@ -217,7 +214,7 @@ int ObMultipleGetMerge::inner_get_next_row(ObDatumRow &row)
       }
       if (OB_SUCCESS == ret) {
         ++get_row_range_idx_;
-        if (fuse_row.row_flag_.is_exist_without_delete()) {
+        if (fuse_row.row_flag_.is_exist_without_delete() || (need_iter_del_row() && fuse_row.row_flag_.is_delete())) {
           if (get_row_range_idx_ > rowkeys_->count()) {
             ret = OB_ERR_UNEXPECTED;
             STORAGE_LOG(WARN, "unexptected range idx", K(ret), K(get_row_range_idx_), K(rowkeys_->count()));

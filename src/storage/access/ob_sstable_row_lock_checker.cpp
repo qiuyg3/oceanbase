@@ -12,8 +12,6 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_sstable_row_lock_checker.h"
-#include "storage/access/ob_rows_info.h"
-#include "storage/tx/ob_trans_define.h"
 using namespace oceanbase::common;
 using namespace oceanbase::share;
 using namespace oceanbase::blocksstable;
@@ -64,17 +62,20 @@ int ObSSTableRowLockChecker::inner_open(
 int ObSSTableRowLockChecker::init_micro_scanner()
 {
   int ret = OB_SUCCESS;
-  if (nullptr == micro_scanner_) {
-    if (nullptr == (micro_scanner_ = OB_NEWx(ObMicroBlockRowLockChecker,
-                                             access_ctx_->stmt_allocator_,
-                                             *access_ctx_->stmt_allocator_))) {
+  if (OB_LIKELY(nullptr == micro_data_scanner_)) {
+    if (nullptr == (micro_data_scanner_ = OB_NEWx(ObMicroBlockRowLockChecker,
+                                                  access_ctx_->stmt_allocator_,
+                                                  *access_ctx_->stmt_allocator_))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("Fail to allocate memory for micro block row scanner", K(ret));
-    } else if (OB_FAIL(micro_scanner_->init(*iter_param_, *access_ctx_, sstable_))) {
+    } else if (OB_FAIL(micro_data_scanner_->init(*iter_param_, *access_ctx_, sstable_))) {
       LOG_WARN("Fail to init micro scanner", K(ret), KP_(sstable));
     }
-  } else if (OB_FAIL(micro_scanner_->switch_context(*iter_param_, *access_ctx_, sstable_))) {
+  } else if (OB_FAIL(micro_data_scanner_->switch_context(*iter_param_, *access_ctx_, sstable_))) {
     LOG_WARN("Fail to switch micro scanner", K(ret), KP_(sstable));
+  }
+  if (OB_SUCC(ret)) {
+    micro_scanner_ = micro_data_scanner_;
   }
   return ret;
 }
@@ -82,8 +83,7 @@ int ObSSTableRowLockChecker::init_micro_scanner()
 int ObSSTableRowLockChecker::check_row_locked(
     const bool check_exist,
     const share::SCN &snapshot_version,
-    ObStoreRowLockState &lock_state,
-    ObRowState &row_state)
+    ObStoreRowLockState &lock_state)
 {
   int ret = OB_SUCCESS;
   const ObDatumRow *store_row = nullptr;
@@ -93,9 +93,8 @@ int ObSSTableRowLockChecker::check_row_locked(
   } else if (OB_FAIL(init_micro_scanner())) {
     LOG_WARN("Failed to init micro scanner", K(ret));
   } else {
-    auto *row_lock_checker = static_cast<ObMicroBlockRowLockChecker *>(micro_scanner_);
+    ObMicroBlockRowLockChecker *row_lock_checker = static_cast<ObMicroBlockRowLockChecker *>(micro_scanner_);
     row_lock_checker->set_lock_state(&lock_state);
-    row_lock_checker->set_row_state(&row_state);
     row_lock_checker->set_snapshot_version(snapshot_version);
     row_lock_checker->set_check_exist(check_exist);
     if (OB_FAIL(ObSSTableRowScanner::inner_get_next_row(store_row))) {
@@ -108,11 +107,10 @@ int ObSSTableRowLockChecker::check_row_locked(
   }
   if (OB_SUCC(ret) &&
       transaction::ObTransVersion::INVALID_TRANS_VERSION != prefetcher_.row_lock_check_version_) {
-    if (OB_UNLIKELY(lock_state.trans_version_ != SCN::min_scn() || lock_state.is_locked_)) {
+    if (OB_UNLIKELY(lock_state.is_row_decided())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("Unexpected lock state", K(ret), K_(lock_state.trans_version), K_(lock_state.is_locked));
-    } else if (row_state.max_trans_version_.get_val_for_tx() < prefetcher_.row_lock_check_version_
-               && OB_FAIL(row_state.max_trans_version_.convert_for_tx(prefetcher_.row_lock_check_version_))) {
+    } else if (OB_FAIL(lock_state.trans_version_.convert_for_tx(prefetcher_.row_lock_check_version_))) {
       LOG_WARN("failed to convert_for_tx", K(ret), K(prefetcher_.row_lock_check_version_));
     } else {/*do nothing*/}
   }
@@ -192,7 +190,7 @@ int ObSSTableRowLockMultiChecker::fetch_row(
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
           LOG_WARN("Failed to get next row", K(ret));
         } else if (prefetcher_.cur_micro_data_fetch_idx_ >= read_handle.micro_end_idx_) {
-          multi_checker->inc_empty_read();
+          multi_checker->inc_empty_read(read_handle);
           ret = OB_ITER_END;
         } else if (FALSE_IT(++prefetcher_.cur_micro_data_fetch_idx_)) {
         } else if (OB_FAIL(open_cur_data_block(read_handle))) {
@@ -211,17 +209,20 @@ int ObSSTableRowLockMultiChecker::fetch_row(
 int ObSSTableRowLockMultiChecker::init_micro_scanner()
 {
   int ret = OB_SUCCESS;
-  if (OB_LIKELY(nullptr == micro_scanner_)) {
-    if (nullptr == (micro_scanner_ = OB_NEWx(ObMicroBlockRowLockMultiChecker,
-                                              access_ctx_->stmt_allocator_,
-                                              *access_ctx_->stmt_allocator_))) {
+  if (OB_LIKELY(nullptr == micro_data_scanner_)) {
+    if (nullptr == (micro_data_scanner_ = OB_NEWx(ObMicroBlockRowLockMultiChecker,
+                                                  access_ctx_->stmt_allocator_,
+                                                  *access_ctx_->stmt_allocator_))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("Fail to allocate memory for micro block row scanner", K(ret));
-    } else if (OB_FAIL(micro_scanner_->init(*iter_param_, *access_ctx_, sstable_))) {
+    } else if (OB_FAIL(micro_data_scanner_->init(*iter_param_, *access_ctx_, sstable_))) {
       LOG_WARN("Fail to init micro scanner", K(ret), KP_(sstable));
     }
-  } else if (OB_FAIL(micro_scanner_->switch_context(*iter_param_, *access_ctx_, sstable_))) {
+  } else if (OB_FAIL(micro_data_scanner_->switch_context(*iter_param_, *access_ctx_, sstable_))) {
     LOG_WARN("Fail to switch micro scanner", K(ret), KP_(sstable));
+  }
+  if (OB_SUCC(ret)) {
+    micro_scanner_ = micro_data_scanner_;
   }
   return ret;
 }
@@ -236,7 +237,7 @@ int ObSSTableRowLockMultiChecker::open_cur_data_block(ObSSTableReadHandle &read_
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Invalid argument", K(ret), K_(prefetcher), K(read_handle));
   } else {
-    micro_block_multi_checker->inc_empty_read();
+    micro_block_multi_checker->inc_empty_read(read_handle);
     micro_block_multi_checker->reuse();
     blocksstable::ObMicroIndexInfo &micro_info = prefetcher_.current_micro_info();
     ObMicroBlockDataHandle &micro_handle = prefetcher_.current_micro_handle();

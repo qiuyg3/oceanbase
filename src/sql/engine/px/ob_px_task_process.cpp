@@ -12,35 +12,21 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_px_task_process.h"
-#include "sql/engine/px/ob_px_util.h"
-#include "sql/engine/px/ob_px_dtl_msg.h"
-#include "sql/engine/px/ob_granule_iterator_op.h"
-#include "sql/dtl/ob_dtl_channel_group.h"
 #include "observer/ob_server.h"
-#include "sql/executor/ob_task_executor_ctx.h"
-#include "lib/stat/ob_session_stat.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/executor/ob_executor_rpc_processor.h"
 #include "sql/engine/px/ob_px_worker_stat.h"
-#include "sql/engine/px/ob_px_interruption.h"
-#include "share/rc/ob_context.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
 #include "sql/engine/px/exchange/ob_px_transmit_op.h"
-#include "sql/engine/px/exchange/ob_px_receive_op.h"
 #include "sql/engine/basic/ob_temp_table_insert_op.h"
 #include "sql/engine/basic/ob_temp_table_insert_vec_op.h"
-#include "sql/engine/dml/ob_table_insert_op.h"
 #include "sql/engine/join/ob_hash_join_op.h"
-#include "sql/engine/window_function/ob_window_function_op.h"
-#include "sql/engine/px/ob_px_basic_info.h"
 #include "sql/engine/pdml/static/ob_px_multi_part_insert_op.h"
 #include "sql/engine/join/ob_join_filter_op.h"
-#include "sql/engine/px/ob_granule_pump.h"
 #include "sql/engine/join/hash_join/ob_hash_join_vec_op.h"
 #include "sql/engine/basic/ob_select_into_op.h"
 #include "observer/mysql/obmp_base.h"
-#include "lib/alloc/ob_malloc_callback.h"
 #include "sql/engine/window_function/ob_window_function_vec_op.h"
+#include "sql/engine/direct_load/ob_table_direct_insert_op.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::share;
@@ -135,6 +121,7 @@ int ObPxTaskProcess::process()
   enqueue_timestamp_ = ObTimeUtility::current_time();
   process_timestamp_ = enqueue_timestamp_;
   ObExecRecord exec_record;
+  ObExecutingSqlStatRecord sqlstat_record;
   ObExecTimestamp exec_timestamp;
   ObWaitEventDesc max_wait_desc;
   ObWaitEventStat total_wait_desc;
@@ -154,10 +141,10 @@ int ObPxTaskProcess::process()
     const bool enable_perf_event = lib::is_diagnose_info_enabled();
     const bool enable_sql_audit =
         GCONF.enable_sql_audit && session->get_local_ob_enable_sql_audit();
+    const bool enable_sqlstat = session->is_sqlstat_enabled();
     ObAuditRecordData &audit_record = session->get_raw_audit_record();
     ObWorkerSessionGuard worker_session_guard(session);
     ObSQLSessionInfo::LockGuard lock_guard(session->get_query_lock());
-    ObSessionStatEstGuard stat_est_guard(session->get_effective_tenant_id(), session->get_sessid());
     session->set_current_trace_id(ObCurTraceId::get_trace_id());
     session->get_raw_audit_record().request_memory_used_ = 0;
     observer::ObProcessMallocCallback pmcb(0,
@@ -171,22 +158,33 @@ int ObPxTaskProcess::process()
     arg_.exec_ctx_->set_px_task_id(arg_.task_.get_task_id());
     arg_.exec_ctx_->set_px_sqc_id(arg_.task_.get_sqc_id());
     arg_.exec_ctx_->set_branch_id(arg_.task_.get_branch_id());
-    ObMaxWaitGuard max_wait_guard(enable_perf_event ? &max_wait_desc : NULL);
-    ObTotalWaitGuard total_wait_guard(enable_perf_event ? &total_wait_desc : NULL);
+    {
+      //统计等待事件的guard生命周期必须小于收集统计信息的逻辑，才能保证后续获取到的时间准确
+      ObMaxWaitGuard max_wait_guard(enable_perf_event ? &max_wait_desc : NULL);
+      ObTotalWaitGuard total_wait_guard(enable_perf_event ? &total_wait_desc : NULL);
+      ObDiagnosticInfo *di = ObLocalDiagnosticInfo::get();
+      if (OB_NOT_NULL(di)) {
+        session->set_ash_stat_value(di->get_ash_stat());
+      }
+      if (enable_perf_event) {
+        exec_record.record_start();
+      }
+      if (enable_sqlstat && OB_NOT_NULL(arg_.exec_ctx_->get_sql_ctx())) {
+        sqlstat_record.record_sqlstat_start_value();
+        sqlstat_record.set_is_in_retry(session->get_is_in_retry());
+        session->sql_sess_record_sql_stat_start_value(sqlstat_record);
+      }
 
-    if (enable_perf_event) {
-      exec_record.record_start();
+      //监控项统计开始
+      exec_start_timestamp_ = enqueue_timestamp_;
+
+      if (OB_FAIL(do_process())) {
+        LOG_WARN("failed to process", K(get_tenant_id()), K(ret), K(get_qc_id()), K(get_dfo_id()));
+      }
+
+      //监控项统计结束
+      exec_end_timestamp_ = ObTimeUtility::current_time();
     }
-
-    //监控项统计开始
-    exec_start_timestamp_ = enqueue_timestamp_;
-
-    if (OB_FAIL(do_process())) {
-      LOG_WARN("failed to process", K(get_tenant_id()), K(ret), K(get_qc_id()), K(get_dfo_id()));
-    }
-
-    //监控项统计结束
-    exec_end_timestamp_ = ObTimeUtility::current_time();
 
     // some statistics must be recorded for plan stat, even though sql audit disabled
     record_exec_timestamp(true, exec_timestamp);
@@ -201,6 +199,14 @@ int ObPxTaskProcess::process()
       audit_record.exec_record_ = exec_record;
       audit_record.update_event_stage_state();
     }
+    if (enable_sqlstat && OB_NOT_NULL(arg_.exec_ctx_->get_sql_ctx())) {
+      sqlstat_record.record_sqlstat_end_value();
+      ObPhysicalPlan *phy_plan = arg_.des_phy_plan_;
+      ObString sql = ObString::make_string("PX DFO EXECUTING");
+      sqlstat_record.set_is_plan_cache_hit(arg_.exec_ctx_->get_sql_ctx()->plan_cache_hit_);
+      sqlstat_record.move_to_sqlstat_cache(*session,
+                            sql, phy_plan, true/*is_px_remote_exec*/);
+    }
 
     if (enable_sql_audit) {
       if (OB_ISNULL(arg_.sqc_task_ptr_)){
@@ -210,6 +216,15 @@ int ObPxTaskProcess::process()
         arg_.sqc_task_ptr_->set_memstore_read_row_count(exec_record.get_memstore_read_row_count());
         arg_.sqc_task_ptr_->set_ssstore_read_row_count(exec_record.get_ssstore_read_row_count());
       }
+    }
+
+    if (enable_sqlstat && OB_NOT_NULL(arg_.exec_ctx_->get_sql_ctx())) {
+      sqlstat_record.record_sqlstat_end_value();
+      ObPhysicalPlan *phy_plan = arg_.des_phy_plan_;
+      ObString sql = ObString::make_string("");
+      sqlstat_record.set_is_plan_cache_hit(arg_.exec_ctx_->get_sql_ctx()->plan_cache_hit_);
+      sqlstat_record.move_to_sqlstat_cache(*session,
+                            sql, phy_plan, true/*is_px_remote_exec*/);
     }
 
     if (enable_sql_audit) {
@@ -279,6 +294,8 @@ int ObPxTaskProcess::execute(ObOpSpec &root_spec)
     int64_t batch_count = arg_.get_sqc_handler()->
       get_sqc_init_arg().sqc_.get_rescan_batch_params().get_count();
     bool need_fill_batch_info = false;
+    LOG_TRACE("trace run op spec root", K(&ctx), K(ctx.get_frames()),
+              K(batch_count), K(root_spec.get_id()), K(&(root->get_exec_ctx())));
     //  这里统一处理了 batch rescan 和非 batch rescan 的场景
     //  一般场景下，传入的参数是 batch_count = 0
     //  为了复用下面的循环代码,将batch_count 改为1, 但无需初始化rescan 参数
@@ -287,8 +304,6 @@ int ObPxTaskProcess::execute(ObOpSpec &root_spec)
     } else {
       need_fill_batch_info = true;
     }
-    LOG_TRACE("trace run op spec root", K(&ctx), K(ctx.get_frames()),
-              K(batch_count), K(need_fill_batch_info), K(root_spec.get_id()), K(&(root->get_exec_ctx())));
     CK(IS_PX_TRANSMIT(root_spec.get_type()));
     for (int i = 0; i < batch_count && OB_SUCC(ret); ++i) {
       if (need_fill_batch_info) {
@@ -408,6 +423,9 @@ int ObPxTaskProcess::do_process()
                   arg_.exec_ctx_->get_my_session()->get_effective_tenant_id(),
                   schema_guard_))) {
         LOG_WARN("fail to get schema guard", K(ret));
+      } else if (OB_FAIL(schema_guard_.get_schema_version(
+                 arg_.exec_ctx_->get_my_session()->get_effective_tenant_id(), arg_.task_.px_worker_execute_start_schema_version_))) {
+        LOG_WARN("get px worker start schema version failed", K(ret));
       } else {
         // 用于远端执行的虚拟表的参数的初始化
         ObVirtualTableCtx vt_ctx;
@@ -494,6 +512,9 @@ int ObPxTaskProcess::do_process()
 
   // Task 和 Sqc 在两个不同线程中时，task 需要和 sqc 通信
   if (NULL != arg_.sqc_task_ptr_) {
+    if (OB_FAIL(ret)) {
+      ObInterruptUtil::update_schema_error_code(arg_.exec_ctx_, ret, arg_.task_.px_worker_execute_start_schema_version_);
+    }
     arg_.sqc_task_ptr_->set_result(ret);
     if (OB_NOT_NULL(arg_.exec_ctx_)) {
       int das_retry_rc = DAS_CTX(*arg_.exec_ctx_).get_location_router().get_last_errno();
@@ -546,6 +567,25 @@ int ObPxTaskProcess::record_user_error_msg(int retcode)
         }
       }
     }
+    //append pl_exact_err_msg
+    CK (OB_NOT_NULL(arg_.exec_ctx_));
+    CK (OB_NOT_NULL(arg_.exec_ctx_->get_my_session()));
+    if (OB_SUCC(ret)) {
+      ObSqlString &pl_exact_err_msg = arg_.exec_ctx_->get_my_session()->get_pl_exact_err_msg();
+      if (pl_exact_err_msg.is_valid()) {
+        uint32_t curr_len = STRLEN(rcode.msg_);
+        if (curr_len == 0) {
+          if (retcode >= OB_MIN_RAISE_APPLICATION_ERROR
+              && retcode <= OB_MAX_RAISE_APPLICATION_ERROR) {
+            // do nothing ...
+          } else {
+            (void)snprintf(rcode.msg_, common::OB_MAX_ERROR_MSG_LEN, "%s", ob_errpkt_strerror(retcode, lib::is_oracle_mode()));
+          }
+        }
+        curr_len = STRLEN(rcode.msg_);
+        (void)snprintf(rcode.msg_ + curr_len, common::OB_MAX_ERROR_MSG_LEN - curr_len, "%s", pl_exact_err_msg.ptr());
+      }
+    }
   }
   return ret;
 }
@@ -582,6 +622,7 @@ int ObPxTaskProcess::record_tx_desc()
       transaction::ObTxDesc *&task_tx_desc = arg_.sqc_task_ptr_->get_tx_desc();
       task_tx_desc = cur_tx_desc;
       cur_tx_desc = NULL;
+      OZ (arg_.sqc_task_ptr_->get_tx_result().assign(cur_session->get_trans_result()));
     }
   }
   return ret;
@@ -827,7 +868,8 @@ int ObPxTaskProcess::OpPostparation::apply(ObExecContext &ctx, ObOpSpec &op)
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("input not found for op", "op_id", op.id_, K(ret));
       } else if (hj_spec.is_shared_ht_ && OB_SUCCESS != ret_) {
-        input->set_error_code(ret_);
+        // set error_code = OB_GOT_SIGNAL_ABORTING if this error code is used to interrupt other tasks.
+        input->set_error_code(OB_GOT_SIGNAL_ABORTING);
         LOG_TRACE("debug post apply info", K(ret_));
       } else {
         LOG_TRACE("debug post apply info", K(ret_));
@@ -844,7 +886,7 @@ int ObPxTaskProcess::OpPostparation::apply(ObExecContext &ctx, ObOpSpec &op)
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("input not found for op", "op_id", op.id_, K(ret));
       } else if (hj_spec.is_shared_ht_ && OB_SUCCESS != ret_) {
-        input->set_error_code(ret_);
+        input->set_error_code(OB_GOT_SIGNAL_ABORTING);
         LOG_TRACE("debug post apply info", K(ret_));
       } else {
         LOG_TRACE("debug post apply info", K(ret_));
@@ -861,7 +903,7 @@ int ObPxTaskProcess::OpPostparation::apply(ObExecContext &ctx, ObOpSpec &op)
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("input not found for op", "op_id", op.id_, K(ret));
       } else if (wf_spec.is_participator() && OB_SUCCESS != ret_) {
-        input->set_error_code(ret_);
+        input->set_error_code(OB_GOT_SIGNAL_ABORTING);
         LOG_TRACE("debug post apply info", K(ret_));
       } else {
         LOG_TRACE("debug post apply info", K(ret_));
@@ -878,7 +920,7 @@ int ObPxTaskProcess::OpPostparation::apply(ObExecContext &ctx, ObOpSpec &op)
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("input is null", K(ret));
       } else if (wf_spec.is_participator() && OB_SUCCESS != ret_) {
-        input->set_error_code(ret_);
+        input->set_error_code(OB_GOT_SIGNAL_ABORTING);
         LOG_TRACE("debug post apply info", K(ret_));
       } else {
         LOG_TRACE("debug post apply info", K(ret_));
@@ -890,6 +932,22 @@ int ObPxTaskProcess::OpPostparation::apply(ObExecContext &ctx, ObOpSpec &op)
       LOG_WARN("operator is NULL", K(ret), KP(kit));
     } else {
       ObPxMultiPartInsertOpInput *input = static_cast<ObPxMultiPartInsertOpInput *>(kit->input_);
+      if (OB_ISNULL(input)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("input not found for op", "op_id", op.id_, K(ret));
+      } else if (OB_SUCCESS != ret_) {
+        input->set_error_code(ret_);
+        LOG_TRACE("debug post apply info", K(ret_));
+      } else {
+        LOG_TRACE("debug post apply info", K(ret_));
+      }
+    }
+  } else if (PHY_TABLE_DIRECT_INSERT == op.get_type()) {
+    if (OB_ISNULL(kit->input_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("operator is NULL", K(ret), KP(kit));
+    } else {
+      ObTableDirectInsertOpInput *input = static_cast<ObTableDirectInsertOpInput *>(kit->input_);
       if (OB_ISNULL(input)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("input not found for op", "op_id", op.id_, K(ret));
@@ -913,6 +971,7 @@ int ObPxTaskProcess::OpPostparation::reset(ObOpSpec &op)
 
 uint64_t ObPxTaskProcess::get_session_id() const
 {
+  int ret = OB_SUCCESS;
   uint64_t session_id = 0;
   ObExecContext *exec_ctx = NULL;
   ObSQLSessionInfo *session = NULL;
@@ -921,7 +980,7 @@ uint64_t ObPxTaskProcess::get_session_id() const
   } else if (OB_ISNULL(session = exec_ctx->get_my_session())) {
     LOG_WARN_RET(OB_ERR_UNEXPECTED, "session is NULL", K(exec_ctx));
   } else {
-    session_id = session->get_sessid();
+    session_id = session->get_sid();
   }
   return session_id;
 }

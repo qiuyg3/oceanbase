@@ -13,11 +13,8 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_const_decoder.h"
-#include "ob_dict_decoder.h"
-#include "storage/blocksstable/ob_block_sstable_struct.h"
 #include "storage/access/ob_pushdown_aggregate.h"
 #include "ob_vector_decode_util.h"
-#include "ob_bit_stream.h"
 
 namespace oceanbase
 {
@@ -376,8 +373,14 @@ int ObConstDecoder::pushdown_operator(
         break;
       }
       case sql::WHITE_OP_IN: {
-        if (OB_FAIL(in_operator(col_ctx, filter, pd_filter_info, result_bitmap))) {
-          LOG_WARN("Failed on running IN pushed down operator", K(ret), K(col_ctx), K(filter));
+        if (filter.is_filter_dynamic_node()) {
+          if (OB_FAIL(in_operator<sql::ObDynamicFilterExecutor>(col_ctx, static_cast<const sql::ObDynamicFilterExecutor &>(filter), pd_filter_info, result_bitmap))) {
+            LOG_WARN("Failed on running IN pushed down operator", K(ret), K(col_ctx), K(filter));
+          }
+        } else {
+          if (OB_FAIL(in_operator<sql::ObWhiteFilterExecutor>(col_ctx, filter, pd_filter_info, result_bitmap))) {
+            LOG_WARN("Failed on running IN pushed down operator", K(ret), K(col_ctx), K(filter));
+          }
         }
         break;
       }
@@ -411,7 +414,7 @@ int ObConstDecoder::const_only_operator(
     } else if (OB_FAIL(decode_without_dict(col_ctx, const_datum))){
       LOG_WARN("Failed to decode const datum", K(ret), K(col_ctx));
     } else {
-      if (col_ctx.obj_meta_.is_fixed_len_char_type() && nullptr != col_ctx.col_param_) {
+      if (need_padding(filter.is_padding_mode(), col_ctx.obj_meta_)) {
         if (OB_FAIL(storage::pad_column(col_ctx.obj_meta_, col_ctx.col_param_->get_accuracy(),
                                         *col_ctx.allocator_, const_datum))) {
           LOG_WARN("Failed to pad column", K(ret));
@@ -487,7 +490,7 @@ int ObConstDecoder::const_only_operator(
             } else {
               bool is_existed = false;
               // Check const datum in hashset or not
-              if (OB_FAIL(filter.exist_in_datum_set(const_datum, is_existed))) {
+              if (OB_FAIL(filter.exist_in_set(const_datum, is_existed))) {
                 LOG_WARN("Failed to check datum in hashset", K(ret));
               } else if (is_existed) {
                 if (OB_FAIL(result_bitmap.bit_not())) {
@@ -587,9 +590,9 @@ int ObConstDecoder::comparison_operator(
       // Const value is null
     } else {
       // Const value is not null
-      ObDictDecoderIterator dict_iter = dict_decoder_.begin(&col_ctx, dict_meta_length);
+      ObDictDecoderIterator dict_iter = dict_decoder_.begin(&col_ctx, filter.is_padding_mode(), dict_meta_length);
       ObStorageDatum& const_datum = *(dict_iter + meta_header_->const_ref_);
-      if (col_ctx.obj_meta_.is_fixed_len_char_type() && nullptr != col_ctx.col_param_) {
+      if (need_padding(filter.is_padding_mode(), col_ctx.obj_meta_)) {
         if (OB_FAIL(storage::pad_column(col_ctx.obj_meta_, col_ctx.col_param_->get_accuracy(),
                                         *col_ctx.allocator_, const_datum))) {
           LOG_WARN("Failed to pad column", K(ret));
@@ -610,8 +613,8 @@ int ObConstDecoder::comparison_operator(
 
     if (OB_SUCC(ret)) {
       bool found = false;
-      ObDictDecoderIterator trav_it = dict_decoder_.begin(&col_ctx, dict_meta_length);
-      ObDictDecoderIterator end_it = dict_decoder_.end(&col_ctx, dict_meta_length);
+      ObDictDecoderIterator trav_it = dict_decoder_.begin(&col_ctx, filter.is_padding_mode(), dict_meta_length);
+      ObDictDecoderIterator end_it = dict_decoder_.end(&col_ctx, filter.is_padding_mode(), dict_meta_length);
       const int64_t ref_bitset_size = dict_count + 1;
       char ref_bitset_buf[sql::ObBitVector::memory_size(ref_bitset_size)];
       sql::ObBitVector *ref_bitset = sql::to_bit_vector(ref_bitset_buf);
@@ -677,9 +680,9 @@ int ObConstDecoder::bt_operator(
     int right_cmp_res = 0;
     if (meta_header_->const_ref_ == dict_count) {
     } else {
-      ObDictDecoderIterator dict_iter = dict_decoder_.begin(&col_ctx, dict_meta_length);
+      ObDictDecoderIterator dict_iter = dict_decoder_.begin(&col_ctx, filter.is_padding_mode(), dict_meta_length);
       ObStorageDatum& const_datum = *(dict_iter + meta_header_->const_ref_);
-      if (col_ctx.obj_meta_.is_fixed_len_char_type() && nullptr != col_ctx.col_param_) {
+      if (need_padding(filter.is_padding_mode(), col_ctx.obj_meta_)) {
         if (OB_FAIL(storage::pad_column(col_ctx.obj_meta_, col_ctx.col_param_->get_accuracy(),
                                         *col_ctx.allocator_, const_datum))) {
           LOG_WARN("Failed to pad column", K(ret));
@@ -701,8 +704,8 @@ int ObConstDecoder::bt_operator(
 
     if (OB_SUCC(ret)) {
       bool found = false;
-      ObDictDecoderIterator trav_it = dict_decoder_.begin(&col_ctx, dict_meta_length);
-      ObDictDecoderIterator end_it = dict_decoder_.end(&col_ctx, dict_meta_length);
+      ObDictDecoderIterator trav_it = dict_decoder_.begin(&col_ctx, filter.is_padding_mode(), dict_meta_length);
+      ObDictDecoderIterator end_it = dict_decoder_.end(&col_ctx, filter.is_padding_mode(), dict_meta_length);
       const int64_t ref_bitset_size = dict_count + 1;
       char ref_bitset_buf[sql::ObBitVector::memory_size(ref_bitset_size)];
       sql::ObBitVector *ref_bitset = sql::to_bit_vector(ref_bitset_buf);
@@ -746,9 +749,10 @@ int ObConstDecoder::bt_operator(
   return ret;
 }
 
+template <typename ObFilterExecutor>
 int ObConstDecoder::in_operator(
     const ObColumnDecoderCtx &col_ctx,
-    const sql::ObWhiteFilterExecutor &filter,
+    const ObFilterExecutor &filter,
     const sql::PushdownFilterInfo &pd_filter_info,
     ObBitmap &result_bitmap) const
 {
@@ -766,16 +770,16 @@ int ObConstDecoder::in_operator(
 
     if (meta_header_->const_ref_ == dict_count) {
     } else {
-      ObDictDecoderIterator dict_iter = dict_decoder_.begin(&col_ctx, dict_meta_length);
+      ObDictDecoderIterator dict_iter = dict_decoder_.begin(&col_ctx, filter.is_padding_mode(), dict_meta_length);
       ObStorageDatum& const_datum = *(dict_iter + meta_header_->const_ref_);
-      if (col_ctx.obj_meta_.is_fixed_len_char_type() && nullptr != col_ctx.col_param_) {
+      if (need_padding(filter.is_padding_mode(), col_ctx.obj_meta_)) {
         if (OB_FAIL(storage::pad_column(col_ctx.obj_meta_, col_ctx.col_param_->get_accuracy(),
                                         *col_ctx.allocator_, const_datum))) {
           LOG_WARN("Failed to pad column", K(ret));
         }
       }
       if (OB_FAIL(ret)) {
-      } else if (OB_FAIL(filter.exist_in_datum_set(const_datum, const_in_result_set))) {
+      } else if (OB_FAIL(filter.exist_in_set(const_datum, const_in_result_set))) {
         LOG_WARN("Failed to check whether const value is in set", K(ret));
       } else if (const_in_result_set) {
         if (OB_FAIL(result_bitmap.bit_not())) {
@@ -786,8 +790,8 @@ int ObConstDecoder::in_operator(
 
     if (OB_SUCC(ret)) {
       bool found = false;
-      ObDictDecoderIterator trav_it = dict_decoder_.begin(&col_ctx, dict_meta_length);
-      ObDictDecoderIterator end_it = dict_decoder_.end(&col_ctx, dict_meta_length);
+      ObDictDecoderIterator trav_it = dict_decoder_.begin(&col_ctx, filter.is_padding_mode(), dict_meta_length);
+      ObDictDecoderIterator end_it = dict_decoder_.end(&col_ctx, filter.is_padding_mode(), dict_meta_length);
       const int64_t ref_bitset_size = dict_count + 1;
       char ref_bitset_buf[sql::ObBitVector::memory_size(ref_bitset_size)];
       sql::ObBitVector *ref_bitset = sql::to_bit_vector(ref_bitset_buf);
@@ -800,7 +804,7 @@ int ObConstDecoder::in_operator(
                         || ((*trav_it).is_null() && lib::is_mysql_mode()))) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("There should not be null datum in dictionary", K(ret));
-        } else if (OB_FAIL(filter.exist_in_datum_set(*trav_it, cur_in_result_set))) {
+        } else if (OB_FAIL(filter.exist_in_set(*trav_it, cur_in_result_set))) {
           LOG_WARN("Failed to check wheter current value is in set", K(ret));
         } else if (!const_in_result_set == cur_in_result_set) {
           found = true;
@@ -967,7 +971,7 @@ int ObConstDecoder::get_distinct_count(int64_t &distinct_count) const
 int ObConstDecoder::read_distinct(
     const ObColumnDecoderCtx &ctx,
     const char **cell_datas,
-    storage::ObGroupByCell &group_by_cell) const
+    storage::ObGroupByCellBase &group_by_cell) const
 {
   int ret = OB_SUCCESS;
   if (0 == meta_header_->count_) {
@@ -997,7 +1001,7 @@ int ObConstDecoder::read_reference(
     const ObColumnDecoderCtx &ctx,
     const int32_t *row_ids,
     const int64_t row_cap,
-    storage::ObGroupByCell &group_by_cell) const
+    storage::ObGroupByCellBase &group_by_cell) const
 {
   UNUSED(ctx);
   int ret = OB_SUCCESS;

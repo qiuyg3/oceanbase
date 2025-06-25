@@ -11,9 +11,7 @@
  */
 
 #include "ob_compaction_suggestion.h"
-#include "ob_partition_merge_progress.h"
-#include "ob_compaction_diagnose.h"
-#include "ob_tablet_merge_ctx.h"
+#include "src/storage/tx_storage/ob_ls_map.h"
 
 namespace oceanbase
 {
@@ -59,7 +57,7 @@ int ObCompactionHistogramStat::add_value(const int64_t time, const bool failed)
 {
   int ret = OB_SUCCESS;
   int64_t index = ObCompactionHistogramBucketUtil::get_index(time);
-  if (ObCompactionHistogramBucketUtil::BUCKET_MAX_COUNT < index || 0 > index) {
+  if (OB_UNLIKELY(ObCompactionHistogramBucketUtil::BUCKET_MAX_COUNT < index || 0 > index)) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "get unexpected index", K(ret), K(index));
   } else {
@@ -250,7 +248,7 @@ void ObCompactionDagStatus::update_finish_cnt(
 int64_t ObCompactionDagStatus::get_cost_long_time(const int64_t prio)
 {
   int64_t ret_time = INT64_MAX;
-  if (0 < prio && COMPACTION_PRIORITY_MAX > prio) {
+  if (0 <= prio && COMPACTION_PRIORITY_MAX > prio) {
     ret_time = COST_LONG_TIME[prio];
   }
   return ret_time;
@@ -262,7 +260,7 @@ int64_t ObCompactionDagStatus::get_cost_long_time(const int64_t prio)
 const char *ObCompactionSuggestionMgr::ObCompactionSuggestionReasonStr[] =
 {
   "dag cnt is full",
-  "schedule slower than add",
+  "scheduling cannot keep up with the speed of adding",
   "dag cost long time"
 };
 
@@ -493,7 +491,7 @@ int64_t ObCompactionSuggestionMgr::calc_variance(
 
 // analyze success merge dag
 int ObCompactionSuggestionMgr::analyze_merge_info(
-    const ObSSTableMergeInfo &merge_info,
+    const ObSSTableMergeHistory &merge_history,
     const share::ObDagType::ObDagTypeEnum type,
     const int64_t cost_time)
 {
@@ -507,33 +505,36 @@ int ObCompactionSuggestionMgr::analyze_merge_info(
     int64_t *scan_row_array = nullptr;
     bool need_suggestion = false;
     const int64_t buf_len = OB_DIAGNOSE_INFO_LENGTH;
+    const ObMergeStaticInfo &static_info = merge_history.static_info_;
+    const ObMergeRunningInfo &running_info = merge_history.running_info_;
+    const ObMergeBlockInfo &block_info = merge_history.block_info_;
     if (ObCompactionDagStatus::get_cost_long_time(OB_DAG_TYPES[type].init_dag_prio_) <= cost_time) {
       ADD_COMPACTION_INFO_PARAM(buf, buf_len,
                 "reason", get_suggestion_reason(ObCompactionSuggestionReason::DAG_COST_LONGTIME));
-      if (TOO_MANY_FAILED_COUNT <= merge_info.retry_cnt_) {
+      if (TOO_MANY_FAILED_COUNT <= merge_history.diagnose_info_.retry_cnt_) {
         ADD_COMPACTION_INFO_PARAM(buf, buf_len,
-                "too many failed count", merge_info.retry_cnt_);
+                "too many failed count", merge_history.diagnose_info_.retry_cnt_);
       }
-      if (merge_info.incremental_row_count_ >= INC_ROW_CNT_PARAM) {
+      if (block_info.incremental_row_count_ >= INC_ROW_CNT_PARAM) {
         ADD_COMPACTION_INFO_PARAM(buf, buf_len,
-                "too many incremental row", merge_info.incremental_row_count_);
+                "too many incremental row", block_info.incremental_row_count_);
         need_suggestion = true;
       }
-      if (merge_info.macro_block_count_ >= SINGLE_PARTITION_MACRO_CNT_PARAM) {
+      if (block_info.macro_block_count_ >= SINGLE_PARTITION_MACRO_CNT_PARAM) {
         ADD_COMPACTION_INFO_PARAM(buf, buf_len,
-                "large single partition", merge_info.macro_block_count_);
+                "large single partition", block_info.macro_block_count_);
         need_suggestion = true;
       }
-      if (merge_info.macro_block_count_ >= MACRO_CNT_PARAM) {
+      if (block_info.macro_block_count_ >= MACRO_CNT_PARAM) {
         ADD_COMPACTION_INFO_PARAM(buf, buf_len,
-              "macro_block_count", merge_info.macro_block_count_,
-              "multiplexed_macro_count", merge_info.multiplexed_macro_block_count_,
-              "new_flush_data_rate", merge_info.new_flush_data_rate_,
-              "concurrent_cnt", merge_info.concurrent_cnt_);
+              "macro_block_count", block_info.macro_block_count_,
+              "multiplexed_macro_count", block_info.multiplexed_macro_block_count_,
+              "new_flush_data_rate", block_info.new_flush_data_rate_,
+              "concurrent_cnt", static_info.concurrent_cnt_);
         need_suggestion = true;
       }
-      if (1 != merge_info.concurrent_cnt_) { // parallel compaction
-        const ObParalleMergeInfo &paral_info = merge_info.parallel_merge_info_;
+      if (1 != static_info.concurrent_cnt_ && block_info.total_row_count_ >= ROW_COUNT_TO_CHECK_PARALLEL_EVEN) { // parallel compaction
+        const ObParalleMergeInfo &paral_info = running_info.parallel_merge_info_;
         const int64_t count = paral_info.info_[ObParalleMergeInfo::SCAN_UNITS].count_;
         if (0 < count) {
           const int64_t max_scan_row_cnt = paral_info.info_[ObParalleMergeInfo::SCAN_UNITS].max_value_;
@@ -555,12 +556,11 @@ int ObCompactionSuggestionMgr::analyze_merge_info(
     }
 
     if (strlen(buf) > 0) {
-      suggestion.merge_type_ = merge_info.merge_type_;
-      suggestion.tenant_id_ = merge_info.tenant_id_;
-      suggestion.ls_id_ = merge_info.ls_id_.id();
-      suggestion.tablet_id_ = merge_info.tablet_id_.id();
-      suggestion.merge_start_time_ = merge_info.merge_start_time_;
-      suggestion.merge_finish_time_ = merge_info.merge_finish_time_;
+      suggestion.merge_type_ = static_info.merge_type_;
+      suggestion.ls_id_ = static_info.ls_id_.id();
+      suggestion.tablet_id_ = static_info.tablet_id_.id();
+      suggestion.merge_start_time_ = running_info.merge_start_time_;
+      suggestion.merge_finish_time_ = running_info.merge_finish_time_;
       if (OB_FAIL(array_.add(suggestion))) {
         STORAGE_LOG(WARN, "failed to add suggestion", K(ret), K(suggestion));
       }

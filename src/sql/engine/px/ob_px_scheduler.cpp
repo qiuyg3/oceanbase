@@ -14,33 +14,10 @@
 
 #include "sql/engine/px/ob_px_scheduler.h"
 #include "sql/engine/px/ob_dfo_scheduler.h"
-#include "sql/engine/px/ob_dfo_mgr.h"
-#include "lib/random/ob_random.h"
-#include "share/ob_rpc_share.h"
-#include "share/schema/ob_part_mgr_util.h"
-#include "sql/ob_sql.h"
-#include "sql/engine/px/ob_px_util.h"
-#include "sql/dtl/ob_dtl_channel_group.h"
-#include "sql/dtl/ob_dtl_channel_loop.h"
-#include "sql/dtl/ob_dtl_msg_type.h"
-#include "sql/dtl/ob_dtl.h"
-#include "sql/dtl/ob_dtl_task.h"
-#include "sql/dtl/ob_op_metric.h"
-#include "sql/engine/ob_exec_context.h"
-#include "sql/engine/px/ob_px_dtl_msg.h"
-#include "sql/engine/px/ob_px_dtl_proc.h"
-#include "sql/engine/px/ob_px_util.h"
-#include "sql/engine/px/ob_px_interruption.h"
-#include "share/config/ob_server_config.h"
-#include "sql/engine/px/ob_px_sqc_async_proxy.h"
-#include "sql/engine/px/datahub/ob_dh_dtl_proc.h"
-#include "sql/engine/px/datahub/components/ob_dh_rollup_key.h"
 #include "sql/engine/px/datahub/components/ob_dh_winbuf.h"
-#include "sql/engine/px/datahub/components/ob_dh_sample.h"
-#include "sql/engine/px/ob_px_sqc_proxy.h"
-#include "storage/tx/ob_trans_service.h"
 #include "share/detect/ob_detect_manager_utils.h"
 #include "sql/engine/join/ob_join_filter_op.h"
+#include "src/sql/engine/px/datahub/components/ob_dh_join_filter_count_row.h"
 
 namespace oceanbase
 {
@@ -174,7 +151,8 @@ int ObPxMsgProc::on_sqc_init_msg(ObExecContext &ctx, const ObPxInitSqcResultMsg 
   } else {
     if (OB_SUCCESS != pkt.rc_) {
       ret = pkt.rc_;
-      ObPxErrorUtil::update_qc_error_code(coord_info_.first_error_code_, pkt.rc_, pkt.err_msg_);
+      ObPxErrorUtil::update_qc_error_code(coord_info_.first_error_code_,
+          pkt.rc_, pkt.err_msg_, sqc->get_exec_addr());
       LOG_WARN("fail init sqc, please check remote server log for details",
                "remote_server", sqc->get_exec_addr(), K(pkt), KP(ret));
     } else if (pkt.task_count_ <= 0) {
@@ -321,15 +299,21 @@ int ObPxMsgProc::process_sqc_finish_msg_once(ObExecContext &ctx, const ObPxFinis
     LOG_WARN("fail to merge feedback info", K(ret));
   } else if (OB_ISNULL(session->get_tx_desc())) {
   } else if (OB_FAIL(MTL(transaction::ObTransService*)
-                     ->add_tx_exec_result(*session->get_tx_desc(),
+                    ->add_tx_exec_result(*session->get_tx_desc(),
                                           pkt.get_trans_result()))) {
     LOG_WARN("fail merge result", K(ret),
              "packet_trans_result", pkt.get_trans_result(),
              "tx_desc", *session->get_tx_desc());
+  } else if (pkt.get_trans_result().get_touched_ls().count() > 0
+             && OB_FAIL(session->get_trans_result()
+                        .add_touched_ls(pkt.get_trans_result().get_touched_ls()))) {
+    LOG_WARN("fail add touched ls for tx", K(ret),
+             "touched_ls", pkt.get_trans_result().get_touched_ls());
   } else {
     LOG_TRACE("on_sqc_finish_msg trans_result",
               "packet_trans_result", pkt.get_trans_result(),
-              "tx_desc", *session->get_tx_desc());
+              "tx_desc", *session->get_tx_desc(),
+              "tx_result", session->get_trans_result());
   }
   if (OB_FAIL(ret)) {
   } else if (common::OB_INVALID_ID != pkt.temp_table_id_) {
@@ -410,7 +394,8 @@ int ObPxMsgProc::process_sqc_finish_msg_once(ObExecContext &ctx, const ObPxFinis
    * 发送这个finish消息的sqc（包括它的worker）其实已经结束了，需要将它
    * 但是因为出错了，后续的调度流程不需要继续了，后面流程会进行错误处理。
    */
-  ObPxErrorUtil::update_qc_error_code(coord_info_.first_error_code_, pkt.rc_, pkt.err_msg_);
+  ObPxErrorUtil::update_qc_error_code(coord_info_.first_error_code_,
+      pkt.rc_, pkt.err_msg_, sqc->get_exec_addr());
   if (OB_SUCC(ret)) {
     if (OB_FAIL(pkt.rc_)) {
       DAS_CTX(ctx).get_location_router().save_cur_exec_status(pkt.rc_);
@@ -530,6 +515,12 @@ int ObPxMsgProc::on_piece_msg(ObExecContext &ctx, const RDWinFuncPXPieceMsg &pkt
   return proc.on_piece_msg(coord_info_, ctx, pkt);
 }
 
+int ObPxMsgProc::on_piece_msg(ObExecContext &ctx, const ObJoinFilterCountRowPieceMsg &pkt)
+{
+  ObDhPieceMsgProc<ObJoinFilterCountRowPieceMsg> proc;
+  return proc.on_piece_msg(coord_info_, ctx, pkt);
+}
+
 int ObPxMsgProc::on_eof_row(ObExecContext &ctx)
 {
   int ret = OB_SUCCESS;
@@ -618,7 +609,8 @@ int ObPxTerminateMsgProc::on_sqc_init_msg(ObExecContext &ctx, const ObPxInitSqcR
     if (pkt.rc_ != OB_SUCCESS) {
       LOG_DEBUG("receive error code from sqc init msg", K(coord_info_.first_error_code_), K(pkt.rc_));
     }
-    ObPxErrorUtil::update_qc_error_code(coord_info_.first_error_code_, pkt.rc_, pkt.err_msg_);
+    ObPxErrorUtil::update_qc_error_code(coord_info_.first_error_code_,
+        pkt.rc_, pkt.err_msg_, sqc->get_exec_addr());
   }
 
   if (OB_SUCC(ret)) {
@@ -668,6 +660,11 @@ int ObPxTerminateMsgProc::on_sqc_finish_msg(ObExecContext &ctx, const ObPxFinish
     LOG_WARN("fail report tx result", K(ret),
              "packet_trans_result", pkt.get_trans_result(),
              "tx_desc", *session->get_tx_desc());
+  } else if (pkt.get_trans_result().get_touched_ls().count() > 0
+             && OB_FAIL(session->get_trans_result()
+                        .add_touched_ls(pkt.get_trans_result().get_touched_ls()))) {
+    LOG_WARN("fail add touched ls for tx", K(ret),
+             "touched_ls", pkt.get_trans_result().get_touched_ls());
   } else {
     LOG_TRACE("on_sqc_finish_msg trans_result",
               "packet_trans_result", pkt.get_trans_result(),
@@ -687,7 +684,8 @@ int ObPxTerminateMsgProc::on_sqc_finish_msg(ObExecContext &ctx, const ObPxFinish
     if (pkt.rc_ != OB_SUCCESS) {
       LOG_DEBUG("receive error code from sqc finish msg", K(coord_info_.first_error_code_), K(pkt.rc_));
     }
-    ObPxErrorUtil::update_qc_error_code(coord_info_.first_error_code_, pkt.rc_, pkt.err_msg_);
+    ObPxErrorUtil::update_qc_error_code(coord_info_.first_error_code_,
+        pkt.rc_, pkt.err_msg_, sqc->get_exec_addr());
 
     NG_TRACE_EXT(sqc_finish,
                  OB_ID(dfo_id), sqc->get_dfo_id(),

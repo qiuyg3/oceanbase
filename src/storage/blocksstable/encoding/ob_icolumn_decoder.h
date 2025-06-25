@@ -32,7 +32,7 @@ namespace oceanbase
 {
 namespace storage
 {
-class ObGroupByCell;
+class ObGroupByCellBase;
 }
 namespace blocksstable
 {
@@ -52,7 +52,7 @@ public:
 
 };
 
-struct ObColumnDecoderCtx : public ObBaseDecoderCtx
+struct ObColumnDecoderCtx final : public ObBaseDecoderCtx
 {
 public:
   ObColumnDecoderCtx()
@@ -64,7 +64,8 @@ public:
   OB_INLINE void fill(const common::ObObjMeta &obj_meta,
       const ObMicroBlockHeader *micro_header,
       const ObColumnHeader *col_header,
-      common::ObIAllocator *allocator)
+      common::ObIAllocator *allocator,
+      const int64_t store_idx)
   {
     obj_meta_ = obj_meta;
     micro_block_header_ = micro_header;
@@ -74,6 +75,14 @@ public:
     cache_attributes_[ObColumnHeader::FIX_LENGTH] = col_header_->is_fix_length();
     cache_attributes_[ObColumnHeader::HAS_EXTEND_VALUE] = col_header_->has_extend_value();
     cache_attributes_[ObColumnHeader::BIT_PACKING] = col_header_->is_bit_packing();
+    cache_attributes_[ObColumnHeader::IS_TRANS_VERSION] = micro_block_header_->is_trans_version_column_idx(store_idx);
+  }
+  // performance critical, do not check parameters
+  OB_INLINE void fill_for_new_column(const share::schema::ObColumnParam *col_param, common::ObIAllocator *allocator)
+  {
+    reset();
+    col_param_ = col_param;
+    allocator_ = allocator;
   }
   OB_INLINE bool is_fix_length() const { return cache_attributes_[ObColumnHeader::FIX_LENGTH]; }
   OB_INLINE bool has_extend_value() const { return cache_attributes_[ObColumnHeader::HAS_EXTEND_VALUE]; }
@@ -82,6 +91,8 @@ public:
   {
     col_param_ = col_param;
   }
+  OB_INLINE bool is_trans_version_col() const { return cache_attributes_[ObColumnHeader::IS_TRANS_VERSION]; }
+  OB_INLINE void reset() { MEMSET(this, 0, sizeof(ObColumnDecoderCtx)); }
 
   TO_STRING_KV(K_(obj_meta), K_(micro_block_header), K_(col_header), KP_(allocator),
       KP_(ref_decoder), KP_(ref_ctx));
@@ -104,7 +115,13 @@ struct ObVectorDecodeCtx
       const int64_t vec_offset,
       sql::VectorHeader &vec_header)
     : ptr_arr_(ptr_arr), len_arr_(len_arr), row_ids_(row_ids), row_cap_(row_cap),
-      vec_offset_(vec_offset), vec_header_(vec_header) {}
+      vec_offset_(vec_offset), vec_header_(vec_header),
+      default_datum_(nullptr) {}
+
+  OB_INLINE void set_default_datum(const ObStorageDatum &default_datum)
+  {
+    default_datum_ = &default_datum;
+  }
 
   bool is_valid() const
   {
@@ -124,7 +141,7 @@ struct ObVectorDecodeCtx
   VectorFormat get_format() const { return vec_header_.get_format(); }
   ObIVector *get_vector() { return vec_header_.get_vector(); }
 
-  TO_STRING_KV(KP_(ptr_arr), KP_(len_arr), KP_(row_ids), K_(row_cap), K_(vec_offset));
+  TO_STRING_KV(KP_(ptr_arr), KP_(len_arr), KP_(row_ids), K_(row_cap), K_(vec_offset), KPC_(default_datum));
 
   const char **ptr_arr_; // tmp mem buf as pointer array
   uint32_t *len_arr_; // tmp mem buf as 4-byte array
@@ -132,6 +149,7 @@ struct ObVectorDecodeCtx
   const int64_t row_cap_; // batch size / array size
   const int64_t vec_offset_; // vector start projection offset
   sql::VectorHeader &vec_header_; // result
+  const ObStorageDatum *default_datum_;  // default column
 };
 
 class ObIColumnDecoder
@@ -312,15 +330,22 @@ public:
   virtual int read_distinct(
       const ObColumnDecoderCtx &ctx,
       const char **cell_datas,
-      storage::ObGroupByCell &group_by_cell)  const
+      storage::ObGroupByCellBase &group_by_cell)  const
   { return OB_NOT_SUPPORTED; }
 
   virtual int read_reference(
       const ObColumnDecoderCtx &ctx,
       const int32_t *row_ids,
       const int64_t row_cap,
-      storage::ObGroupByCell &group_by_cell) const
+      storage::ObGroupByCellBase &group_by_cell) const
   { return OB_NOT_SUPPORTED; }
+
+  virtual bool is_new_column() const { return false; }
+
+  static bool need_padding(const bool is_padding_mode, const ObObjMeta &obj_meta)
+  {
+    return is_padding_mode && obj_meta.is_fixed_len_char_type();
+  }
 
 protected:
   int get_null_count_from_extend_value(
@@ -330,7 +355,6 @@ protected:
     const int64_t row_cap,
     const char *meta_data_,
     int64_t &null_count) const;
-
 
   template <typename Header, bool HAS_NULL>
   static int batch_locate_cell_data(

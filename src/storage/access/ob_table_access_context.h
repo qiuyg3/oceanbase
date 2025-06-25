@@ -37,27 +37,24 @@ template<typename T>
 class ObStoreRowIterPool;
 class ObBlockRowStore;
 class ObCGIterParamPool;
+struct ObTableScanRange;
+class ObTruncatePartitionFilter;
 
-struct ObRowStat
-{
-  int64_t base_row_count_;
-  int64_t inc_row_count_;
-  int64_t merge_row_count_;
-  int64_t result_row_count_;
-  int64_t filt_del_count_;
+#define REALTIME_MONITOR_ADD_IO_READ_BYTES(CTX, SIZE) \
+  if (OB_NOT_NULL(CTX)) CTX->add_io_read_bytes(SIZE)  \
 
-  ObRowStat() : base_row_count_(0), inc_row_count_(0), merge_row_count_(0), result_row_count_(0), filt_del_count_(0) {}
+#define REALTIME_MONITOR_ADD_SSSTORE_READ_BYTES(CTX, SIZE) \
+  if (OB_NOT_NULL(CTX)) CTX->add_ssstore_read_bytes(SIZE)
 
-  void reset()
-  {
-    base_row_count_ = 0;
-    inc_row_count_ = 0;
-    merge_row_count_ = 0;
-    result_row_count_ = 0;
-    filt_del_count_ = 0;
-  }
-  TO_STRING_KV(K_(base_row_count), K_(inc_row_count), K_(merge_row_count), K_(result_row_count), K_(filt_del_count));
-};
+#define REALTIME_MONITOR_INC_READ_ROW_CNT(ITER, CTX) \
+  if (OB_LIKELY(nullptr != ITER && nullptr != CTX))  \
+    ITER->is_sstable_iter() ? CTX->add_ssstore_read_row_cnt() : CTX->add_memstore_read_row_cnt();
+
+#define REALTIME_MONITOR_ADD_READ_ROW_CNT(CTX, COUNT) \
+  if (OB_NOT_NULL(CTX)) CTX->add_ssstore_read_row_cnt(COUNT);
+
+#define IF_NEED_CHECK_BASE_VERSION_FILTER(CTX) \
+  CTX->truncate_part_filter_ != nullptr && CTX->truncate_part_filter_->is_valid_filter()
 
 struct ObTableScanStoreStat
 {
@@ -78,16 +75,17 @@ struct ObTableScanStoreStat
     rowkey_prefix_ = 0;
     logical_read_cnt_ = 0;
     physical_read_cnt_ = 0;
+    in_row_cache_threshold_ = common::DEFAULT_MAX_MULTI_GET_CACHE_AWARE_ROW_NUM;
   }
 public:
   OB_INLINE bool enable_get_row_cache() const
   {
-    return row_cache_miss_cnt_ < common::MAX_MULTI_GET_CACHE_AWARE_ROW_NUM
+    return row_cache_miss_cnt_ < in_row_cache_threshold_
            || row_cache_hit_cnt_ > row_cache_miss_cnt_ / 2;
   }
   OB_INLINE bool enable_put_row_cache() const
   {
-    return row_cache_put_cnt_ < common::MAX_MULTI_GET_CACHE_AWARE_ROW_NUM;
+    return row_cache_put_cnt_ < in_row_cache_threshold_;
   }
   OB_INLINE bool enable_put_fuse_row_cache(const int64_t threshold) const
   {
@@ -100,7 +98,7 @@ public:
   }
   OB_INLINE bool enable_bf_cache() const
   {
-    return (bf_access_cnt_ < common::MAX_MULTI_GET_CACHE_AWARE_ROW_NUM
+    return (bf_access_cnt_ < common::DEFAULT_MAX_MULTI_GET_CACHE_AWARE_ROW_NUM
            || bf_filter_cnt_ > (bf_access_cnt_ / 8));
   }
   TO_STRING_KV(K_(row_cache_hit_cnt), K_(row_cache_miss_cnt), K_(row_cache_put_cnt),
@@ -109,7 +107,7 @@ public:
                K_(fuse_row_cache_hit_cnt), K_(fuse_row_cache_miss_cnt), K_(fuse_row_cache_put_cnt),
                K_(micro_access_cnt), K_(pushdown_micro_access_cnt),
                K_(empty_read_cnt), K_(rowkey_prefix),
-               K_(logical_read_cnt), K_(physical_read_cnt));
+               K_(logical_read_cnt), K_(physical_read_cnt), K_(in_row_cache_threshold));
   int64_t row_cache_hit_cnt_;
   int64_t row_cache_miss_cnt_;
   int64_t row_cache_put_cnt_;
@@ -126,6 +124,7 @@ public:
   int64_t rowkey_prefix_;
   int64_t logical_read_cnt_;
   int64_t physical_read_cnt_;
+  int64_t in_row_cache_threshold_;
 };
 
 struct ObTableAccessContext
@@ -141,10 +140,10 @@ struct ObTableAccessContext
       && NULL != stmt_allocator_
       && NULL != allocator_; }
   inline bool enable_get_row_cache() const {
-    return query_flag_.is_use_row_cache() && !use_fuse_row_cache_ && table_store_stat_.enable_get_row_cache() && !need_scn_ && !tablet_id_.is_ls_inner_tablet();
+    return query_flag_.is_use_row_cache() && !use_fuse_row_cache_ && table_store_stat_.enable_get_row_cache() && !need_scn_ && !tablet_id_.is_ls_inner_tablet() && !has_truncate_filter();
   }
   inline bool enable_put_row_cache() const {
-    return query_flag_.is_use_row_cache() && !use_fuse_row_cache_ && table_store_stat_.enable_put_row_cache() && !need_scn_ && !tablet_id_.is_ls_inner_tablet();
+    return query_flag_.is_use_row_cache() && !use_fuse_row_cache_ && table_store_stat_.enable_put_row_cache() && !need_scn_ && !tablet_id_.is_ls_inner_tablet() && !has_truncate_filter();
   }
   inline bool enable_bf_cache() const {
     return query_flag_.is_use_bloomfilter_cache() && table_store_stat_.enable_bf_cache() && !need_scn_ && !tablet_id_.is_ls_inner_tablet();
@@ -153,10 +152,10 @@ struct ObTableAccessContext
     return trans_version_range_.snapshot_version_ < snapshot_version;
   }
   inline bool enable_get_fuse_row_cache(const int64_t threshold) const {
-    return query_flag_.is_use_fuse_row_cache() && table_store_stat_.enable_get_fuse_row_cache(threshold) && !need_scn_ && !tablet_id_.is_ls_inner_tablet();
+    return query_flag_.is_use_fuse_row_cache() && table_store_stat_.enable_get_fuse_row_cache(threshold) && !need_scn_ && !tablet_id_.is_ls_inner_tablet() && !has_truncate_filter();
   }
-  inline bool enable_put_fuse_row_cache(const int64_t threshold) const {
-    return query_flag_.is_use_fuse_row_cache() && table_store_stat_.enable_put_fuse_row_cache(threshold) && !need_scn_ && !tablet_id_.is_ls_inner_tablet();
+  inline bool enable_put_fuse_row_cache(const int64_t threshold, const bool is_mview_table_scan) const {
+    return query_flag_.is_use_fuse_row_cache() && table_store_stat_.enable_put_fuse_row_cache(threshold) && (!need_scn_ || is_mview_table_scan) && !tablet_id_.is_ls_inner_tablet() && !has_truncate_filter();
   }
   inline bool is_limit_end() const {
     return (nullptr != limit_param_ && limit_param_->limit_ >= 0 && (out_cnt_ - limit_param_->offset_ >= limit_param_->limit_));
@@ -194,19 +193,67 @@ struct ObTableAccessContext
            common::ObIAllocator &allocator,
            common::ObIAllocator &stmt_allocator,
            const common::ObVersionRange &trans_version_range,
+           memtable::ObMvccMdsFilter *mds_filter = nullptr,
            const bool for_exist = false);
   // used for exist or simple scan
   int init(const common::ObQueryFlag &query_flag,
            ObStoreCtx &ctx,
            common::ObIAllocator &allocator,
-           const common::ObVersionRange &trans_version_range);
+           const common::ObVersionRange &trans_version_range,
+           memtable::ObMvccMdsFilter *mds_filter = nullptr,
+           CachedIteratorNode *cached_iter_node = nullptr);
+  // used for mview table scan
+  int init_for_mview(common::ObIAllocator *allocator,
+                     const ObTableAccessContext &access_ctx,
+                     ObStoreCtx &store_ctx);
+  OB_INLINE bool is_mview_query() const
+  {
+    return nullptr != mview_scan_info_;
+  }
+  OB_INLINE StorageScanType get_scan_type() const
+  {
+    return is_mview_query() ?  mview_scan_info_->scan_type_ : StorageScanType::NORMAL;
+  }
   int alloc_iter_pool(const bool use_column_store);
   void inc_micro_access_cnt();
   int init_scan_allocator(ObTableScanParam &scan_param);
+  int init_mview_scan_info(const int64_t multi_version_start, const sql::ObExprPtrIArray *op_filters, sql::ObEvalCtx &eval_ctx);
+  int check_filtered_by_base_version(ObDatumRow &row);
+  OB_INLINE bool has_truncate_filter() const
+  {
+    return nullptr != truncate_part_filter_;
+  }
+  // update realtime monitor info
+  OB_INLINE void add_io_read_bytes(const int64_t bytes)
+  {
+    if (OB_LIKELY(nullptr != table_scan_stat_ && nullptr != table_scan_stat_->tsc_monitor_info_)) {
+      *table_scan_stat_->tsc_monitor_info_->io_read_bytes_ += bytes;
+    }
+  }
+  OB_INLINE void add_ssstore_read_bytes(const int64_t bytes)
+  {
+    if (OB_LIKELY(nullptr != table_scan_stat_ && nullptr != table_scan_stat_->tsc_monitor_info_)) {
+      *table_scan_stat_->tsc_monitor_info_->ssstore_read_bytes_ += bytes;
+    }
+  }
+  OB_INLINE void add_ssstore_read_row_cnt(const int64_t count = 1)
+  {
+    if (OB_LIKELY(nullptr != table_scan_stat_ && nullptr != table_scan_stat_->tsc_monitor_info_)) {
+      *table_scan_stat_->tsc_monitor_info_->ssstore_read_row_cnt_ += count;
+    }
+  }
+  OB_INLINE void add_memstore_read_row_cnt(const int64_t count = 1)
+  {
+    if (OB_LIKELY(nullptr != table_scan_stat_ && nullptr != table_scan_stat_->tsc_monitor_info_)) {
+      *table_scan_stat_->tsc_monitor_info_->memstore_read_row_cnt_ += count;
+    }
+  }
   TO_STRING_KV(
     K_(is_inited),
     K_(use_fuse_row_cache),
     K_(need_scn),
+    K_(need_release_mview_scan_info),
+    K_(need_release_truncate_part_filter),
     K_(timeout),
     K_(ls_id),
     K_(tablet_id),
@@ -228,7 +275,11 @@ struct ObTableAccessContext
     KP_(cg_iter_pool),
     KP_(cg_param_pool),
     KP_(block_row_store),
-    KP_(sample_filter));
+    KP_(sample_filter),
+    KPC_(mview_scan_info),
+    K_(table_store_stat),
+    KP_(truncate_part_filter),
+    KP_(mds_collector));
 private:
   static const int64_t DEFAULT_COLUMN_SCALE_INFO_SIZE = 8;
   static const int64_t USE_BLOCK_CACHE_LIMIT = 128L << 10;  // 128K
@@ -239,7 +290,6 @@ private:
                                const ObVersionRange &trans_version_range); // local scan
   // init need_fill_scale_ and search column which need fill scale
   int init_column_scale_info(ObTableScanParam &scan_param);
-
 public:
   OB_INLINE common::ObIAllocator *get_long_life_allocator()
   {
@@ -249,9 +299,19 @@ public:
   {
     return nullptr == cached_iter_node_ ? stmt_iter_pool_ : cached_iter_node_->get_stmt_iter_pool();
   }
+  OB_INLINE ObTruncatePartitionFilter *get_truncate_part_filter()
+  {
+    return truncate_part_filter_;
+  }
+  ObMdsReadInfoCollector * get_mds_collector()
+  {
+    return mds_collector_;
+  }
   bool is_inited_;
   bool use_fuse_row_cache_; // temporary code
   bool need_scn_;
+  bool need_release_mview_scan_info_;
+  bool need_release_truncate_part_filter_;
   int64_t timeout_;
   share::ObLSID ls_id_;
   common::ObTabletID tablet_id_;
@@ -270,6 +330,7 @@ public:
   common::ObTableScanStatistic *table_scan_stat_;
   ObTableScanStoreStat table_store_stat_;
   int64_t out_cnt_;
+  int64_t in_row_cache_threshold_;
   common::ObVersionRange trans_version_range_;
   const common::ObSEArray<int64_t, 4, common::ModulePageAllocator> *range_array_pos_;
   share::SCN merge_scn_;
@@ -282,9 +343,9 @@ public:
   ObBlockRowStore *block_row_store_;
   ObRowSampleFilter *sample_filter_;
   compaction::ObCachedTransStateMgr *trans_state_mgr_;
-#ifdef ENABLE_DEBUG_LOG
-  transaction::ObDefensiveCheckRecordExtend defensive_check_record_;
-#endif
+  ObMviewScanInfo *mview_scan_info_;
+  ObTruncatePartitionFilter *truncate_part_filter_;
+  ObMdsReadInfoCollector *mds_collector_; // used for collect mds info when query mds sstable
 };
 
 } // namespace storage

@@ -12,11 +12,9 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/expr/ob_expr_neg.h"
-#include "share/object/ob_obj_cast.h"
 #include "share/datum/ob_datum_util.h"
 #include "sql/engine/expr/ob_expr_result_type_util.h"
 #include "sql/session/ob_sql_session_info.h"
-#include "lib/json_type/ob_json_base.h"
 
 namespace oceanbase
 {
@@ -351,7 +349,9 @@ int ObExprNeg::calc_param_type(const ObExprResType &param_type,
   case ObDateTimeTC:
   case ObTimeTC:
   case ObTextTC:
-  case ObStringTC: {
+  case ObStringTC:
+  case ObMySQLDateTC:
+  case ObMySQLDateTimeTC: {
     if (lib::is_oracle_mode()) {
       result_type = calc_type = ObNumberType;
     } else {

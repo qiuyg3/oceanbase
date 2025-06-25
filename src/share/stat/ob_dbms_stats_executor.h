@@ -46,6 +46,7 @@ struct GatherHelper
   ObOptStatRunningMonitor &running_monitor_;
   bool use_column_store_;
   bool use_split_part_;
+
   TO_STRING_KV(K(is_split_gather_),
                K(maximum_gather_part_cnt_),
                K(maximum_gather_col_cnt_),
@@ -86,7 +87,8 @@ public:
                                 ObTableStatParam &param,
                                 share::schema::ObSchemaGetterGuard *schema_guard,
                                 const TabStatIndMap &online_table_stats,
-                                const ColStatIndMap &online_column_stats);
+                                const ColStatIndMap &online_column_stats,
+                                const ObIArray<ObOptDmlStat *> *dml_stats = nullptr /*for_direct_load*/);
 
   static int cancel_gather_stats(ObExecContext &ctx, ObString &task_id);
 
@@ -102,18 +104,21 @@ private:
                                   ObMySQLTransaction &trans,
                                   const ObTableStatParam &param,
                                   PartitionIdBlockMap &partition_id_block_map,
+                                  PartitionIdSkipRateMap &partition_id_skip_rate_map,
                                   GatherHelper &gather_helper);
 
   static int split_gather_stats(ObExecContext &ctx,
                                 ObMySQLTransaction &trans,
                                 const ObTableStatParam &param,
                                 const PartitionIdBlockMap *partition_id_block_map,
+                                const PartitionIdSkipRateMap *partition_id_skip_rate_map,
                                 GatherHelper &gather_helper);
 
   static int no_split_gather_stats(ObExecContext &ctx,
                                    ObMySQLTransaction &trans,
                                    const ObTableStatParam &param,
                                    const PartitionIdBlockMap *partition_id_block_map,
+                                   const PartitionIdSkipRateMap *partition_id_skip_rate_map,
                                    GatherHelper &gather_helper);
 
   static int split_gather_partition_stats(ObExecContext &ctx,
@@ -121,12 +126,14 @@ private:
                                           const ObTableStatParam &param,
                                           StatLevel stat_level,
                                           const PartitionIdBlockMap *partition_id_block_map,
+                                          const PartitionIdSkipRateMap *partition_id_skip_rate_map,
                                           const GatherHelper &gather_helper);
 
   static int split_gather_global_stats(ObExecContext &ctx,
                                        ObMySQLTransaction &trans,
                                        const ObTableStatParam &param,
                                        const PartitionIdBlockMap *partition_id_block_map,
+                                       const PartitionIdSkipRateMap *partition_id_skip_rate_map,
                                        GatherHelper &gather_helper);
 
   static int do_gather_stats(ObExecContext &ctx,
@@ -135,6 +142,7 @@ private:
                              const ObIArray<PartInfo> &gather_partition_infos,
                              const ObIArray<ObColumnStatParam> &gather_column_params,
                              bool is_all_columns_gather,
+                             ObOptStatGatherAudit &audit,
                              ObIArray<ObOptStat> &opt_stats,
                              ObIArray<ObOptTableStat *> &all_tstats,
                              ObIArray<ObOptColumnStat *> &all_cstats);
@@ -160,21 +168,15 @@ private:
                                                              share::schema::ObSchemaGetterGuard *schema_guard,
                                                              sql::ObSQLSessionInfo::StmtSavedValue &saved_value,
                                                              int64_t &nested_count,
-                                                             ObSqlString &old_db_name,
-                                                             int64_t &old_db_id,
                                                              int64_t &old_trx_lock_timeout,
                                                              bool &need_restore_session,
-                                                             bool &need_reset_default_database,
                                                              bool &need_reset_trx_lock_timeout,
                                                              sqlclient::ObISQLConnection *&conn);
 
   static int restore_session_for_online_stat(sql::ObSQLSessionInfo *session,
                                              sql::ObSQLSessionInfo::StmtSavedValue &saved_value,
                                              int64_t nested_count,
-                                             ObSqlString &old_db_name,
-                                             int64_t old_db_id,
                                              int64_t old_trx_lock_timeout,
-                                             bool need_reset_default_database,
                                              bool need_reset_trx_lock_timeout);
 
   static int64_t get_column_histogram_size(const ObIArray<ObColumnStatParam> &column_params);
@@ -201,7 +203,22 @@ private:
                                     char *&svr_ip,
                                     int32_t &svr_port);
 
+  static int adjsut_async_gather_param(const PartitionIdBlockMap &partition_id_block_map,
+                                       ObTableStatParam &param,
+                                       bool &need_split_part);
 
+  static bool is_async_gather_partition_id(const int64_t partition_id,
+                                           const ObIArray<int64_t> *async_partition_ids);
+
+  static int adjust_auto_gather_param(const PartitionIdBlockMap &partition_id_block_map,
+                                      const ObTableStatParam &param,
+                                      bool use_column_store,
+                                      bool &need_split_part);
+
+  static int get_skip_rate_sample_count(ObMySQLProxy *mysql_proxy,
+                                        const uint64_t tenant_id,
+                                        const uint64_t table_id,
+                                        int64_t &sample_count);
 };
 
 } // end of sql

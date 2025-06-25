@@ -212,6 +212,12 @@ public:
                                    rootserver::ObDDLOperator &ddl_operator,
                                    share::schema::ObMultiVersionSchemaService &schema_service);
 
+  static int insert_dependency_infos(common::ObMySQLTransaction &trans,
+                              common::ObIArray<share::schema::ObDependencyInfo> &dep_infos,
+                              uint64_t tenant_id,
+                              uint64_t dep_obj_id,
+                              uint64_t schema_version, uint64_t owner_id);
+
   TO_STRING_KV(K_(tenant_id),
                K_(dep_obj_id),
                K_(dep_obj_type),
@@ -467,7 +473,6 @@ public:
   inline const RefObjVersionMap &get_ref_obj_table() const { return ref_obj_version_table_; }
   static int batch_execute_insert_or_update_obj_dependency(
     const uint64_t tenant_id,
-    const bool is_standby,
     const int64_t new_schema_version,
     const ObReferenceObjTable::DependencyObjKeyItemPairs &dep_objs,
     ObMySQLTransaction &trans,
@@ -475,7 +480,6 @@ public:
     rootserver::ObDDLOperator &ddl_operator);
   static int batch_execute_delete_obj_dependency(
     const uint64_t tenant_id,
-    const bool is_standby,
     const ObReferenceObjTable::DependencyObjKeyItemPairs &dep_objs,
     ObMySQLTransaction &trans);
   static int update_max_dependency_version(

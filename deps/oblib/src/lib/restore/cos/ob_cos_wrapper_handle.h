@@ -26,6 +26,8 @@ namespace oceanbase
 namespace common
 {
 
+static constexpr char OB_STORAGE_COS_ALLOCATOR[] = "StorageCOS";
+
 // Allocator for creating cos handle
 class ObCosMemAllocator
 {
@@ -35,17 +37,10 @@ public:
   void *alloc(size_t size);
   void free(void *addr);
   void reuse();
+  void reset();
 private:
   ObArenaAllocator allocator_;
 };
-
-// Create a temporary cos_handle object,
-// utilizing the 'allocator' to allocate the necessary memory.
-int create_cos_handle(
-    ObCosMemAllocator &allocator,
-    const qcloud_cos::ObCosAccount &cos_account,
-    const bool check_md5,
-    qcloud_cos::ObCosWrapper::Handle *&handle);
 
 class ObCosWrapperHandle
 {
@@ -55,13 +50,28 @@ public:
 
   int init(const common::ObObjectStorageInfo *storage_info);
   void reset();
+  // Create a temporary cos_handle object,
+  // utilizing the 'allocator' to allocate the necessary memory.
+  int create_cos_handle(
+    ObCosMemAllocator &allocator,
+    const bool check_md5,
+    qcloud_cos::ObCosWrapper::Handle *&handle);
   int create_cos_handle(const bool check_md5);
   void destroy_cos_handle();
   qcloud_cos::ObCosWrapper::Handle *get_ptr() { return handle_; }
 
+  // Create a temporary cos_handle object,
+  // utilizing the 'allocator' to allocate the necessary memory.
+  int create_tmp_cos_handle(
+      ObCosMemAllocator &allocator,
+      const bool check_md5,
+      qcloud_cos::ObCosWrapper::Handle *&handle);
+
   int build_bucket_and_object_name(const ObString &uri);
   const ObString &get_bucket_name() const { return bucket_name_; }
   const ObString &get_object_name() const { return object_name_; }
+  const qcloud_cos::CosStringBuffer &get_bucket_name_str_buf() const { return bucket_name_str_buf_; }
+  const qcloud_cos::CosStringBuffer &get_object_name_str_buf() const { return object_name_str_buf_; }
   const qcloud_cos::ObCosAccount &get_cos_account() const { return cos_account_; }
 
   bool is_valid() const { return is_inited_ && handle_ != nullptr; }
@@ -77,10 +87,13 @@ private:
   bool is_inited_;
   qcloud_cos::ObCosWrapper::Handle *handle_;
   qcloud_cos::ObCosAccount cos_account_;
+  ObSTSToken sts_token_;
   ObCosMemAllocator allocator_;
   ObString bucket_name_;
   ObString object_name_;
-  int64_t delete_mode_;
+  qcloud_cos::CosStringBuffer bucket_name_str_buf_;
+  qcloud_cos::CosStringBuffer object_name_str_buf_;
+  ObStorageDeleteMode delete_mode_;
 };
 
 

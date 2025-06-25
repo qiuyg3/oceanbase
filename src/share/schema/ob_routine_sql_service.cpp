@@ -12,14 +12,6 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_routine_sql_service.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/string/ob_sql_string.h"
-#include "lib/mysqlclient/ob_mysql_proxy.h"
-#include "share/ob_dml_sql_splicer.h"
-#include "share/schema/ob_package_info.h"
-#include "ob_routine_info.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "pl/ob_pl_stmt.h"
 
 namespace oceanbase
@@ -52,6 +44,7 @@ int ObRoutineSqlService::create_package(ObPackageInfo &package_info,
       opt.op_type_ = is_replace ? OB_DDL_ALTER_PACKAGE : OB_DDL_CREATE_PACKAGE;
       opt.schema_version_ = package_info.get_schema_version();
       opt.ddl_stmt_str_ = (NULL != ddl_stmt_str) ? *ddl_stmt_str : ObString();
+      opt.table_name_ = package_info.get_package_name();
       if (OB_FAIL(log_operation(opt, *sql_client))) {
         LOG_WARN("Failed to log operation", K(ret));
       }
@@ -111,6 +104,7 @@ int ObRoutineSqlService::alter_package(const ObPackageInfo &package_info,
     opt.op_type_ = OB_DDL_ALTER_PACKAGE;
     opt.schema_version_ = package_info.get_schema_version();
     opt.ddl_stmt_str_ = (NULL != ddl_stmt_str) ? *ddl_stmt_str : ObString();
+    opt.table_name_ = package_info.get_package_name();
     if (OB_FAIL(log_operation(opt, *sql_client))) {
       LOG_WARN("Failed to log operation", K(ret));
     }
@@ -186,6 +180,7 @@ int ObRoutineSqlService::create_routine(ObRoutineInfo &routine_info,
       opt.op_type_ = OB_DDL_CREATE_ROUTINE;
       opt.schema_version_ = routine_info.get_schema_version();
       opt.ddl_stmt_str_ = (NULL != ddl_stmt_str) ? *ddl_stmt_str : ObString();
+      opt.table_name_ = routine_info.get_routine_name();
       if (OB_FAIL(log_operation(opt, *sql_client))) {
         LOG_WARN("Failed to log operation", K(ret));
       }
@@ -246,6 +241,7 @@ int ObRoutineSqlService::replace_routine(ObRoutineInfo &routine_info,
       opt.op_type_ = OB_DDL_REPLACE_ROUTINE;
       opt.schema_version_ = routine_info.get_schema_version();
       opt.ddl_stmt_str_ = (NULL != ddl_stmt_str) ? *ddl_stmt_str : ObString();
+      opt.table_name_ = routine_info.get_routine_name();
       if (OB_FAIL(log_operation(opt, *sql_client))) {
         LOG_WARN("Failed to log operation", K(ret));
       }
@@ -263,6 +259,7 @@ int ObRoutineSqlService::drop_routine(const ObRoutineInfo &routine_info,
   uint64_t tenant_id = routine_info.get_tenant_id();
   uint64_t db_id = routine_info.get_database_id();
   uint64_t routine_id = routine_info.get_routine_id();
+  const ObString& routine_name = routine_info.get_routine_name();
   if (OB_UNLIKELY(OB_INVALID_ID == tenant_id)
       || OB_UNLIKELY(OB_INVALID_ID == db_id)
       || OB_UNLIKELY(OB_INVALID_ID == routine_id)) {
@@ -280,6 +277,7 @@ int ObRoutineSqlService::drop_routine(const ObRoutineInfo &routine_info,
     opt.op_type_ = OB_DDL_DROP_ROUTINE;
     opt.schema_version_ = new_schema_version;
     opt.ddl_stmt_str_ = (NULL != ddl_stmt_str) ? *ddl_stmt_str : ObString();
+    opt.table_name_ = routine_name;
     if (OB_FAIL(log_operation(opt, sql_client))) {
       LOG_WARN("Failed to log operation", K(ret));
     }

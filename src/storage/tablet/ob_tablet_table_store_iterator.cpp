@@ -12,11 +12,8 @@
 
 #define USING_LOG_PREFIX STORAGE
 
-#include "storage/blocksstable/ob_sstable.h"
-#include "storage/memtable/ob_memtable.h"
-#include "storage/tablet/ob_tablet_table_store_iterator.h"
+#include "ob_tablet_table_store_iterator.h"
 #include "storage/tablet/ob_tablet_table_store.h"
-#include "storage/column_store/ob_column_oriented_sstable.h"
 
 namespace oceanbase
 {
@@ -32,7 +29,8 @@ ObTableStoreIterator::ObTableStoreIterator(const bool reverse, const bool need_l
     table_ptr_array_(),
     pos_(INT64_MAX),
     memstore_retired_(nullptr),
-    transfer_src_table_store_handle_(nullptr)
+    transfer_src_table_store_handle_(nullptr),
+    split_extra_table_store_handles_()
 {
   step_ = reverse ? -1 : 1;
   sstable_handle_array_.set_attr(ObMemAttr(MTL_ID(), "TblHdlArray"));
@@ -82,6 +80,11 @@ int ObTableStoreIterator::assign(const ObTableStoreIterator& other)
         *transfer_src_table_store_handle_ = *(other.transfer_src_table_store_handle_);
       }
     }
+
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(split_extra_table_store_handles_.assign(other.split_extra_table_store_handles_))) {
+      LOG_WARN("failed to assign split extra table store handles", K(ret));
+    }
   }
   return ret;
 }
@@ -96,11 +99,13 @@ void ObTableStoreIterator::reset()
   table_ptr_array_.reset();
   sstable_handle_array_.reset();
   table_store_handle_.reset();
+
   if (nullptr != transfer_src_table_store_handle_) {
     transfer_src_table_store_handle_->~ObStorageMetaHandle();
     ob_free(transfer_src_table_store_handle_);
     transfer_src_table_store_handle_ = nullptr;
   }
+  split_extra_table_store_handles_.reset();
   pos_ = INT64_MAX;
   memstore_retired_ = nullptr;
 }
@@ -128,9 +133,9 @@ int ObTableStoreIterator::get_next(ObTableHandleV2 &table_handle)
   int ret = OB_SUCCESS;
   table_handle.reset();
   ObITable *table = nullptr;
-  if (OB_UNLIKELY(nullptr != transfer_src_table_store_handle_)) {
+  if (OB_UNLIKELY(nullptr != transfer_src_table_store_handle_ || !split_extra_table_store_handles_.empty())) {
     ret = OB_NOT_SUPPORTED;
-    LOG_ERROR("doesn't support cross tablet get table handl", K(ret), KP(transfer_src_table_store_handle_));
+    LOG_ERROR("doesn't support cross tablet get table handl", K(ret), KP(transfer_src_table_store_handle_), K(split_extra_table_store_handles_));
   } else if (OB_FAIL(inner_move_idx_to_next())) {
   } else {
     if (OB_FAIL(get_ith_table(pos_, table))) {
@@ -205,6 +210,17 @@ int ObTableStoreIterator::set_handle(const ObStorageMetaHandle &table_store_hand
     LOG_WARN("invalid table store handle", K(ret), K(table_store_handle));
   } else {
     table_store_handle_ = table_store_handle;
+  }
+  return ret;
+}
+
+int ObTableStoreIterator::alloc_split_extra_table_store_handle(ObStorageMetaHandle *&meta_handle)
+{
+  int ret = OB_SUCCESS;
+  meta_handle = nullptr;
+  if (OB_ISNULL(meta_handle = split_extra_table_store_handles_.alloc_place_holder())) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("fail to allocator memory for handle", K(ret));
   }
   return ret;
 }

@@ -12,7 +12,6 @@
 
 #define USING_LOG_PREFIX STORAGE
 
-#include "lib/allocator/ob_malloc.h"
 #include "storage/ddl/ob_ddl_inc_clog_callback.h"
 #include "storage/tx_storage/ob_ls_service.h"
 
@@ -26,20 +25,21 @@ using namespace share;
 using namespace common;
 
 ObDDLIncStartClogCb::ObDDLIncStartClogCb()
-  : is_inited_(false), log_basic_(), scn_(SCN::min_scn())
+  : is_inited_(false), ls_id_(), log_basic_(), scn_(SCN::min_scn())
 {
 }
 
-int ObDDLIncStartClogCb::init(const ObDDLIncLogBasic& log_basic)
+int ObDDLIncStartClogCb::init(const ObLSID &ls_id, const ObDDLIncLogBasic &log_basic)
 {
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
     LOG_WARN("init twice", K(ret));
-  } else if (OB_UNLIKELY(!log_basic.is_valid())) {
+  } else if (OB_UNLIKELY(!ls_id.is_valid() || !log_basic.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(log_basic));
+    LOG_WARN("invalid argument", K(ret), K(ls_id), K(log_basic));
   } else {
+    ls_id_ = ls_id;
     log_basic_ = log_basic;
     is_inited_ = true;
   }
@@ -54,8 +54,8 @@ int ObDDLIncStartClogCb::on_success()
   scn_ = __get_scn();
   status_.set_ret_code(ret);
   status_.set_state(STATE_SUCCESS);
+  FLOG_INFO("write ddl inc start log success", K(ls_id_), K(scn_), K(log_basic_));
   try_release();
-
   return OB_SUCCESS;
 }
 
@@ -87,7 +87,7 @@ ObDDLIncRedoClogCb::ObDDLIncRedoClogCb()
 ObDDLIncRedoClogCb::~ObDDLIncRedoClogCb()
 {
   int ret = OB_SUCCESS;
-  if (macro_block_id_.is_valid() && OB_FAIL(OB_SERVER_BLOCK_MGR.dec_ref(macro_block_id_))) {
+  if (macro_block_id_.is_valid() && OB_FAIL(OB_STORAGE_OBJECT_MGR.dec_ref(macro_block_id_))) {
     LOG_ERROR("dec ref failed", K(ret), K(macro_block_id_), K(common::lbt()));
   }
   macro_block_id_.reset();
@@ -105,13 +105,14 @@ int ObDDLIncRedoClogCb::init(const share::ObLSID &ls_id,
   } else if (OB_UNLIKELY(!ls_id.is_valid() || !redo_info.is_valid() || !macro_block_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(ls_id), K(redo_info), K(macro_block_id));
-  } else if (OB_FAIL(OB_SERVER_BLOCK_MGR.inc_ref(macro_block_id))) {
+  } else if (OB_FAIL(OB_STORAGE_OBJECT_MGR.inc_ref(macro_block_id))) {
     LOG_WARN("inc reference count failed", K(ret), K(macro_block_id));
+  } else if (OB_FAIL(tablet_handle_.assign(tablet_handle))) {
+    LOG_WARN("failed to assign tablet_handle", K(ret), K(tablet_handle));
   } else {
     redo_info_ = redo_info;
     ls_id_ = ls_id;
     macro_block_id_ = macro_block_id;
-    tablet_handle_ = tablet_handle;
   }
   return ret;
 }
@@ -140,16 +141,25 @@ int ObDDLIncRedoClogCb::on_success()
       LOG_INFO("data buffer is freed, do not need to callback");
     } else if (OB_FAIL(macro_block.block_handle_.set_block_id(macro_block_id_))) {
       LOG_WARN("set macro block id failed", K(ret), K(macro_block_id_));
+    } else if (OB_FAIL(macro_block.set_data_macro_meta(macro_block_id_,
+                                                       redo_info_.data_buffer_.ptr(),
+                                                       redo_info_.data_buffer_.length(),
+                                                       redo_info_.block_type_,
+                                                       true))) {
+      LOG_WARN("fail to set data macro meta", K(ret), K(macro_block_id_),
+                                                      KP(redo_info_.data_buffer_.ptr()),
+                                                      K(redo_info_.data_buffer_.length()),
+                                                      K(redo_info_.block_type_));
+
     } else {
       macro_block.block_type_ = redo_info_.block_type_;
       macro_block.logic_id_ = redo_info_.logic_id_;
       macro_block.scn_ = __get_scn();
-      macro_block.buf_ = redo_info_.data_buffer_.ptr();
-      macro_block.size_ = redo_info_.data_buffer_.length();
       macro_block.ddl_start_scn_ = redo_info_.start_scn_;
       macro_block.table_key_ = redo_info_.table_key_;
       macro_block.end_row_id_ = redo_info_.end_row_id_;
       macro_block.trans_id_ = redo_info_.trans_id_;
+      macro_block.seq_no_ = redo_info_.seq_no_;
       const int64_t snapshot_version = redo_info_.table_key_.get_snapshot_version();
       const uint64_t data_format_version = redo_info_.data_format_version_;
       if (OB_FAIL(tablet_handle_.get_obj()->set_macro_block(macro_block, snapshot_version, data_format_version))) {
@@ -176,7 +186,7 @@ ObDDLIncCommitClogCb::ObDDLIncCommitClogCb()
 {
 }
 
-int ObDDLIncCommitClogCb::init(const share::ObLSID &ls_id, const ObDDLIncLogBasic &log_basic)
+int ObDDLIncCommitClogCb::init(const ObLSID &ls_id, const ObDDLIncLogBasic &log_basic)
 {
   int ret = OB_SUCCESS;
   if (IS_INIT) {
@@ -207,10 +217,19 @@ int ObDDLIncCommitClogCb::on_success()
     LOG_ERROR("ls should not be null", K(ret), K(log_basic_.get_tablet_id()));
   } else {
     const bool is_sync = false;
-    (void)ls->tablet_freeze(log_basic_.get_tablet_id(), is_sync);
+    (void)ls->tablet_freeze(log_basic_.get_tablet_id(),
+                            is_sync,
+                            0, /*timeout, useless for async one*/
+                            false, /*need_rewrite_meta*/
+                            ObFreezeSourceFlag::DIRECT_INC_START);
     if (log_basic_.get_lob_meta_tablet_id().is_valid()) {
-      (void)ls->tablet_freeze(log_basic_.get_lob_meta_tablet_id(), is_sync);
+      (void)ls->tablet_freeze(log_basic_.get_lob_meta_tablet_id(),
+                              is_sync,
+                              0, /*timeout, useless for async one*/
+                              false, /*need_rewrite_meta*/
+                              ObFreezeSourceFlag::DIRECT_INC_START);
     }
+    FLOG_INFO("write ddl inc commit log success", K(ls_id_), K(scn_), K(log_basic_));
   }
 
   status_.set_ret_code(ret);

@@ -41,7 +41,7 @@ public:
       ObExprJoinFilterContext() : ObExprOperatorCtx(),
           rf_msg_(nullptr), rf_key_(), hash_funcs_(), cmp_funcs_(), start_time_(0),
           filter_count_(0), total_count_(0), check_count_(0),
-          n_times_(0), ready_ts_(0), slide_window_(total_count_), flag_(0),
+          n_times_(0), ready_ts_(0), by_pass_count_before_ready_(0), slide_window_(total_count_), flag_(0), max_wait_time_ms_(0),
           cur_row_(), cur_row_with_hash_(nullptr), skip_vector_(nullptr)
         {
           cur_row_.set_attr(ObMemAttr(MTL_ID(), "RfCurRow"));
@@ -49,6 +49,7 @@ public:
           need_check_ready_ = true;
           is_first_ = true;
           is_partition_wise_jf_ = false;
+          is_active_ = true;
         }
       virtual ~ObExprJoinFilterContext();
     public:
@@ -64,6 +65,14 @@ public:
         // pushdown filter parameters
         return is_partition_wise_jf_;
       }
+
+      inline void rescan()
+      {
+        n_times_ = 0;
+        is_ready_ = false;
+        slide_window_.reset_for_rescan();
+      }
+
       inline void collect_monitor_info(const int64_t filtered_rows_count,
                                        const int64_t check_rows_count,
                                        const int64_t total_rows_count) override final
@@ -86,6 +95,7 @@ public:
         check_count_ = 0;
         n_times_ = 0;
         ready_ts_ = 0;
+        by_pass_count_before_ready_ = 0;
         is_ready_ = false;
       }
 
@@ -106,12 +116,13 @@ public:
       int64_t check_count_;
       int64_t n_times_;
       int64_t ready_ts_;
+      int64_t by_pass_count_before_ready_;
 
       ObAdaptiveFilterSlideWindow slide_window_;
 
       union {
         uint64_t flag_;
-        struct {
+        struct { // FARM COMPAT WHITELIST
           bool is_ready_:1;
           bool is_first_:1;
           // whether need to sync wait
@@ -121,10 +132,11 @@ public:
           // for runtime filter pushdown, if is partition wise join, we need to reset
           // pushdown filter parameters
           bool is_partition_wise_jf_ : 1;
-          int32_t max_wait_time_ms_:32;
-          int32_t reserved_:27;
+          bool is_active_ : 1;
+          uint64_t reserved_:58;
         };
       };
+      int64_t max_wait_time_ms_;
       ObTMArray<ObDatum> cur_row_;
       ObRowWithHash *cur_row_with_hash_; // used in ObRFInFilterVecMsg, for probe
       // used in ObRFInFilterVecMsg/ObRFBloomFilterMsg, for probe in single row interface

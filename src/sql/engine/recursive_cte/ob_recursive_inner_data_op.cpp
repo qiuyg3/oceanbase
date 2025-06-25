@@ -11,10 +11,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
-#include "ob_recursive_union_all_op.h"
-#include "sql/engine/ob_exec_context.h"
-#include "lib/allocator/ob_malloc.h"
 #include "ob_recursive_inner_data_op.h"
+#include "ob_recursive_union_all_op.h"
 
 namespace oceanbase
 {
@@ -114,7 +112,7 @@ int ObRecursiveInnerDataOp::get_all_data_from_left_batch()
           }
         }
       }
-      if (child_brs->end_) {
+      if (OB_SUCC(ret) && child_brs->end_) {
         break;
       }
     }

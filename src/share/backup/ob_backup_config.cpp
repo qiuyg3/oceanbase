@@ -15,18 +15,10 @@
 #include "ob_log_restore_config.h"
 #include "ob_backup_data_table_operator.h"
 #include "ob_backup_helper.h"
-#include "ob_backup_store.h"
 #include "ob_archive_persist_helper.h"
 #include "ob_backup_connectivity.h"
-#include "sql/parser/parse_node.h"
-#include "observer/ob_server_struct.h"
-#include "share/schema/ob_schema_mgr.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/schema/ob_multi_version_schema_service.h"
 #include "share/backup/ob_backup_connectivity.h"
 #include "share/backup/ob_tenant_archive_mgr.h"
-#include "share/restore/ob_log_restore_source_mgr.h"  // ObLogRestoreSourceMgr
-#include "share/ob_log_restore_proxy.h"  // ObLogRestoreProxyUtil
 
 using namespace oceanbase;
 using namespace share;
@@ -411,10 +403,12 @@ int ObDataBackupDestConfigParser::parse_from(const common::ObSqlString &value)
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(pair.key_.assign(type_.get_backup_config_type_str()))) {
     LOG_WARN("fail to assign backup config type str", K(ret));
-  } else if (OB_FAIL(pair.value_.assign(path.ptr()))) {
+  } else if (OB_FAIL(pair.value_.assign(value.ptr()))) {
     LOG_WARN("fail to assign backup dest root path", K(ret));
   } else if (OB_FAIL(config_items_.push_back(pair))) {
     LOG_WARN("fail to push backup item", K(ret));
+  } else {
+    LOG_INFO("parse from", K(value), K(backup_dest), K(path), K(config_items_));
   }
   return ret;
 }
@@ -443,9 +437,15 @@ int ObDataBackupDestConfigParser::check_before_update_inner_config(obrpc::ObSrvR
   } else if (!config_items_.at(0).value_.empty()) {
     if (OB_FAIL(backup_dest.assign(config_items_.at(0).value_.ptr()))) {
       LOG_WARN("fail to assign backup dest", K(ret), K_(tenant_id), K_(config_items));
+    } else if (OB_FAIL(ObIBackupConfigItemParser::set_default_checksum_type(backup_dest))) {
+      LOG_WARN("fail to check dest checksum type", K(ret), K(backup_dest));
     } else if (OB_FAIL(dest_mgr.init(tenant_id_, dest_type, backup_dest, trans))) {
       LOG_WARN("fail to init dest manager", K(ret), K_(tenant_id), K(backup_dest));
     } else if (OB_FAIL(dest_mgr.check_dest_validity(rpc_proxy, false/*need_format_file*/))) {
+      if (OB_OBJECT_STORAGE_OBJECT_LOCKED_BY_WORM == ret) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                          "set backup dest: parameter enable_worm=true is required for bucket with worm.");
+      }
       LOG_WARN("fail to check dest validity", K(ret), K_(tenant_id), K(backup_dest));
     } else {
       LOG_INFO("succ to check data dest config", K_(tenant_id), K(backup_dest)); 
@@ -468,7 +468,7 @@ int ObDataBackupDestConfigParser::update_data_backup_dest_config_(common::ObISQL
       LOG_WARN("fail to set backup dest", K(ret), K_(tenant_id), K_(config_items));
     } else if (OB_FAIL(dest.get_backup_dest_str(backup_dest_str, sizeof(backup_dest_str)))) {
       LOG_WARN("fail to get_backup_dest_str", K(ret), K(dest));
-    } 
+    }
   }
   
   if (OB_FAIL(ret)) {
@@ -495,6 +495,8 @@ int ObDataBackupDestConfigParser::update_inner_config_table(common::ObISQLClient
     // allow set empty data backup dest
     if (OB_FAIL(backup_dest.assign(config_items_.at(0).value_.ptr()))) {
       LOG_WARN("fail to assign backup dest", K(ret), K_(tenant_id), K_(config_items));
+    } else if (OB_FAIL(ObIBackupConfigItemParser::set_default_checksum_type(backup_dest))) {
+      LOG_WARN("fail to check dest checksum type", K(ret), K(backup_dest));
     } else if (OB_FAIL(dest_mgr.init(tenant_id_, dest_type, backup_dest, trans))) {
       LOG_WARN("fail to init dest manager", K(ret), K_(tenant_id));
     } else if (OB_FAIL(dest_mgr.write_format_file())) {
@@ -588,6 +590,8 @@ int ObLogArchiveDestConfigParser::update_archive_dest_config_(common::ObISQLClie
     } else if (OB_FAIL(ObBackupStorageInfoOperator::get_dest_id(trans, tenant_id_, dest, dest_id))) {
       LOG_WARN("fail to get dest id", K(ret)); 
     } else if (OB_FALSE_IT(archive_dest_.dest_id_ = dest_id)) {
+    } else if (OB_FAIL(ObIBackupConfigItemParser::set_default_checksum_type(archive_dest_.dest_))) {
+      LOG_WARN("fail to set default checksum type", K(ret), "backup_dest", archive_dest_.dest_);
     } else if (OB_FAIL(archive_dest_.gen_config_items(config_items_))) {
       LOG_WARN("fail to gen archive config items", K(ret)); 
     }
@@ -649,6 +653,8 @@ int ObLogArchiveDestConfigParser::check_before_update_inner_config(obrpc::ObSrvR
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("cannot change archive dest when archive is running.", K(ret), K_(backup_dest));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "change archive dest when archive is running is");
+  } else if (OB_FAIL(ObIBackupConfigItemParser::set_default_checksum_type(backup_dest_))) {
+    LOG_WARN("fail to check dest checksum type", K(ret));
   } else if (OB_FAIL(backup_dest.set(backup_dest_))) {
     LOG_WARN("fail to set backup dest", K(ret));
   } else {
@@ -660,6 +666,10 @@ int ObLogArchiveDestConfigParser::check_before_update_inner_config(obrpc::ObSrvR
     } else if (OB_FAIL(dest_mgr.init(tenant_id_, dest_type, backup_dest_, trans))) {
       LOG_WARN("fail to update archive dest config", K(ret), K_(tenant_id));
     } else if (OB_FAIL(dest_mgr.check_dest_validity(rpc_proxy, false/*need_format_file*/))) {
+      if (OB_OBJECT_STORAGE_OBJECT_LOCKED_BY_WORM == ret) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                          "set backup dest: parameter enable_worm=true is required for bucket with worm.");
+      }
       LOG_WARN("fail to update archive dest config", K(ret), K_(tenant_id));
     }
   }
@@ -831,3 +841,251 @@ int ObLogArchiveDestStateConfigParser::check_before_update_inner_config(obrpc::O
   return ret;
 }
 
+int ObIBackupConfigItemParser::set_default_checksum_type(share::ObBackupPathString &backup_dest)
+{
+  int ret = OB_SUCCESS;
+  char tmp_str[OB_MAX_BACKUP_DEST_LENGTH] = { 0 };
+
+  if (backup_dest.is_empty() || OB_MAX_BACKUP_DEST_LENGTH < backup_dest.size()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("backup dest is empty or too long", K(ret), "str_size", backup_dest.size());
+  } else {
+    if ( NULL != strstr(backup_dest.ptr(), CHECKSUM_TYPE)) { // user has specified checksum type
+    } else {
+      ObBackupDest tmp_dest;
+      if (OB_FAIL(tmp_dest.set(backup_dest))) {
+        LOG_WARN("fail to set tmp backup dest", K(ret));
+      } else if (is_object_storage_type(tmp_dest.get_storage_info()->get_type())) {
+        int64_t pos = 0;
+        if (OB_FAIL(databuff_printf(tmp_str, OB_MAX_BACKUP_DEST_LENGTH, pos, "%s%s%s%s",
+                                    backup_dest.ptr(), "&", CHECKSUM_TYPE, CHECKSUM_TYPE_MD5))) {
+          LOG_WARN("fail to databuff printf", K(ret));
+        } else if (OB_FAIL(backup_dest.assign(tmp_str))) {
+          LOG_WARN("fail to assign backup dest", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObIBackupConfigItemParser::set_default_checksum_type(ObBackupDest &backup_dest)
+{
+  int ret = OB_SUCCESS;
+  if (!backup_dest.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid backup dest", K(ret), K(backup_dest));
+  } else {
+    char buf[OB_MAX_BACKUP_DEST_LENGTH] = { 0 };
+    ObBackupPathString backup_dest_str;
+    if (OB_FAIL(backup_dest.get_backup_dest_str(buf, OB_MAX_BACKUP_DEST_LENGTH))) {
+      LOG_WARN("fail to get backup dest str", K(ret), K(backup_dest));
+    } else if (OB_FAIL(backup_dest_str.assign(buf))) {
+      LOG_WARN("fail to assign backup dest str", K(ret), K(backup_dest));
+    } else if (OB_FAIL(set_default_checksum_type(backup_dest_str))) {
+      LOG_WARN("fail to set default checksum type", K(ret), K(backup_dest));
+    } else if (OB_FALSE_IT(backup_dest.reset())) {
+    } else if (OB_FAIL(backup_dest.set(backup_dest_str))) {
+      LOG_WARN("fail to set backup dest", K(ret), K(backup_dest_str));
+    }
+  }
+  return ret;
+}
+
+ChangeExternalStorageDestMgr::ChangeExternalStorageDestMgr()
+  : is_inited_(false),
+    tenant_id_(OB_INVALID_TENANT_ID),
+    dest_id_(OB_INVALID_DEST_ID),
+    dest_type_(ObBackupDestType::TYPE::DEST_TYPE_MAX),
+    sql_proxy_(NULL),
+    backup_dest_()
+
+{
+}
+
+void ChangeExternalStorageDestMgr::reset()
+{
+  is_inited_ = false;
+  tenant_id_ = OB_INVALID_TENANT_ID;
+  dest_id_ = OB_INVALID_DEST_ID;
+  dest_type_ = ObBackupDestType::TYPE::DEST_TYPE_MAX;
+  backup_dest_.reset();
+  sql_proxy_ = NULL;
+}
+
+int ChangeExternalStorageDestMgr::init(
+    const uint64_t tenant_id,
+    const common::ObFixedLengthString<common::OB_MAX_CONFIG_VALUE_LEN> &path,
+    common::ObISQLClient &sql_proxy)
+{
+  int ret = OB_SUCCESS;
+  ObBackupPathString backup_path;
+
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("ChangeExternalStorageDest init twice.", K(ret));
+  } else if (OB_INVALID_TENANT_ID == tenant_id || path.is_empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid dest", K(ret), K(path));
+  } else if (OB_FAIL(backup_dest_.set_storage_path(path.ptr()))) {
+    LOG_WARN("failed to set backup dest", K(ret), K(path));
+  } else if (OB_FAIL(backup_dest_.get_backup_path_str(backup_path.ptr(), backup_path.capacity()))) {
+    LOG_WARN("fail to get backup path str", K(ret), K(tenant_id));
+  } else if (OB_FAIL(ObBackupStorageInfoOperator::get_backup_dest(sql_proxy, tenant_id, backup_path, backup_dest_))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      LOG_USER_ERROR(OB_ENTRY_NOT_EXIST, "the path does not exist");
+    }
+    LOG_WARN("failed to get backup dest", K(ret), K(tenant_id), K(backup_path));
+  } else if (OB_FAIL(ObBackupStorageInfoOperator::get_dest_type(sql_proxy, tenant_id, backup_dest_, dest_type_))) {
+    LOG_WARN("failed to get dest type", K(ret), K(tenant_id), K(backup_dest_));
+  } else if (OB_FAIL(ObBackupStorageInfoOperator::get_dest_id(sql_proxy, tenant_id, backup_dest_, dest_id_))) {
+    LOG_WARN("failed to get dest id", K(ret), K(tenant_id), K(backup_dest_));
+  } else {
+    tenant_id_ = tenant_id;
+    sql_proxy_ = &sql_proxy;
+    is_inited_ = true;
+  }
+
+  return ret;
+}
+
+//Updates backup_dest_ with new access_id and access_key, and validates the access permissions of new ak&sk.
+int ChangeExternalStorageDestMgr::update_and_validate_authorization(const char *access_id, const char *access_key)
+{
+  int ret = OB_SUCCESS;
+  ObBackupDestMgr dest_mgr;
+  ObBackupPathString backup_dest_str;
+  obrpc::ObSrvRpcProxy *rpc_proxy = nullptr;
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ChangeExternalStorageDestMgr not init", K(ret));
+  } else if (OB_ISNULL(rpc_proxy = GCTX.srv_rpc_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("rpc_proxy should not be NULL", K(ret), KP(rpc_proxy));
+  } else if (OB_FAIL(update_backup_dest_authorization_(access_id, access_key))) {
+    LOG_WARN("failed to update backup dest authorization", K(ret), KCSTRING(access_id));
+  } else if (OB_FAIL(backup_dest_.get_backup_dest_str(backup_dest_str.ptr(), backup_dest_str.capacity()))) {
+    LOG_WARN("fail to get backup dest str", K(ret));
+  } else if (OB_FAIL(dest_mgr.init(tenant_id_, dest_type_, backup_dest_str, *sql_proxy_))) {
+    LOG_WARN("failed to init dest mgr", K(ret), K(tenant_id_), K(backup_dest_str));
+  } else if (OB_FAIL(dest_mgr.check_dest_validity(*rpc_proxy, true/*need_format_file*/))) {
+    LOG_WARN("fail to check archive dest validity", K(ret), K(tenant_id_), K(backup_dest_str));
+  } else {
+    LOG_INFO("succeed to check archive dest validity", K(tenant_id_), K(backup_dest_str));
+  }
+
+  return ret;
+}
+
+//updates dest attr in __all_backup_parameter_table, __all_log_archive_dest_parameter and __all_backup_storage_info.
+int ChangeExternalStorageDestMgr::update_backup_dest_authorization_(const char *access_id, const char *access_key)
+{
+  int ret = OB_SUCCESS;
+
+  if (OB_ISNULL(access_id) || OB_ISNULL(access_key) || 0 >= strlen(access_id) || 0 >= strlen(access_key)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("access_id or access_key is null", K(ret), KP(access_id));
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "reset ak/sk, access_id or access_key is null");
+  } else if (!backup_dest_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("backup dest is not valid", K(ret), K(backup_dest_));
+  } else if (backup_dest_.is_storage_type_file()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("nfs path not support reset ak/sk", K(ret), K(backup_dest_));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reset ak/sk of nfs path");
+  } else if (backup_dest_.is_assume_role_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("assume role mode not support reset ak/sk", K(ret), K(backup_dest_));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reset ak/sk of path with assume role mode ");
+  } else if (OB_FAIL(backup_dest_.reset_access_id_and_access_key(access_id, access_key))) {
+    LOG_WARN("failed to reset access id and access key", K(ret), KCSTRING(access_id));
+  }
+
+  return ret;
+}
+
+int ChangeExternalStorageDestMgr::update_backup_parameter_(common::ObISQLClient &trans)
+{
+  int ret = OB_SUCCESS;
+  ObBackupHelper backup_helper;
+  ObBackupPathString backup_dest_str;
+  ObBackupDest dest;
+  bool is_equal = false;
+
+  if (OB_FAIL(backup_helper.init(tenant_id_, trans))) {
+    LOG_WARN("fail to init backup helper", K(ret), K(tenant_id_));
+  } else if (OB_FAIL(backup_helper.get_backup_dest(backup_dest_str))) {
+    LOG_WARN("fail to get backup dest", K(ret), K(tenant_id_));
+  } else if (backup_dest_str.is_empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("backup dest is empty", K(ret), K(tenant_id_));
+  } else if (OB_FAIL(dest.set(backup_dest_str.ptr()))) {
+    LOG_WARN("fail to set backup dest", K(ret), K(tenant_id_));
+  } else if (OB_FAIL(dest.is_backup_path_equal(backup_dest_, is_equal))) {
+    LOG_WARN("fail to check backup dest equal", K(ret));
+  } else if (is_equal) {
+    backup_dest_str.reset();
+    if (OB_FAIL(backup_dest_.get_backup_dest_str(backup_dest_str.ptr(), backup_dest_str.capacity()))) {
+      LOG_WARN("fail to get backup dest str", K(ret), K(tenant_id_));
+    } else if (OB_FAIL(backup_helper.set_backup_dest(backup_dest_str))) {
+      LOG_WARN("fail to set backup dest", K(ret), K(backup_dest_str));
+    }
+  }
+
+  return ret;
+}
+
+int ChangeExternalStorageDestMgr::update_archive_parameter_(common::ObISQLClient &trans)
+{
+  int ret = OB_SUCCESS;
+  ObArchivePersistHelper archive_helper;
+  // Only one dest is supported.
+  const int64_t dest_no = 0;
+  const bool need_lock = true;
+  int64_t dest_id = OB_INVALID_DEST_ID;
+  ObBackupPathString archive_dest_str;
+  ObSqlString key;
+  ObSqlString value;
+
+  if (OB_FAIL(archive_helper.init(tenant_id_))) {
+    LOG_WARN("fail to init archive helper", K(ret), K(tenant_id_));
+  } else if (OB_FAIL(archive_helper.get_dest_id(trans, need_lock, dest_no, dest_id))) {
+    LOG_WARN("fail to get archive dest id", K(ret), K(tenant_id_));
+  } else if (dest_id == dest_id_) {
+    if (OB_FAIL(backup_dest_.get_backup_dest_str(archive_dest_str.ptr(), archive_dest_str.capacity()))) {
+      LOG_WARN("fail to get backup dest str", K(ret), K(tenant_id_));
+    } else if (OB_FAIL(key.assign(OB_STR_PATH))) {
+      LOG_WARN("failed to assign key", K(ret));
+    } else if (OB_FAIL(value.assign(archive_dest_str.ptr()))) {
+      LOG_WARN("failed to assign value", K(ret));
+    } else if (OB_FAIL(archive_helper.set_kv_item(trans, dest_no, key, value))) {
+      LOG_WARN("fail to reset log archive dest", K(ret));
+    }
+  }
+
+  return ret;
+}
+
+int ChangeExternalStorageDestMgr::update_inner_table_authorization(common::ObISQLClient &trans)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ChangeExternalStorageDestMgr not init", K(ret));
+  } else if (!backup_dest_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("backup dest is not valid", K(ret), K(backup_dest_));
+  } else if (OB_FAIL(ObBackupStorageInfoOperator::update_backup_authorization(trans, tenant_id_, backup_dest_))) {
+    LOG_WARN("failed to update backup authorization", K(ret), K(tenant_id_), K(backup_dest_));
+  } else if (ObBackupDestType::TYPE::DEST_TYPE_BACKUP_DATA == dest_type_) {
+    if (OB_FAIL(update_backup_parameter_(trans))) {
+      LOG_WARN("failed to update backup parameter table", K(ret), K(tenant_id_), K(backup_dest_));
+    }
+  } else if (ObBackupDestType::TYPE::DEST_TYPE_ARCHIVE_LOG == dest_type_) {
+    if (OB_FAIL(update_archive_parameter_(trans))) {
+      LOG_WARN("failed to update log archive dest table", K(ret), K(tenant_id_), K(backup_dest_));
+    }
+  }
+  return ret;
+}

@@ -10,17 +10,9 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "ob_gts_define.h"
 #include "ob_gts_source.h"
-#include "ob_gts_rpc.h"
-//#include "ob_ts_worker.h"
-#include "lib/utility/utility.h"
-#include "lib/utility/ob_tracepoint.h"
-#include "ob_trans_part_ctx.h"
 #include "ob_trans_service.h"
 #include "ob_timestamp_access.h"
-#include "ob_location_adapter.h"
-#include "share/ob_ls_id.h"
 
 namespace oceanbase
 {
@@ -158,10 +150,7 @@ int ObGtsSource::get_gts(ObTsCbTask *task, int64_t &gts)
   int tmp_ret = OB_SUCCESS;
   int64_t tmp_gts = 0;
 
-  if (OB_UNLIKELY(!is_inited_)) {
-    ret = OB_NOT_INIT;
-    TRANS_LOG(WARN, "not inited", KR(ret));
-  } else if (OB_SUCCESS == (ret = gts_local_cache_.get_gts(tmp_gts))) {
+  if (OB_SUCCESS == (ret = gts_local_cache_.get_gts(tmp_gts))) {
     //Able to find a suitable gts value
     gts = tmp_gts;
   } else if (OB_EAGAIN != ret) {
@@ -526,6 +515,7 @@ int ObGtsSource::get_gts_leader_(ObAddr &leader)
 {
   int ret = OB_SUCCESS;
   const int64_t cluster_id = GCONF.cluster_id;
+  ObLSID ls_id = GTS_LS;
 #ifdef ERRSIM
   ret = OB_E(EventTable::EN_GET_GTS_LEADER) OB_SUCCESS;
   if (OB_LS_LOCATION_LEADER_NOT_EXIST == ret) {
@@ -533,9 +523,12 @@ int ObGtsSource::get_gts_leader_(ObAddr &leader)
     return ret;
   }
 #endif
+  if (GCTX.is_shared_storage_mode() && is_meta_tenant(tenant_id_)) {
+    ls_id = SSLOG_LS;
+  }
   if (gts_cache_leader_.is_valid()) {
     leader = gts_cache_leader_;
-  } else if (OB_FAIL(location_adapter_->nonblock_get_leader(cluster_id, tenant_id_, GTS_LS, leader))) {
+  } else if (OB_FAIL(location_adapter_->nonblock_get_leader(cluster_id, tenant_id_, ls_id, leader))) {
     if (EXECUTE_COUNT_PER_SEC(16)) {
       TRANS_LOG(WARN, "gts nonblock get leader failed", K(ret), K_(tenant_id), K(GTS_LS));
     }
@@ -548,6 +541,7 @@ int ObGtsSource::get_gts_leader_(ObAddr &leader)
       TRANS_LOG(WARN, "gts cache leader is invalid", KR(ret), K(leader), K(*this));
     }
   }
+  ACTIVE_SESSION_RETRY_DIAG_INFO_SETTER(sys_ls_leader_addr_, static_cast<int64_t>(leader.get_ipv4() << 31 | leader.get_port()));
 
   return ret;
 }
@@ -576,9 +570,13 @@ int ObGtsSource::refresh_gts_location_()
 {
   int ret = OB_SUCCESS;
   gts_cache_leader_.reset();
+  ObLSID ls_id = GTS_LS;
+  if (GCTX.is_shared_storage_mode() && is_meta_tenant(tenant_id_)) {
+    ls_id = SSLOG_LS;
+  }
   if (refresh_location_interval_.reach()) {
     const int64_t cluster_id = GCONF.cluster_id;
-    if (OB_FAIL(location_adapter_->nonblock_renew(cluster_id, tenant_id_, GTS_LS))) {
+    if (OB_FAIL(location_adapter_->nonblock_renew(cluster_id, tenant_id_, ls_id))) {
       TRANS_LOG(WARN, "gts nonblock renew error", KR(ret), K(GTS_LS));
     } else {
       TRANS_LOG(INFO, "gts nonblock renew success", K(ret), K_(tenant_id), K_(gts_local_cache));

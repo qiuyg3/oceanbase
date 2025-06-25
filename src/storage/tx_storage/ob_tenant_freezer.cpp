@@ -12,20 +12,13 @@
 
 #define USING_LOG_PREFIX STORAGE
 
-#include "lib/utility/utility.h"
-#include "lib/oblog/ob_log.h"
+#include "ob_tenant_freezer.h"
 #include "observer/ob_srv_network_frame.h"
-#include "observer/omt/ob_tenant_config_mgr.h"  // ObTenantConfigGuard
 #include "rootserver/freeze/ob_major_freeze_helper.h"
 #include "share/allocator/ob_shared_memory_allocator_mgr.h"
-#include "share/config/ob_server_config.h"
-#include "share/ob_share_util.h"
-#include "share/rc/ob_tenant_module_init_ctx.h"
-#include "storage/ls/ob_ls.h"
-#include "storage/tx_storage/ob_ls_handle.h"
 #include "storage/tx_storage/ob_ls_service.h"
-#include "storage/tx_storage/ob_tenant_freezer.h"
 #include "storage/multi_data_source/runtime_utility/mds_tenant_service.h"
+#include "observer/ob_server_event_history_table_operator.h"
 
 namespace oceanbase
 {
@@ -46,10 +39,10 @@ ObTenantFreezer::ObTenantFreezer()
     rs_mgr_(nullptr),
     freeze_thread_pool_(),
     freeze_thread_pool_lock_(common::ObLatchIds::FREEZE_THREAD_POOL_LOCK),
-    exist_ls_freezing_(false),
-    last_update_ts_(0),
     freezer_stat_(),
-    freezer_history_()
+    freezer_history_(),
+    throttle_is_skipping_cache_(),
+    memstore_remain_memory_is_exhausting_cache_()
 {
   freezer_stat_.reset();
 }
@@ -63,13 +56,14 @@ void ObTenantFreezer::destroy()
 {
   freeze_trigger_timer_.destroy();
   is_freezing_tx_data_ = false;
-  exist_ls_freezing_ = false;
   self_.reset();
   svr_rpc_proxy_ = nullptr;
   common_rpc_proxy_ = nullptr;
   rs_mgr_ = nullptr;
   freezer_stat_.reset();
   freezer_history_.reset();
+  throttle_is_skipping_cache_.reset();
+  memstore_remain_memory_is_exhausting_cache_.reset();
 
   is_inited_ = false;
 }
@@ -160,12 +154,46 @@ void ObTenantFreezer::wait()
 
 bool ObTenantFreezer::exist_ls_freezing()
 {
-  int64_t cur_ts = ObTimeUtility::fast_current_time();
-  int64_t old_ts = last_update_ts_;
+  int ret = OB_SUCCESS;
+  bool exist_ls_freezing = false;
+  common::ObSharedGuard<ObLSIterator> iter;
+  ObLSService *ls_srv = MTL(ObLSService *);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("[TenantFreezer] tenant freezer not inited", KR(ret));
+  } else if (OB_FAIL(ls_srv->get_ls_iter(iter, ObLSGetMod::TXSTORAGE_MOD))) {
+    LOG_WARN("[TenantFreezer] fail to get log stream iterator", KR(ret));
+  } else {
+    ObLS *ls = nullptr;
+    while (OB_SUCC(iter->get_next(ls))) {
+      if (ls->get_freezer()->is_ls_freeze_running()) {
+        exist_ls_freezing = true;
+        break;
+      }
+    }
 
-  if ((cur_ts - last_update_ts_ > UPDATE_INTERVAL) &&
-      old_ts == ATOMIC_CAS(&last_update_ts_, old_ts, cur_ts)) {
-    int ret = OB_SUCCESS;
+    if (ret == OB_ITER_END) {
+      ret = OB_SUCCESS;
+    }
+
+    if (OB_FAIL(ret)) {
+      LOG_WARN("[TenantFreezer] iter ls failed", K(ret));
+    }
+  }
+
+  return exist_ls_freezing;
+}
+
+bool ObTenantFreezer::exist_ls_throttle_is_skipping()
+{
+  int ret = OB_SUCCESS;
+  int64_t cur_ts = ObClockGenerator::getClock();
+  int64_t last_update_ts = throttle_is_skipping_cache_.update_ts_;
+
+  if ((cur_ts - last_update_ts > UPDATE_INTERVAL) &&
+      ATOMIC_BCAS(&throttle_is_skipping_cache_.update_ts_, last_update_ts, cur_ts)) {
+    bool exist_ls_throttle_is_skipping = false;
+
     common::ObSharedGuard<ObLSIterator> iter;
     ObLSService *ls_srv = MTL(ObLSService *);
     if (IS_NOT_INIT) {
@@ -175,39 +203,80 @@ bool ObTenantFreezer::exist_ls_freezing()
       LOG_WARN("[TenantFreezer] fail to get log stream iterator", KR(ret));
     } else {
       ObLS *ls = nullptr;
-      int ls_cnt = 0;
-      int exist_ls_freezing = false;
-      for (; OB_SUCC(iter->get_next(ls)); ++ls_cnt) {
-        int tmp_ret = OB_SUCCESS;
-        ObRole role;
-        int64_t proposal_id = 0;
-        if (OB_TMP_FAIL(ls->get_log_handler()->get_role(role, proposal_id))) {
-          LOG_WARN("get ls role failed", KR(tmp_ret), K(ls->get_ls_id()));
-        } else if (common::is_strong_leader(role)) {
-          // skip check leader logstream
-        } else if (ls->get_freezer()->is_freeze()) {
-          exist_ls_freezing = true;
+      while (OB_SUCC(iter->get_next(ls))) {
+        if (ls->get_freezer()->throttle_is_skipping()) {
+          exist_ls_throttle_is_skipping = true;
+          break;
         }
       }
-      exist_ls_freezing_ = exist_ls_freezing;
-
       if (ret == OB_ITER_END) {
         ret = OB_SUCCESS;
-      } else {
-         LOG_WARN("[TenantFreezer] iter ls failed", K(ret));
+      }
+
+      if (OB_FAIL(ret)) {
+        LOG_WARN("[TenantFreezer] iter ls failed", K(ret));
       }
     }
+
+    // assign need_skip_throttle here because if some error happened, the value can be reset to false
+    throttle_is_skipping_cache_.value_ = exist_ls_throttle_is_skipping;
   }
 
-  return exist_ls_freezing_;
+  return throttle_is_skipping_cache_.value_;
 }
 
-int ObTenantFreezer::ls_freeze_(ObLS *ls, const bool is_sync, const int64_t abs_timeout_ts)
+bool ObTenantFreezer::memstore_remain_memory_is_exhausting()
+{
+  int ret = OB_SUCCESS;
+  int64_t cur_ts = ObClockGenerator::getClock();
+  int64_t last_update_ts = memstore_remain_memory_is_exhausting_cache_.update_ts_;
+
+  if ((cur_ts - last_update_ts > UPDATE_INTERVAL) &&
+      ATOMIC_BCAS(&memstore_remain_memory_is_exhausting_cache_.update_ts_, last_update_ts, cur_ts)) {
+    bool remain_mem_exhausting = false;
+    if (false == tenant_info_.is_loaded_) {
+      LOG_INFO("[TenantFreezer] This tenant not exist", KR(ret));
+    } else {
+      const int64_t MEMORY_IS_EXHAUSTING_PERCENTAGE = 10;
+
+      // tenant memory condition
+      const int64_t tenant_memory_limit = get_tenant_memory_limit(MTL_ID());
+      const int64_t tenant_memory_remain = get_tenant_memory_remain(MTL_ID());
+      const bool tenant_memory_exhausting =
+          tenant_memory_remain < (tenant_memory_limit * MEMORY_IS_EXHAUSTING_PERCENTAGE / 100);
+
+      // memstore memory condition
+      const int64_t memstore_limit = tenant_info_.get_memstore_limit();
+      const int64_t memstore_remain = (memstore_limit - get_tenant_memory_hold(MTL_ID(), ObCtxIds::MEMSTORE_CTX_ID));
+      const bool memstore_memory_exhausting = memstore_remain < (memstore_limit * MEMORY_IS_EXHAUSTING_PERCENTAGE / 100);
+
+      remain_mem_exhausting = tenant_memory_exhausting || memstore_memory_exhausting;
+
+      if (remain_mem_exhausting && REACH_TIME_INTERVAL(1LL * 1000LL * 1000LL /* 1 second */)) {
+        STORAGE_LOG(INFO,
+                    "[TenantFreezer] memstore remain memory is exhausting",
+                    K(tenant_memory_limit),
+                    K(tenant_memory_remain),
+                    K(tenant_memory_exhausting),
+                    K(memstore_limit),
+                    K(memstore_remain),
+                    K(memstore_memory_exhausting));
+      }
+    }
+
+    memstore_remain_memory_is_exhausting_cache_.value_ = remain_mem_exhausting;
+  }
+
+  return memstore_remain_memory_is_exhausting_cache_.value_;
+}
+
+int ObTenantFreezer::ls_freeze_data_(ObLS *ls)
 {
   int ret = OB_SUCCESS;
   const int64_t SLEEP_TS = 1000 * 1000; // 1s
-  int64_t current_ts = 0;
+  const int64_t abs_timeout_ts = ObClockGenerator::getClock() + TENANT_FREEZE_RETRY_TIME_US;
   int64_t retry_times = 0;
+  const bool is_sync = true;
   bool is_timeout = false;
   bool need_retry = false;
   // wait and retry if there is a freeze is doing
@@ -215,7 +284,10 @@ int ObTenantFreezer::ls_freeze_(ObLS *ls, const bool is_sync, const int64_t abs_
   do {
     need_retry = false;
     retry_times++;
-    if (OB_SUCC(ls->logstream_freeze(checkpoint::INVALID_TRACE_ID, is_sync, abs_timeout_ts))) {
+    if (OB_SUCC(ls->logstream_freeze(checkpoint::INVALID_TRACE_ID,
+                                     is_sync,
+                                     abs_timeout_ts,
+                                     ObFreezeSourceFlag::FREEZE_TRIGGER))) {
     } else {
       need_retry = (ObClockGenerator::getClock() < abs_timeout_ts) && (OB_EAGAIN == ret);
     }
@@ -232,7 +304,9 @@ int ObTenantFreezer::ls_freeze_(ObLS *ls, const bool is_sync, const int64_t abs_
   return ret;
 }
 
-int ObTenantFreezer::ls_freeze_all_unit_(ObLS *ls, const int64_t abs_timeout_ts)
+int ObTenantFreezer::ls_freeze_all_unit_(ObLS *ls,
+                                         const int64_t abs_timeout_ts,
+                                         const ObFreezeSourceFlag source)
 {
   int ret = OB_SUCCESS;
   const int64_t SLEEP_TS = 1000 * 1000; // 1s
@@ -244,7 +318,10 @@ int ObTenantFreezer::ls_freeze_all_unit_(ObLS *ls, const int64_t abs_timeout_ts)
   do {
     need_retry = false;
     retry_times++;
-    if (OB_SUCC(ls->advance_checkpoint_by_flush(SCN::max_scn(), abs_timeout_ts, true /* is_tennat_freeze */))) {
+    if (OB_SUCC(ls->advance_checkpoint_by_flush(SCN::max_scn(),
+                                                abs_timeout_ts,
+                                                true, /* is_tenant_freeze */
+                                                source))) {
     } else {
       current_ts = ObTimeUtil::current_time();
       is_timeout = (current_ts >= abs_timeout_ts);
@@ -266,46 +343,7 @@ int ObTenantFreezer::ls_freeze_all_unit_(ObLS *ls, const int64_t abs_timeout_ts)
   return ret;
 }
 
-int ObTenantFreezer::tablet_freeze_(ObLS *ls,
-                                    const common::ObTabletID &tablet_id,
-                                    const bool need_rewrite_tablet_meta,
-                                    const bool is_sync,
-                                    const int64_t abs_timeout_ts)
-{
-  int ret = OB_SUCCESS;
-  const int64_t SLEEP_TS = 1000 * 1000; // 1s
-  int64_t current_ts = 0;
-  int64_t retry_times = 0;
-  bool is_timeout = false;
-  bool need_retry = false;
-  // wait and retry if there is a freeze is doing
-  // or if we can not get the ls lock.
-  do {
-    need_retry = false;
-    retry_times++;
-    if (OB_SUCC(ls->tablet_freeze(tablet_id, is_sync, abs_timeout_ts, need_rewrite_tablet_meta))) {
-    } else {
-      current_ts = ObTimeUtil::current_time();
-      is_timeout = (current_ts >= abs_timeout_ts);
-      // retry condition 1
-      need_retry = (!is_timeout);
-      // retry condition 2, 3
-      need_retry = need_retry && (OB_EAGAIN == ret);
-    }
-    if (need_retry) {
-      ob_usleep(SLEEP_TS);
-    }
-    if (retry_times % 10 == 0) {
-      LOG_WARN_RET(OB_ERR_TOO_MUCH_TIME, "wait ls freeze finished cost too much time", K(retry_times));
-    }
-  } while (need_retry);
-  if (OB_NOT_RUNNING == ret) {
-    ret = OB_SUCCESS;
-  }
-  return ret;
-}
-
-int ObTenantFreezer::tenant_freeze_()
+int ObTenantFreezer::tenant_freeze_data_()
 {
   int ret = OB_SUCCESS;
   int first_fail_ret = OB_SUCCESS;
@@ -322,9 +360,7 @@ int ObTenantFreezer::tenant_freeze_()
     for (; OB_SUCC(iter->get_next(ls)); ++ls_cnt) {
       // wait until this ls freeze finished to make sure not freeze frequently because
       // of this ls freeze stuck.
-      const bool is_sync = true;
-      const int64_t abs_timeout_ts = 0;
-      if (OB_FAIL(ls_freeze_(ls, is_sync, abs_timeout_ts))) {
+      if (OB_FAIL(ls_freeze_data_(ls))) {
         if (OB_SUCCESS == first_fail_ret) {
           first_fail_ret = ret;
         }
@@ -348,7 +384,8 @@ int ObTenantFreezer::tenant_freeze_()
   return ret;
 }
 
-int ObTenantFreezer::tenant_freeze()
+// only called by user triggered minor freeze
+int ObTenantFreezer::tenant_freeze(const ObFreezeSourceFlag source)
 {
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
@@ -370,9 +407,11 @@ int ObTenantFreezer::tenant_freeze()
   } else if (OB_ISNULL(iter = guard.get_ptr())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("iter is NULL", K(ret));
+  } else if (OB_FAIL(set_tenant_freezing_())) {
+    LOG_WARN("set tenant freeze failed", K(ret));
   } else {
     for (; OB_SUCC(iter->get_next(ls)); ++ls_cnt) {
-      if (OB_TMP_FAIL(ls_freeze_all_unit_(ls, abs_timeout_ts))) {
+      if (OB_TMP_FAIL(ls_freeze_all_unit_(ls, abs_timeout_ts, source))) {
         LOG_WARN("ls freeze all unit failed", K(tmp_ret), K(ls->get_ls_id()));
       }
     }
@@ -384,19 +423,22 @@ int ObTenantFreezer::tenant_freeze()
   if (OB_SUCC(ret)) {
     freezer_stat_.add_freeze_event();
   }
+  if (OB_TMP_FAIL(unset_tenant_freezing_(OB_FAIL(ret)))) {
+    LOG_WARN("unset tenant freeze failed", KR(tmp_ret));
+  }
 
   LOG_INFO("tenant_freeze finished", KR(ret), K(abs_timeout_ts));
 
   return ret;
 }
 
-int ObTenantFreezer::ls_freeze(const share::ObLSID &ls_id)
+int ObTenantFreezer::ls_freeze_all_unit(const share::ObLSID &ls_id,
+                                        const ObFreezeSourceFlag source)
 {
   int ret = OB_SUCCESS;
   ObLSService *ls_srv = MTL(ObLSService *);
   ObLSHandle handle;
   ObLS *ls = nullptr;
-  const bool is_sync = false;
   const bool need_rewrite_tablet_meta = false;
   int64_t abs_timeout_ts = 0;
 
@@ -411,47 +453,27 @@ int ObTenantFreezer::ls_freeze(const share::ObLSID &ls_id)
   } else if (OB_ISNULL(ls = handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[TenantFreezer] ls is null", KR(ret), K(ls_id));
-  } else if (OB_FAIL(ls_freeze_(ls, is_sync, abs_timeout_ts))) {
+  } else if (OB_FAIL(ls_freeze_all_unit_(ls, abs_timeout_ts, source))) {
     LOG_WARN("[TenantFreezer] logstream freeze failed", KR(ret), K(ls_id));
   }
 
   return ret;
 }
 
-int ObTenantFreezer::tablet_freeze(const common::ObTabletID &tablet_id,
-                                   const bool need_rewrite_tablet_meta,
-                                   const bool is_sync)
-{
-  return tablet_freeze(ObLSID(ObLSID::INVALID_LS_ID),
-                       tablet_id,
-                       need_rewrite_tablet_meta,
-                       is_sync);
-}
-
 int ObTenantFreezer::tablet_freeze(share::ObLSID ls_id,
                                    const common::ObTabletID &tablet_id,
+                                   const bool is_sync,
+                                   const int64_t max_retry_time_us,
                                    const bool need_rewrite_tablet_meta,
-                                   const bool is_sync)
+                                   const ObFreezeSourceFlag source)
 {
   int ret = OB_SUCCESS;
   bool is_cache_hit = false;
   ObLSService *ls_srv = MTL(ObLSService *);
   ObLSHandle handle;
   ObLS *ls = nullptr;
-  int64_t abs_timeout_ts = INT64_MAX;
-
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("[TenantFreezer] tenant freezer not inited", KR(ret));
-  } else if (OB_FAIL(ObShareUtil::get_abs_timeout(MAX_FREEZE_TIMEOUT_US/* default timeout */,
-                                                  abs_timeout_ts))) {
-    LOG_WARN("get timeout ts failed", KR(ret));
-  } else if (!ls_id.is_valid()) {
-    // if ls_id is invalid, get ls id by tablet id
-    if (OB_FAIL(GCTX.location_service_->get(tenant_info_.tenant_id_, tablet_id, INT64_MAX, is_cache_hit, ls_id))) {
-      LOG_WARN("[TenantFreezer] fail to get ls id according to tablet_id", KR(ret), K(tablet_id));
-    }
-  }
+  // 0 as default timeout ts
+  const int64_t abs_timeout_ts = (0 == max_retry_time_us) ? 0 : ObClockGenerator::getClock() + max_retry_time_us;
 
   FLOG_INFO("[TenantFreezer] tablet_freeze start",
             KR(ret),
@@ -461,24 +483,29 @@ int ObTenantFreezer::tablet_freeze(share::ObLSID ls_id,
             K(tablet_id),
             KTIME(abs_timeout_ts));
 
-  if (OB_FAIL(ret)) {
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("[TenantFreezer] tenant freezer not inited", KR(ret));
+  } else if (!ls_id.is_valid()) {
+    LOG_ERROR("[TenantFreezer] ls id can not be invalid", KR(ret), K(tablet_id));
   } else if (OB_FAIL(ls_srv->get_ls(ls_id, handle, ObLSGetMod::TXSTORAGE_MOD))) {
     LOG_WARN("[TenantFreezer] fail to get ls", K(ret), K(ls_id));
   } else if (OB_ISNULL(ls = handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[TenantFreezer] ls is null", KR(ret), K(ls_id));
-  } else if (OB_FAIL(tablet_freeze_(ls,
-                                    tablet_id,
-                                    need_rewrite_tablet_meta,
-                                    is_sync,
-                                    abs_timeout_ts))) {
+  } else if (OB_FAIL(ls->tablet_freeze(tablet_id,
+                                       is_sync,
+                                       abs_timeout_ts,
+                                       need_rewrite_tablet_meta,
+                                       source))) {
     LOG_WARN("[TenantFreezer] fail to freeze tablet", KR(ret), K(ls_id), K(tablet_id));
+    if (OB_NOT_RUNNING == ret) {
+      ret = OB_SUCCESS;
+    }
   }
 
   return ret;
 }
-
-
 
 int ObTenantFreezer::check_and_freeze_normal_data_(ObTenantFreezeCtx &ctx)
 {
@@ -504,7 +531,7 @@ int ObTenantFreezer::check_and_freeze_normal_data_(ObTenantFreezeCtx &ctx)
       LOG_WARN("[TenantFreezer] fail to do major freeze", K(tmp_ret));
     }
     if (need_freeze) {
-      if (OB_TMP_FAIL(do_minor_freeze_(ctx))) {
+      if (OB_TMP_FAIL(do_minor_freeze_data_(ctx))) {
         LOG_WARN("[TenantFreezer] fail to do minor freeze", K(tmp_ret));
       }
     }
@@ -533,6 +560,7 @@ int ObTenantFreezer::check_and_freeze_tx_data_()
   int64_t tx_data_mem_limit = total_memory * ObTenantTxDataAllocator::TX_DATA_LIMIT_PERCENTAGE / 100;
 
   static int skip_count = 0;
+  bool need_re_freeze = false;
   if (true == ATOMIC_LOAD(&is_freezing_tx_data_)) {
     // skip freeze when there is another self freeze task is running
     if (++skip_count > 10) {
@@ -543,9 +571,9 @@ int ObTenantFreezer::check_and_freeze_tx_data_()
                    K(skip_count),
                    K(cost_time));
     }
-  } else if (OB_FAIL(get_tenant_tx_data_mem_used_(frozen_tx_data_mem_used, active_tx_data_mem_used))) {
+  } else if (OB_FAIL(get_tx_data_info_for_freeze_(frozen_tx_data_mem_used, active_tx_data_mem_used, need_re_freeze))) {
     LOG_WARN("[TenantFreezer] get tenant tx data mem used failed.", KR(ret));
-  } else if (active_tx_data_mem_used > self_freeze_trigger_memory) {
+  } else if (need_re_freeze || active_tx_data_mem_used > self_freeze_trigger_memory) {
     // trigger tx data self freeze
     if (OB_FAIL(post_tx_data_freeze_request_())) {
       LOG_WARN("[TenantFreezer] fail to do tx data self freeze", KR(ret), K(tenant_info_.tenant_id_));
@@ -559,8 +587,8 @@ int ObTenantFreezer::check_and_freeze_tx_data_()
     int tmp_ret = OB_SUCCESS;
     if (frozen_tx_data_mem_used + active_tx_data_mem_used > tx_data_mem_limit) {
       LOG_INFO("tx data use too much memory!!!", STATISTIC_PRINT_MACRO);
-    } else if (OB_TMP_FAIL(get_tenant_tx_data_mem_used_(
-                   frozen_tx_data_mem_used, active_tx_data_mem_used, true /*for_statistic_print*/))) {
+    } else if (OB_FAIL(get_tx_data_info_for_freeze_(
+                   frozen_tx_data_mem_used, active_tx_data_mem_used, need_re_freeze, true /*for_statistic_print*/))) {
       LOG_INFO("print statistic failed");
     } else {
       LOG_INFO("TxData Memory Statistic : ", STATISTIC_PRINT_MACRO);
@@ -569,6 +597,53 @@ int ObTenantFreezer::check_and_freeze_tx_data_()
   return ret;
 }
 #undef STATISTIC_PRINT_MACRO
+
+int ObTenantFreezer::get_tx_data_info_for_freeze_(int64_t &tenant_tx_data_frozen_mem_used,
+                                                  int64_t &tenant_tx_data_active_mem_used,
+                                                  bool &need_re_freeze,
+                                                  bool for_statistic_print)
+{
+  int ret = OB_SUCCESS;
+  tenant_tx_data_frozen_mem_used = 0;
+  tenant_tx_data_active_mem_used = 0;
+  common::ObSharedGuard<ObLSIterator> iter;
+  ObLSService *ls_srv = MTL(ObLSService *);
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("[TenantFreezer] tenant freezer not inited", KR(ret));
+  } else if (OB_FAIL(ls_srv->get_ls_iter(iter, ObLSGetMod::TXSTORAGE_MOD))) {
+    LOG_WARN("[TenantFreezer] fail to get log stream iterator", KR(ret));
+  } else {
+    ObLS *ls = nullptr;
+    int ls_cnt = 0;
+    for (; OB_SUCC(ret) && OB_SUCC(iter->get_next(ls)); ++ls_cnt) {
+      int tmp_ret = OB_SUCCESS;
+      int64_t ls_tx_data_frozen_mem_used = 0;
+      int64_t ls_tx_data_active_mem_used = 0;
+      if (!for_statistic_print && OB_NOT_NULL(ls) && ls->tx_table_need_re_freeze()) {
+        need_re_freeze = true;
+        break;
+      }
+
+      if (OB_TMP_FAIL(get_ls_tx_data_memory_info_(
+              ls, ls_tx_data_frozen_mem_used, ls_tx_data_active_mem_used, for_statistic_print))) {
+        LOG_WARN("[TenantFreezer] fail to get tx data mem used in one ls", KR(ret), K(ls->get_ls_id()));
+      } else {
+        tenant_tx_data_frozen_mem_used += ls_tx_data_frozen_mem_used;
+        tenant_tx_data_active_mem_used += ls_tx_data_active_mem_used;
+      }
+    }
+
+    if (ret == OB_ITER_END) {
+      ret = OB_SUCCESS;
+      if (0 == ls_cnt) {
+        LOG_WARN("[TenantFreezer] no logstream", KR(ret), K(ls_cnt), K(tenant_info_));
+      }
+    }
+  }
+  return ret;
+}
 
 int ObTenantFreezer::get_tenant_tx_data_mem_used_(int64_t &tenant_tx_data_frozen_mem_used,
                                                   int64_t &tenant_tx_data_active_mem_used,
@@ -717,6 +792,8 @@ int ObTenantFreezer::do_freeze_diagnose()
 
       (void)freezer_stat_.print_activity_metrics();
       (void)freezer_history_.add_activity_metric(freezer_stat_);
+
+      (void)report_freezer_source_events();
     }
 
     freezer_stat_.last_captured_timestamp_ = current_time;
@@ -724,6 +801,59 @@ int ObTenantFreezer::do_freeze_diagnose()
   }
 
   return ret;
+}
+
+void ObTenantFreezer::record_freezer_source_event(const ObLSID &ls_id,
+                                                  const ObFreezeSourceFlag source)
+{
+  if (is_valid_freeze_source((source))) {
+    ATOMIC_AAF(&freezer_stat_.captured_source_times_[static_cast<int64_t>(source)], 1);
+    STORAGE_LOG(INFO, "[Freezer] freeze from source", K(ls_id), "freeze_source", obj_to_cstring(source));
+  }
+}
+
+void ObTenantFreezer::report_freezer_source_events()
+{
+  int ret = OB_SUCCESS;
+  int64_t pos = 0;
+
+  TRANS_LOG(INFO, "[TENANT_FREEZER_EVENT] print freeze source");
+  char server_event_value[MAX_ROOTSERVICE_EVENT_VALUE_LENGTH] = {0};
+
+  ret = common::databuff_printf(server_event_value,
+                                MAX_ROOTSERVICE_EVENT_VALUE_LENGTH,
+                                pos,
+                                "[");
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < MAX_FREEZE_SOURCE_TYPE_COUNT; i++) {
+    if (is_valid_freeze_source((ObFreezeSourceFlag(i)))) {
+      int64_t captured_source_times = ATOMIC_LOAD(&(freezer_stat_.captured_source_times_[i]));
+      TRANS_LOG(INFO, "[TENANT_FREEZER_EVENT] print source", K(i),
+                "source_type", obj_to_cstring(ObFreezeSourceFlag(i)),
+                K(captured_source_times));
+      ret = common::databuff_printf(server_event_value,
+                                    MAX_ROOTSERVICE_EVENT_VALUE_LENGTH,
+                                    pos,
+                                    "%s: %ld; ",
+                                    obj_to_cstring(ObFreezeSourceFlag(i)),
+                                    captured_source_times);
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+      ret = common::databuff_printf(server_event_value,
+                                    MAX_ROOTSERVICE_EVENT_VALUE_LENGTH,
+                                    pos,
+                                    "]");
+  }
+
+  if (OB_SUCC(ret)) {
+    SERVER_EVENT_ADD("freezer", "freeze_source_statistics",
+                     "tenant_id", MTL_ID(),
+                     "source_statistics", server_event_value);
+  } else {
+    TRANS_LOG(WARN, "[TENANT_FREEZER_EVENT] print source failed", K(ret));
+  }
 }
 
 int ObTenantFreezer::check_and_do_freeze()
@@ -1545,7 +1675,7 @@ bool ObTenantFreezer::is_major_freeze_turn_()
   return (major_compact_trigger != 0 && freeze_cnt >= major_compact_trigger);
 }
 
-int ObTenantFreezer::do_minor_freeze_(const ObTenantFreezeCtx &ctx)
+int ObTenantFreezer::do_minor_freeze_data_(const ObTenantFreezeCtx &ctx)
 {
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
@@ -1564,7 +1694,7 @@ int ObTenantFreezer::do_minor_freeze_(const ObTenantFreezeCtx &ctx)
   if (OB_FAIL(set_tenant_freezing_())) {
   } else {
     bool rollback_freeze_cnt = false;
-    if (OB_FAIL(tenant_freeze_())) {
+    if (OB_FAIL(tenant_freeze_data_())) {
       rollback_freeze_cnt = true;
       LOG_WARN("fail to minor freeze", K(ret));
     } else {
@@ -1691,6 +1821,17 @@ void ObTenantFreezer::get_freezer_stat_from_history(int64_t pos, ObTenantFreezer
                                    % ObTenantFreezerStatHistory::MAX_HISTORY_LENGTH];
 }
 
+int ObTenantFreezer::update_frozen_scn(const int64_t frozen_scn)
+{
+  int ret = OB_SUCCESS;
+  if (!tenant_info_.is_loaded_) {
+    // do nothing
+  } else if (OB_FAIL(tenant_info_.update_frozen_scn(frozen_scn))) {
+    LOG_WARN("update frozen scn failed", K(ret), K(frozen_scn));
+  }
+  return ret;
+}
+
 ObTenantFreezerStat::ObFreezerMergeType ObTenantFreezerStat::switch_to_freezer_merge_type(const compaction::ObMergeType type)
 {
   ObFreezerMergeType ret_merge_type = ObFreezerMergeType::UNNECESSARY_TYPE;
@@ -1745,6 +1886,10 @@ void ObTenantFreezerStat::reset(int64_t retire_clock)
     ATOMIC_SET(&(captured_merge_times_[i]), 0);
   }
 
+  for (int64_t i = 0; i < MAX_FREEZE_SOURCE_TYPE_COUNT; i++) {
+    ATOMIC_SET(&(captured_source_times_[i]), 0);
+  }
+
   ATOMIC_SET(&last_captured_retire_clock_, retire_clock);
 }
 
@@ -1755,6 +1900,10 @@ void ObTenantFreezerStat::refresh()
   for (int64_t i = 0; i < ObFreezerMergeType::MAX_MERGE_TYPE; i++) {
     ATOMIC_SET(&(captured_merge_time_cost_[i]), 0);
     ATOMIC_SET(&(captured_merge_times_[i]), 0);
+  }
+
+  for (int64_t i = 0; i < MAX_FREEZE_SOURCE_TYPE_COUNT; i++) {
+    ATOMIC_SET(&(captured_source_times_[i]), 0);
   }
 }
 
@@ -1797,6 +1946,10 @@ void ObTenantFreezerStat::assign(const ObTenantFreezerStat stat)
   for (int64_t i = 0; i < ObFreezerMergeType::MAX_MERGE_TYPE; i++) {
     captured_merge_time_cost_[i] = stat.captured_merge_time_cost_[i];
     captured_merge_times_[i] = stat.captured_merge_times_[i];
+  }
+
+  for (int64_t i = 0; i < MAX_FREEZE_SOURCE_TYPE_COUNT; i++) {
+    captured_source_times_[i] = stat.captured_source_times_[i];
   }
 
   last_captured_retire_clock_ = stat.last_captured_retire_clock_;

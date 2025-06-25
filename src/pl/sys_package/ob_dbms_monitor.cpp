@@ -11,14 +11,8 @@
  */
 
 #define USING_LOG_PREFIX PL
-#include "pl/sys_package/ob_dbms_application.h"
-#include "share/ob_common_rpc_proxy.h"
-#include "share/ob_errno.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "lib/oblog/ob_log_module.h"
 #include "sql/monitor/flt/ob_flt_control_info_mgr.h"
 #include "pl/sys_package/ob_dbms_monitor.h"
-#include "lib/number/ob_number_v2.h"
 
 using namespace oceanbase::sql;
 
@@ -73,12 +67,12 @@ int ObDBMSMonitor::session_trace_enable(sql::ObExecContext &ctx, sql::ParamStore
   if (params.at(0).is_number()) {
     OZ (params.at(0).get_number(sess_id));
     if (sess_id.is_zero()) {
-      sid = ctx.get_my_session()->get_sessid();
+      sid = ctx.get_my_session()->get_server_sid();
     } else {
       sid = atoi(sess_id.format());
     }
   } else {
-    sid = ctx.get_my_session()->get_sessid();
+    sid = ctx.get_my_session()->get_server_sid();
   }
   OV (params.at(1).is_number(), OB_INVALID_ARGUMENT);
   OZ (params.at(1).get_number(level));
@@ -129,12 +123,12 @@ int ObDBMSMonitor::session_trace_disable(sql::ObExecContext &ctx, sql::ParamStor
   if (params.at(0).is_number()) {
     OZ (params.at(0).get_number(sess_id));
     if (sess_id.is_zero()) {
-      sid = ctx.get_my_session()->get_sessid();
+      sid = ctx.get_my_session()->get_server_sid();
     } else {
       sid = atoi(sess_id.format());
     }
   } else {
-    sid = ctx.get_my_session()->get_sessid();
+    sid = ctx.get_my_session()->get_server_sid();
   }
   // check policy, if policy not exist, report err.
   // mark session

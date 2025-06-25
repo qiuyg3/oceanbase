@@ -32,12 +32,6 @@ namespace storage
 class ObITable;
 class ObTablet;
 class ObTabletHandle;
-struct ObUpdateTableStoreParam;
-}
-
-namespace blocksstable
-{
-class ObSSTable;
 }
 namespace compaction
 {
@@ -48,6 +42,7 @@ struct ObStaticMergeParam;
 class ObPartitionMerger;
 struct ObCachedTransStateMgr;
 class ObPartitionMergeProgress;
+class ObMviewMergeParameter;
 /*
 DAG : *PrepareTask -> ObTabletMergeTask* -> ObTabletMergeFinishTask
 
@@ -67,6 +62,11 @@ struct ObMergeParameter {
   const storage::ObTablesHandleArray & get_tables_handle() const;
   const ObStorageSchema *get_schema() const;
   bool is_full_merge() const;
+  OB_INLINE bool is_mv_merge() const
+  {
+    return nullptr != mview_merge_param_;
+  }
+  bool is_delete_insert_merge() const;
 
   const ObStaticMergeParam &static_param_;
   /* rest variables are different for MergeTask */
@@ -76,12 +76,13 @@ struct ObMergeParameter {
   ObITableReadInfo *cg_rowkey_read_info_;
   compaction::ObCachedTransStateMgr *trans_state_mgr_;
   share::ObDiagnoseLocation *error_location_;
-  share::SCN merge_scn_;
+  ObMviewMergeParameter *mview_merge_param_;
   ObIAllocator *allocator_;
 
   int64_t to_string(char* buf, const int64_t buf_len) const;
 private:
   int set_merge_rowid_range(ObIAllocator *allocator);
+  int init_mview_merge_param(ObIAllocator *allocator);
   DISALLOW_COPY_AND_ASSIGN(ObMergeParameter);
 };
 
@@ -115,17 +116,20 @@ struct ObTabletMergeDagParam : public share::ObIDagInitParam
     const compaction::ObMergeType merge_type,
     const share::ObLSID &ls_id,
     const ObTabletID &tablet_id,
-    const int64_t transfer_seq);
+    const int64_t schedule_transfer_seq);
   virtual bool is_valid() const override;
   VIRTUAL_TO_STRING_KV(K_(skip_get_tablet), "merge_type", merge_type_to_str(merge_type_), K_(merge_version),
-     K_(ls_id), K_(tablet_id), K_(need_swap_tablet_flag), K_(is_reserve_mode), K_(transfer_seq));
+     K_(ls_id), K_(tablet_id), "exec_mode", exec_mode_to_str(exec_mode_),
+     K_(need_swap_tablet_flag), K_(is_reserve_mode), K_(schedule_transfer_seq), K(reorganization_scn_));
 
   bool skip_get_tablet_;
   bool need_swap_tablet_flag_;
   bool is_reserve_mode_;
+  ObExecMode exec_mode_;
   compaction::ObMergeType merge_type_;
   int64_t merge_version_;
-  int64_t transfer_seq_; // only affect minor and major now
+  int64_t schedule_transfer_seq_; // only affect minor and major now
+  share::SCN reorganization_scn_; // for shared storage merge
   share::ObLSID ls_id_;
   ObTabletID tablet_id_;
   ObCompactionParam compaction_param_; // used for adaptive compaction dag scheduling
@@ -154,6 +158,9 @@ public:
   int init();
   int report_checkpoint_diagnose_info(ObTabletMergeCtx &ctx);
   virtual int process() override;
+
+  void report_checkpoint_info(ObTabletMergeCtx &ctx);
+  void record_tx_data_info(ObTabletMergeCtx &ctx);
 private:
   bool is_inited_;
   ObTabletMergeDag *merge_dag_;
@@ -229,6 +236,8 @@ public:
   int generate_merge_task(ObBasicTabletMergeCtx &ctx, share::ObITask *prepare_task);
   virtual bool is_ha_dag() const override { return false; }
   int alloc_merge_ctx();
+  int get_min_sstable_end_scn(share::SCN &min_end_scn);
+  int init_min_sstable_end_scn();
 protected:
   int inner_init(const ObTabletMergeDagParam *param);
   int collect_compaction_param(const ObTabletHandle &tablet_handle);
@@ -240,12 +249,12 @@ protected:
       ObBasicTabletMergeCtx *ctx,
       compaction::ObPartitionMergeProgress *input_progress,
       int64_t start_cg_idx = 0, int64_t end_cg_idx = 0);
-
   bool is_inited_;
   lib::Worker::CompatMode compat_mode_;
   ObBasicTabletMergeCtx *ctx_;
   ObTabletMergeDagParam param_;
   common::ObArenaAllocator allocator_;
+  int64_t min_sstable_end_scn_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTabletMergeDag);
 };
@@ -284,6 +293,7 @@ public:
   int init(const int64_t idx, ObBasicTabletMergeCtx &ctx);
   virtual int process() override;
   virtual int generate_next_task(ObITask *&next_task) override;
+  virtual int64_t get_sub_task_id() const override { return idx_; }
 private:
   compaction::ObLocalArena allocator_;
   int64_t idx_;
@@ -324,88 +334,6 @@ public:
   {}
   virtual ~ObTabletMiniMergeDag();
 };
-
-
-struct ObTabletSchedulePair
-{
-public:
-  ObTabletSchedulePair()
-    : tablet_id_(),
-      schedule_merge_scn_(0)
-  { }
-  ObTabletSchedulePair(
-      const common::ObTabletID &tablet_id,
-      const int64_t schedule_merge_scn)
-    : tablet_id_(tablet_id),
-      schedule_merge_scn_(schedule_merge_scn)
-  { }
-  bool is_valid() const { return tablet_id_.is_valid() && schedule_merge_scn_ > 0; }
-  bool need_force_freeze() const { return schedule_merge_scn_ > 0; }
-  void reset() { tablet_id_.reset(); schedule_merge_scn_ = 0; }
-  TO_STRING_KV(K_(tablet_id), K_(schedule_merge_scn));
-public:
-  common::ObTabletID tablet_id_;
-  int64_t schedule_merge_scn_;
-};
-
-
-struct ObBatchFreezeTabletsParam : public share::ObIDagInitParam
-{
-public:
-  ObBatchFreezeTabletsParam();
-  virtual ~ObBatchFreezeTabletsParam() { tablet_pairs_.reset(); }
-  virtual bool is_valid() const override { return ls_id_.is_valid() && tablet_pairs_.count() > 0; }
-  int assign(const ObBatchFreezeTabletsParam &other);
-  bool operator == (const ObBatchFreezeTabletsParam &other) const;
-  bool operator != (const ObBatchFreezeTabletsParam &other) const { return !this->operator==(other); }
-  int64_t get_hash() const;
-  VIRTUAL_TO_STRING_KV(K_(ls_id), "tablet_pair_cnt", tablet_pairs_.count(), K_(tablet_pairs));
-public:
-  static constexpr int64_t DEFAULT_BATCH_SIZE = 16;
-  share::ObLSID ls_id_;
-  common::ObSEArray<ObTabletSchedulePair, DEFAULT_BATCH_SIZE> tablet_pairs_;
-};
-
-
-class ObBatchFreezeTabletsDag : public share::ObIDag
-{
-public:
-  ObBatchFreezeTabletsDag();
-  virtual ~ObBatchFreezeTabletsDag();
-  int init_by_param(const share::ObIDagInitParam *param);
-  virtual int create_first_task() override;
-  virtual bool operator == (const ObIDag &other) const override;
-  virtual int64_t hash() const override;
-  virtual int fill_info_param(
-      compaction::ObIBasicInfoParam *&out_param,
-      ObIAllocator &allocator) const override;
-  virtual int fill_dag_key(char *buf, const int64_t buf_len) const override;
-  virtual lib::Worker::CompatMode get_compat_mode() const override { return lib::Worker::CompatMode::MYSQL; }
-  virtual uint64_t get_consumer_group_id() const override { return consumer_group_id_; }
-  const ObBatchFreezeTabletsParam &get_param() const { return param_; }
-  INHERIT_TO_STRING_KV("ObIDag", ObIDag, K_(is_inited), K_(param));
-private:
-  bool is_inited_;
-  ObBatchFreezeTabletsParam param_;
-private:
-  DISALLOW_COPY_AND_ASSIGN(ObBatchFreezeTabletsDag);
-};
-
-
-class ObBatchFreezeTabletsTask : public share::ObITask
-{
-public:
-  ObBatchFreezeTabletsTask();
-  virtual ~ObBatchFreezeTabletsTask();
-  int init();
-  virtual int process() override;
-private:
-  bool is_inited_;
-  ObBatchFreezeTabletsDag *base_dag_;
-private:
-  DISALLOW_COPY_AND_ASSIGN(ObBatchFreezeTabletsTask);
-};
-
 
 } // namespace compaction
 } // namespace oceanbase

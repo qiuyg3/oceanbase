@@ -27,9 +27,7 @@ class ObInsertLogPlan: public ObDelUpdLogPlan
 {
 public:
   ObInsertLogPlan(ObOptimizerContext &ctx, const ObInsertStmt *insert_stmt)
-      : ObDelUpdLogPlan(ctx, insert_stmt),
-        is_direct_insert_(false),
-        is_insert_overwrite_(false)
+      : ObDelUpdLogPlan(ctx, insert_stmt)
   { }
   virtual ~ObInsertLogPlan()
   { }
@@ -49,10 +47,10 @@ public:
   { return insert_up_index_upd_infos_; }
   const common::ObIArray<IndexDMLInfo *> &get_insert_up_index_upd_infos() const
   { return insert_up_index_upd_infos_; }
+  common::ObIArray<ObUniqueConstraintInfo> &get_uk_constraint_infos()
+  { return uk_constraint_infos_; }
 
-  bool is_direct_insert() const { return is_direct_insert_; }
-  void set_is_insert_overwrite(const bool is_insert_overwrite) { is_insert_overwrite_ = is_insert_overwrite; }
-  bool is_insert_overwrite() const { return is_insert_overwrite_; }
+  virtual int perform_vector_assign_expr_replacement(ObDelUpdStmt *stmt)override;
 protected:
   int allocate_insert_values_as_top(ObLogicalOperator *&top);
   int candi_allocate_insert(OSGShareInfo *osg_info);
@@ -73,6 +71,10 @@ protected:
                              bool is_partition_wise);
   int candi_allocate_pdml_insert(OSGShareInfo *osg_info);
   int candi_allocate_optimizer_stats_merge(OSGShareInfo *osg_info);
+
+  /** @brief Allocate SELECTINTO on top of plan candidates when insert into external table*/
+  int candi_allocate_select_into_for_insert();
+  int allocate_select_into_as_top_for_insert(ObLogicalOperator *&old_top);
 
   int get_osg_type(bool is_multi_part_dml,
                    ObShardingInfo *insert_table_sharding,
@@ -129,18 +131,16 @@ protected:
 
   int check_contain_non_onetime_expr(const ObRawExpr *expr, bool &contain);
   int check_contain_non_onetime_expr(const ObIArray<ObRawExpr *> &exprs, bool &contain);
+  int get_online_estimate_percent(double &percent);
 private:
   int get_index_part_ids(const ObInsertTableInfo& table_info, const ObTableSchema *&data_table_schema, const ObTableSchema *&index_schema, ObIArray<uint64_t> &index_part_ids);
   int generate_osg_share_info(OSGShareInfo *&info);
   int check_need_online_stats_gather(bool &need_osg);
-  int set_is_direct_insert();
   DISALLOW_COPY_AND_ASSIGN(ObInsertLogPlan);
 private:
   common::ObSEArray<IndexDMLInfo *, 1, common::ModulePageAllocator, true> replace_del_index_del_infos_;
   common::ObSEArray<IndexDMLInfo *, 1, common::ModulePageAllocator, true> insert_up_index_upd_infos_;
   common::ObSEArray<ObUniqueConstraintInfo, 8, common::ModulePageAllocator, true> uk_constraint_infos_;
-  bool is_direct_insert_;
-  bool is_insert_overwrite_;
 };
 }
 }

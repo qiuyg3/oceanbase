@@ -11,7 +11,6 @@
  */
 
 #include "storage/tablet/ob_tablet_dumped_medium_info.h"
-#include <algorithm>
 #include "storage/multi_data_source/adapter_define/mds_dump_node.h"
 #include "storage/tablet/ob_tablet_obj_load_helper.h"
 
@@ -203,7 +202,7 @@ int ObTabletDumpedMediumInfo::init_for_mds_table_dump(
   return ret;
 }
 
-int ObTabletDumpedMediumInfo::assign(const ObTabletDumpedMediumInfo &other, common::ObIAllocator &allocator)
+int ObTabletDumpedMediumInfo::assign(common::ObIAllocator &allocator, const ObTabletDumpedMediumInfo &other)
 {
   int ret = OB_SUCCESS;
 
@@ -768,5 +767,6 @@ int ObTabletDumpedMediumInfoIterator::get_next_medium_info(
 
   return ret;
 }
+
 } // namespace storage
 } // namespace oceanbase

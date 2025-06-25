@@ -21,6 +21,7 @@
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "src/sql/resolver/ob_stmt_resolver.h"
+#include "sql/engine/table/ob_odps_table_row_iter.h"
 
 namespace oceanbase {
 namespace sql {
@@ -31,13 +32,17 @@ class ObAlterTableStmt;
 namespace share {
 
 struct ObExternalFileInfo {
-  ObExternalFileInfo() : file_id_(INT64_MAX), part_id_(0), file_size_(0) {}
+  ObExternalFileInfo() : file_id_(INT64_MAX), part_id_(0), file_size_(0), row_start_(0), row_count_(0) {}
   common::ObString file_url_;
   int64_t file_id_;
   int64_t part_id_;
   common::ObAddr file_addr_;
   int64_t file_size_;
-  TO_STRING_KV(K_(file_url), K_(file_id), K_(part_id), K_(file_addr), K_(file_size));
+  int64_t row_start_;
+  int64_t row_count_;
+  common::ObString session_id_;
+  int deep_copy(ObIAllocator &allocator, const ObExternalFileInfo &other);
+  TO_STRING_KV(K_(file_url), K_(file_id), K_(part_id), K_(file_addr), K_(file_size), K_(row_start), K_(row_count));
   OB_UNIS_VERSION(1);
 };
 
@@ -85,18 +90,21 @@ public:
 
 class ObExternalTableFileManager
 {
-private:
+public:
   struct ObExternalFileInfoTmp {
-    ObExternalFileInfoTmp(common::ObString file_url, int64_t file_size, int64_t part_id) :
-                          file_url_(file_url), file_size_(file_size), part_id_(part_id) {}
-    ObExternalFileInfoTmp() : file_url_(), file_size_(0), part_id_(0) {}
+    ObExternalFileInfoTmp(common::ObString file_url,
+                          int64_t file_size,
+                          int64_t part_id,
+                          int64_t delete_version = MAX_VERSION) :
+      file_url_(file_url), file_size_(file_size), part_id_(part_id), delete_version_(delete_version) {}
+    ObExternalFileInfoTmp() : file_url_(), file_size_(0), part_id_(0), delete_version_(0) {}
     common::ObString file_url_;
     int64_t file_size_;
     int64_t part_id_;
-    TO_STRING_KV(K_(file_url),K_(part_id), K_(file_size));
+    int64_t delete_version_;
+    TO_STRING_KV(K_(file_url),K_(part_id), K_(file_size), K_(delete_version));
   };
 
-public:
   static const int64_t CACHE_EXPIRE_TIME = 20 * 1000000L; //20s
   static const int64_t MAX_VERSION = INT64_MAX;
   static const int64_t LOAD_CACHE_LOCK_CNT = 16;
@@ -104,6 +112,7 @@ public:
 
   const char* auto_refresh_job_name = "auto_refresh_external_table_job";
   const char ip_delimiter = '%';
+  const char equals_delimiter = '=';
 
   ObExternalTableFileManager() {}
 
@@ -128,6 +137,13 @@ public:
       common::ObIArray<ObExternalFileInfo> &external_files,
       common::ObIArray<ObNewRange *> *range_filter = NULL);
 
+  int get_mocked_external_table_files(
+      const uint64_t tenant_id,
+      ObIArray<int64_t> &partition_ids,
+      sql::ObExecContext &ctx,
+      const ObDASScanCtDef &das_ctdef,
+      ObIArray<ObExternalFileInfo> &external_files);
+
   int get_external_files_by_part_id(
       const uint64_t tenant_id,
       const uint64_t table_id,
@@ -145,9 +161,12 @@ public:
   int update_inner_table_file_list(sql::ObExecContext &exec_ctx,
                                   const uint64_t tenant_id,
                                   const uint64_t table_id,
-                                  ObIArray<ObString> &file_urls,
-                                  ObIArray<int64_t> &file_sizes,
-                                  const uint64_t part_id = -1);
+                                  common::ObIArray<common::ObString> &file_urls,
+                                  common::ObIArray<int64_t> &file_sizes,
+                                  common::ObIArray<uint64_t> &updated_part_ids,
+                                  bool &has_partition_changed,
+                                  const uint64_t part_id = -1,
+                                  bool collect_statistic = true);
 
   int get_all_records_from_inner_table(ObIAllocator &allocator,
                                     int64_t tenant_id,
@@ -183,14 +202,25 @@ public:
   int refresh_external_table(const uint64_t tenant_id,
                             const uint64_t table_id,
                             ObSchemaGetterGuard &schema_guard,
-                            ObExecContext &exec_ctx);
+                            ObExecContext &exec_ctx,
+                            bool &has_partition_changed);
 
   int refresh_external_table(const uint64_t tenant_id,
                               const ObTableSchema *table_schema,
-                              ObExecContext &exec_ctx);
+                              ObExecContext &exec_ctx,
+                              bool &has_partition_changed);
 
   int auto_refresh_external_table(ObExecContext &exec_ctx, const int64_t interval);
+  static int calculate_odps_part_val_by_part_spec(const ObTableSchema *table_schema,
+                                          const ObIArray<ObExternalFileInfoTmp> &file_infos,
+                                          ObIArray<ObNewRow> &part_vals,
+                                          ObIAllocator &allocator);
 private:
+  int collect_odps_table_statistics(const bool collect_statistic,
+                                    const uint64_t tenant_id,
+                                    const uint64_t table_id,
+                                    ObIArray<uint64_t> &updated_part_ids,
+                                    ObMySQLTransaction &trans);
   int delete_auto_refresh_job(ObExecContext &exec_ctx, ObMySQLTransaction &trans);
   int create_auto_refresh_job(ObExecContext &ctx, const int64_t interval, ObMySQLTransaction &trans);
   int update_inner_table_files_list_by_part(
@@ -198,14 +228,17 @@ private:
       const uint64_t tenant_id,
       const uint64_t table_id,
       const uint64_t partition_id,
-      const ObIArray<ObExternalFileInfoTmp> &file_infos);
+      const common::ObIArray<ObExternalFileInfoTmp> &file_infos,
+      common::ObIArray<uint64_t> &updated_part_ids);
 
-    int update_inner_table_files_list_by_table(
+  int update_inner_table_files_list_by_table(
     sql::ObExecContext &exec_ctx,
     ObMySQLTransaction &trans,
     const uint64_t tenant_id,
     const uint64_t table_id,
-    const ObIArray<ObExternalFileInfoTmp> &file_infos);
+    const common::ObIArray<ObExternalFileInfoTmp> &file_infos,
+    common::ObIArray<uint64_t> &updated_part_ids,
+    bool &has_partition_changed);
 
   bool is_cache_value_timeout(const ObExternalTableFiles &ext_files) {
     return ObTimeUtil::current_time() - ext_files.create_ts_ > CACHE_EXPIRE_TIME;
@@ -255,6 +288,7 @@ private:
                                           ObIArray<ObNewRow> &part_vals,
                                           share::schema::ObSchemaGetterGuard &schema_guard,
                                           ObExecContext &exec_ctx);
+
   int find_partition_existed(ObIArray<ObNewRow> &existed_part,
                             ObNewRow &file_part_val,
                             int64_t &found);
@@ -299,17 +333,6 @@ private:
   int add_partition_for_alter_stmt(ObAlterTableStmt *&alter_table_stmt,
                                   const ObString &part_name,
                                   ObNewRow &part_val);
-
-  int create_repeat_job_sql_(const bool is_oracle_mode,
-                            const uint64_t tenant_id,
-                            const int64_t job_id,
-                            const char *job_name,
-                            const ObString &exec_env,
-                            const int64_t start_usec,
-                            ObSqlString &job_action,
-                            ObSqlString &interval,
-                            const int64_t interval_ts,
-                            ObSqlString &raw_sql);
 
 private:
   common::ObSpinLock fill_cache_locks_[LOAD_CACHE_LOCK_CNT];

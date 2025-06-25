@@ -13,21 +13,8 @@
 #define USING_LOG_PREFIX RS
 
 #include "ob_backup_task_scheduler.h"
-#include "ob_backup_service.h"
-#include "rootserver/ob_root_service.h"
-#include "lib/lock/ob_mutex.h"
-#include "lib/stat/ob_diagnose_info.h"
-#include "lib/profile/ob_trace_id.h"
-#include "lib/alloc/ob_malloc_allocator.h"
-#include "lib/oblog/ob_log_module.h"
-#include "share/ob_rpc_struct.h"
-#include "rootserver/ob_rs_event_history_table_operator.h"
-#include "share/ob_srv_rpc_proxy.h"
 #include "share/ob_zone_table_operation.h"
-#include "share/ob_zone_info.h"
-#include "share/ob_unit_table_operator.h"
 #include "share/backup/ob_backup_server_mgr.h"
-#include "share/ob_srv_rpc_proxy.h"
 
 namespace oceanbase
 
@@ -136,7 +123,16 @@ int ObBackupTaskSchedulerQueue::init(
 
 int ObBackupTaskSchedulerQueue::push_task(const ObBackupScheduleTask &task)
 {
+  int ret = OB_SUCCESS;
   ObMutexGuard guard(mutex_);
+  if (OB_FAIL(push_task_without_lock_(task))) {
+    LOG_WARN("failed to push task", K(ret));
+  }
+  return ret;
+}
+
+int ObBackupTaskSchedulerQueue::push_task_without_lock_(const ObBackupScheduleTask &task)
+{
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -148,13 +144,8 @@ int ObBackupTaskSchedulerQueue::push_task(const ObBackupScheduleTask &task)
   } else if (OB_FAIL(check_push_unique_task_(task))) {
     LOG_WARN("fail to check unique task", K(ret), K(task));
   } else {
-    void *raw_ptr = nullptr;
     ObBackupScheduleTask *new_task = nullptr;
-    const int64_t task_deep_copy_size = task.get_deep_copy_size();
-    if (nullptr == (raw_ptr = (task_allocator_.alloc(task_deep_copy_size)))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("fail to allocate task", K(ret), K(task_deep_copy_size));
-    } else if (OB_FAIL(task.clone(raw_ptr, new_task))) {
+    if (OB_FAIL(task.clone(task_allocator_, new_task))) {
       LOG_WARN("fail to clone new task", K(ret), K(task));
     } else if (OB_UNLIKELY(nullptr == new_task)) {
       ret = OB_ERR_UNEXPECTED;
@@ -199,10 +190,6 @@ int ObBackupTaskSchedulerQueue::push_task(const ObBackupScheduleTask &task)
           new_task->~ObBackupScheduleTask();
           new_task = nullptr;
         } 
-        if (nullptr != raw_ptr) {
-          task_allocator_.free(raw_ptr);
-          raw_ptr = nullptr;
-        }
       }
     }
   }
@@ -251,6 +238,25 @@ int ObBackupTaskSchedulerQueue::dump_statistics()
     for (; tit != tenant_stat_map_.get_hash_table().end(); ++tit) {
       LOG_INFO("tenant task", "stat", tit->v_);
     }
+  }
+  return ret;
+}
+
+int ObBackupTaskSchedulerQueue::update_task_last_alive_time(const ObBackupScheduleTask *task)
+{
+  int ret = OB_SUCCESS;
+  ObMutexGuard guard(mutex_);
+  ObBackupScheduleTask *tmp_task = nullptr;
+  if (OB_ISNULL(task)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("task should not be null", K(ret));
+  } else if (OB_FAIL(get_schedule_task_(*task, tmp_task))) {
+    LOG_WARN("failed to get schedule task", K(ret), K(task));
+  } else if (nullptr == tmp_task) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("in schedule list task not found", K(ret));
+  } else if (FALSE_IT(tmp_task->set_last_check_alive_time(ObTimeUtility::current_time()))) {
+    LOG_WARN("failed to set last check alive time", K(ret));
   }
   return ret;
 }
@@ -344,12 +350,7 @@ int ObBackupTaskSchedulerQueue::pop_task(ObBackupScheduleTask *&output_task, com
 
     if (OB_FAIL(ret) || OB_ISNULL(task)) {
     } else {
-      void *raw_ptr = nullptr;
-      const int64_t task_deep_copy_size = task->get_deep_copy_size();
-      if (OB_ISNULL(raw_ptr = allocator.alloc(task_deep_copy_size))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("fail to allocate task", K(ret));
-      } else if (OB_FAIL(task->clone(raw_ptr, output_task))) {
+      if (OB_FAIL(task->clone(allocator, output_task))) {
         LOG_WARN("fail to clone input task", K(ret));
       } else if (OB_ISNULL(output_task)) {
         ret = OB_ERR_UNEXPECTED;
@@ -357,7 +358,6 @@ int ObBackupTaskSchedulerQueue::pop_task(ObBackupScheduleTask *&output_task, com
       } else {
         task->set_executor_time(ObTimeUtility::current_time());
       }
-      raw_ptr = nullptr;
     }
   }
   return ret;
@@ -935,12 +935,8 @@ int ObBackupTaskSchedulerQueue::get_all_tasks(
   } else {
     ObMutexGuard guard(mutex_);
     DLIST_FOREACH_X(t, schedule_list_, OB_SUCC(ret)) {
-      void *raw_ptr = nullptr;
       ObBackupScheduleTask *task = nullptr;
-      if (nullptr == (raw_ptr = allocator.alloc(t->get_deep_copy_size()))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("fail to allocate task", K(ret));
-      } else if (OB_FAIL(t->clone(raw_ptr, task))) {
+      if (OB_FAIL(t->clone(allocator, task))) {
         LOG_WARN("fail to clone input task", K(ret));
       } else if (nullptr == task) {
         ret = OB_ERR_UNEXPECTED;
@@ -950,12 +946,8 @@ int ObBackupTaskSchedulerQueue::get_all_tasks(
       }
     }
     DLIST_FOREACH_X(t, wait_list_, OB_SUCC(ret)) {
-      void *raw_ptr = nullptr;
       ObBackupScheduleTask *task = nullptr;
-      if (nullptr == (raw_ptr = allocator.alloc(t->get_deep_copy_size()))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("fail to allocate task", K(ret));
-      } else if (OB_FAIL(t->clone(raw_ptr, task))) {
+      if (OB_FAIL(t->clone(allocator, task))) {
         LOG_WARN("fail to clone input task", K(ret));
       } else if (nullptr == task) {
         ret = OB_ERR_UNEXPECTED;
@@ -1095,12 +1087,8 @@ int ObBackupTaskSchedulerQueue::get_schedule_tasks(
   } else {
     ObMutexGuard guard(mutex_);
     DLIST_FOREACH_X(t, schedule_list_, OB_SUCC(ret)) {
-      void *raw_ptr = nullptr;
       ObBackupScheduleTask * task = nullptr;
-      if (nullptr == (raw_ptr = allocator.alloc(t->get_deep_copy_size()))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("fail to allocate task", K(ret));
-      } else if (OB_FAIL(t->clone(raw_ptr, task))) {
+      if (OB_FAIL(t->clone(allocator, task))) {
         LOG_WARN("fail to clone input task", K(ret));
       } else if (nullptr == task) {
         ret = OB_ERR_UNEXPECTED;
@@ -1355,6 +1343,7 @@ int ObBackupTaskScheduler::check_alive_(int64_t &last_check_task_on_server_ts, b
     last_check_task_on_server_ts = now;
     for (int64_t i = 0; OB_SUCC(ret) && i < schedule_tasks.count(); ++i) {
       bool is_exist = true;
+      bool is_task_keep_alive_timeout = false;
       ObBackupScheduleTask *task = schedule_tasks.at(i);
       const ObAddr dst = task->get_dst();
       share::ObServerInfoInTable server_info;
@@ -1373,15 +1362,33 @@ int ObBackupTaskScheduler::check_alive_(int64_t &last_check_task_on_server_ts, b
         is_exist = false;
         LOG_WARN("server status may not active or in service", K(ret), K(dst));
       } else if (OB_FAIL(rpc_proxy_->to(dst).check_backup_task_exist(check_task_arg, res))) {
-        if (now - task->get_executor_time() > backup_task_keep_alive_timeout) {
+        if (now - task->get_last_check_alive_time() > backup_task_keep_alive_timeout) {
+          ROOTSERVICE_EVENT_ADD("backup", "backup_task_keep_alive_timeout",
+                                          "job_id", task->get_job_id(),
+                                          "tenant_id", task->get_tenant_id(),
+                                          "ls_id", task->get_ls_id(),
+                                          "dst", task->get_dst(),
+                                          "trace_id", task->get_trace_id(),
+                                          "timeout", now - task->get_last_check_alive_time());
           is_exist = false;
+          is_task_keep_alive_timeout = true;
+          LOG_WARN("check task timeout", K(ret), K(now), KPC(task), K(backup_task_keep_alive_timeout));
         }
-        LOG_WARN("fail to check task", K(ret), KPC(task));
+        LOG_WARN("fail to check task", K(ret), KPC(task), "time diff", now - task->get_last_check_alive_time(), K(backup_task_keep_alive_timeout));
       } else if (!res) {
         is_exist = false;
       }
-      if (!is_exist) {
-        LOG_INFO("task not on server, need remove", KPC(task));
+
+      if (OB_SUCC(ret) && is_exist) {
+        if (OB_FAIL(queue_.update_task_last_alive_time(task))) {
+          LOG_WARN("failed to update task last check alive time", K(ret), KPC(task));
+        } else {
+          LOG_INFO("update task last alive time", KPC(task));
+        }
+      }
+
+      if (!is_exist || is_task_keep_alive_timeout) {
+        LOG_INFO("task not on server, need remove", KPC(task), K(is_exist), K(is_task_keep_alive_timeout));
         const int rc = OB_REBALANCE_TASK_NOT_IN_PROGRESS;
         ObHAResultInfo result_info(ObHAResultInfo::ROOT_SERVICE,
                                    task->get_dst(),

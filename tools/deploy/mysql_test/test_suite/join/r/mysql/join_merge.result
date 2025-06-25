@@ -19,7 +19,7 @@ Query Plan
 ===================================================
 |ID|OPERATOR           |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------
-|0 |MERGE JOIN         |    |5       |7           |
+|0 |MERGE JOIN         |    |6       |7           |
 |1 |├─SORT             |    |5       |3           |
 |2 |│ └─TABLE FULL SCAN|bb  |5       |3           |
 |3 |└─SORT             |    |6       |4           |
@@ -52,7 +52,7 @@ Query Plan
 ===================================================
 |ID|OPERATOR           |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------
-|0 |MERGE JOIN         |    |5       |7           |
+|0 |MERGE JOIN         |    |6       |7           |
 |1 |├─SORT             |    |5       |3           |
 |2 |│ └─TABLE FULL SCAN|bb  |5       |3           |
 |3 |└─SORT             |    |6       |4           |
@@ -85,7 +85,7 @@ Query Plan
 ===================================================
 |ID|OPERATOR           |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------
-|0 |MERGE JOIN         |    |5       |7           |
+|0 |MERGE JOIN         |    |6       |7           |
 |1 |├─SORT             |    |5       |3           |
 |2 |│ └─TABLE FULL SCAN|bb  |5       |3           |
 |3 |└─SORT             |    |6       |4           |
@@ -118,7 +118,7 @@ Query Plan
 ===================================================
 |ID|OPERATOR           |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------
-|0 |MERGE JOIN         |    |5       |7           |
+|0 |MERGE JOIN         |    |6       |7           |
 |1 |├─SORT             |    |5       |3           |
 |2 |│ └─TABLE FULL SCAN|bb  |5       |3           |
 |3 |└─SORT             |    |6       |4           |
@@ -155,7 +155,7 @@ Query Plan
 ===================================================
 |ID|OPERATOR           |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------
-|0 |MERGE JOIN         |    |5       |8           |
+|0 |MERGE JOIN         |    |6       |8           |
 |1 |├─SORT             |    |5       |4           |
 |2 |│ └─TABLE FULL SCAN|bb  |5       |3           |
 |3 |└─SORT             |    |6       |4           |
@@ -188,7 +188,7 @@ Query Plan
 ===================================================
 |ID|OPERATOR           |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------
-|0 |MERGE JOIN         |    |5       |8           |
+|0 |MERGE JOIN         |    |6       |8           |
 |1 |├─SORT             |    |5       |4           |
 |2 |│ └─TABLE FULL SCAN|bb  |5       |3           |
 |3 |└─SORT             |    |6       |4           |
@@ -221,7 +221,7 @@ Query Plan
 ===================================================
 |ID|OPERATOR           |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------
-|0 |MERGE JOIN         |    |5       |8           |
+|0 |MERGE JOIN         |    |6       |8           |
 |1 |├─SORT             |    |5       |4           |
 |2 |│ └─TABLE FULL SCAN|bb  |5       |3           |
 |3 |└─SORT             |    |6       |4           |
@@ -254,7 +254,7 @@ Query Plan
 ===================================================
 |ID|OPERATOR           |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------
-|0 |MERGE JOIN         |    |5       |8           |
+|0 |MERGE JOIN         |    |6       |8           |
 |1 |├─SORT             |    |5       |4           |
 |2 |│ └─TABLE FULL SCAN|bb  |5       |3           |
 |3 |└─SORT             |    |6       |4           |
@@ -288,8 +288,8 @@ Query Plan
 =====================================================
 |ID|OPERATOR             |NAME|EST.ROWS|EST.TIME(us)|
 -----------------------------------------------------
-|0 |MERGE JOIN           |    |2       |12          |
-|1 |├─MERGE JOIN         |    |5       |8           |
+|0 |MERGE JOIN           |    |4       |12          |
+|1 |├─MERGE JOIN         |    |6       |8           |
 |2 |│ ├─SORT             |    |6       |4           |
 |3 |│ │ └─TABLE FULL SCAN|aa  |6       |3           |
 |4 |│ └─SORT             |    |5       |4           |
@@ -332,8 +332,8 @@ Query Plan
 =====================================================
 |ID|OPERATOR             |NAME|EST.ROWS|EST.TIME(us)|
 -----------------------------------------------------
-|0 |MERGE JOIN           |    |2       |12          |
-|1 |├─MERGE JOIN         |    |5       |8           |
+|0 |MERGE JOIN           |    |4       |12          |
+|1 |├─MERGE JOIN         |    |6       |8           |
 |2 |│ ├─SORT             |    |6       |4           |
 |3 |│ │ └─TABLE FULL SCAN|aa  |6       |3           |
 |4 |│ └─SORT             |    |5       |4           |
@@ -889,7 +889,7 @@ Query Plan
 ===================================================================
 |ID|OPERATOR                       |NAME    |EST.ROWS|EST.TIME(us)|
 -------------------------------------------------------------------
-|0 |MERGE JOIN                     |        |2       |50          |
+|0 |MERGE JOIN                     |        |4       |51          |
 |1 |├─MERGE JOIN                   |        |5       |35          |
 |2 |│ ├─PX COORDINATOR MERGE SORT  |        |6       |18          |
 |3 |│ │ └─EXCHANGE OUT DISTR       |:EX10000|6       |16          |
@@ -960,7 +960,7 @@ Query Plan
 ===================================================================
 |ID|OPERATOR                       |NAME    |EST.ROWS|EST.TIME(us)|
 -------------------------------------------------------------------
-|0 |MERGE JOIN                     |        |2       |50          |
+|0 |MERGE JOIN                     |        |4       |51          |
 |1 |├─MERGE JOIN                   |        |5       |35          |
 |2 |│ ├─PX COORDINATOR MERGE SORT  |        |6       |18          |
 |3 |│ │ └─EXCHANGE OUT DISTR       |:EX10000|6       |16          |
@@ -1325,6 +1325,10 @@ NULL	NULL	NULL	67	A	1	1.0000000000
 5	B	5.0000000000	NULL	NULL	NULL	NULL
 6	6666	5.5000000000	NULL	NULL	NULL	NULL
 6	AB	6.0000000000	NULL	NULL	NULL	NULL
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'A'
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
+Warning	1292	Truncated incorrect DECIMAL value: 'AB'
 
 explain select /*+use_hash(t2,t7)*/* from t2 full join t7 on t2.b = t7.a and t2.c = t7.d order by t2.a,t2.b,t7.a,t7.b;
 Query Plan
@@ -1370,6 +1374,10 @@ NULL	NULL	NULL	67	A	1	1.0000000000
 5	B	5.0000000000	NULL	NULL	NULL	NULL
 6	6666	5.5000000000	NULL	NULL	NULL	NULL
 6	AB	6.0000000000	NULL	NULL	NULL	NULL
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'A'
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
+Warning	1292	Truncated incorrect DECIMAL value: 'AB'
 
 explain select /*+use_nl(t2,t7)*/* from t2 full join t7 on t2.b = t7.a and t2.c = t7.d order by t2.a,t2.b,t7.a,t7.b;
 Query Plan
@@ -1415,6 +1423,10 @@ NULL	NULL	NULL	67	A	1	1.0000000000
 5	B	5.0000000000	NULL	NULL	NULL	NULL
 6	6666	5.5000000000	NULL	NULL	NULL	NULL
 6	AB	6.0000000000	NULL	NULL	NULL	NULL
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'A'
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
+Warning	1292	Truncated incorrect DECIMAL value: 'AB'
 ************ 测试right join
 
 explain select /*+use_merge(t2,t7)*/* from t2 right join t7 on t2.b = t7.a and t2.c = t7.d order by t2.a,t2.b,t7.a,t7.b;
@@ -1455,6 +1467,10 @@ NULL	NULL	NULL	65	444	5.550	1.0000000000
 NULL	NULL	NULL	66	2	B	2.0000000000
 NULL	NULL	NULL	66	3.0	555	3.0000100000
 NULL	NULL	NULL	67	A	1	1.0000000000
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'A'
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
+Warning	1292	Truncated incorrect DECIMAL value: 'AB'
 
 explain select /*+use_hash(t2,t7)*/* from t2 right join t7 on t2.b = t7.a and t2.c = t7.d order by t2.a,t2.b,t7.a,t7.b;
 Query Plan
@@ -1487,14 +1503,18 @@ NULL	NULL	NULL	65	444	5.550	1.0000000000
 NULL	NULL	NULL	66	2	B	2.0000000000
 NULL	NULL	NULL	66	3.0	555	3.0000100000
 NULL	NULL	NULL	67	A	1	1.0000000000
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'A'
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
+Warning	1292	Truncated incorrect DECIMAL value: 'AB'
 
 explain select /*+use_nl(t2,t7)*/* from t2 right join t7 on t2.b = t7.a and t2.c = t7.d order by t2.a,t2.b,t7.a,t7.b;
 Query Plan
 =========================================================
 |ID|OPERATOR                 |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------------
-|0 |SORT                     |    |5       |6           |
-|1 |└─NESTED-LOOP OUTER JOIN |    |5       |4           |
+|0 |SORT                     |    |5       |10          |
+|1 |└─NESTED-LOOP OUTER JOIN |    |5       |8           |
 |2 |  ├─TABLE FULL SCAN      |t7  |5       |3           |
 |3 |  └─MATERIAL             |    |13      |5           |
 |4 |    └─TABLE FULL SCAN    |t2  |13      |3           |
@@ -1521,6 +1541,8 @@ NULL	NULL	NULL	65	444	5.550	1.0000000000
 NULL	NULL	NULL	66	2	B	2.0000000000
 NULL	NULL	NULL	66	3.0	555	3.0000100000
 NULL	NULL	NULL	67	A	1	1.0000000000
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
 explain select /*+leading(t8, t9)*/ t8.b,t8.c,t9.b,t9.c from t8 right join t9 on t8.b = t9.b;
 Query Plan
 ==========================================================
@@ -1546,23 +1568,23 @@ Outputs & filters:
 select /*+leading(t8, t9)*/ t8.b,t8.c,t9.b,t9.c from t8 right join t9 on t8.b = t9.b;
 b	c	b	c
 2	1	2	1
-2	1	2	2
-2	1	2	3
 2	2	2	1
-2	2	2	2
-2	2	2	3
 2	3	2	1
+2	1	2	2
+2	2	2	2
 2	3	2	2
+2	1	2	3
+2	2	2	3
 2	3	2	3
 NULL	NULL	3	1
 4	1	4	1
-4	1	4	2
-4	1	4	3
 4	2	4	1
-4	2	4	2
-4	2	4	3
 4	3	4	1
+4	1	4	2
+4	2	4	2
 4	3	4	2
+4	1	4	3
+4	2	4	3
 4	3	4	3
 ************ 测试left join
 
@@ -1612,6 +1634,10 @@ a	b	c	a	b	c	d
 5	B	5.0000000000	NULL	NULL	NULL	NULL
 6	6666	5.5000000000	NULL	NULL	NULL	NULL
 6	AB	6.0000000000	NULL	NULL	NULL	NULL
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'A'
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
+Warning	1292	Truncated incorrect DECIMAL value: 'AB'
 
 explain select /*+use_hash(t2,t7)*/* from t2 left join t7 on t2.b = t7.a and t2.c = t7.d order by t2.a,t2.b,t7.a,t7.b;
 Query Plan
@@ -1652,14 +1678,18 @@ a	b	c	a	b	c	d
 5	B	5.0000000000	NULL	NULL	NULL	NULL
 6	6666	5.5000000000	NULL	NULL	NULL	NULL
 6	AB	6.0000000000	NULL	NULL	NULL	NULL
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'A'
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
+Warning	1292	Truncated incorrect DECIMAL value: 'AB'
 
 explain select /*+use_nl(t2,t7)*/* from t2 left join t7 on t2.b = t7.a and t2.c = t7.d order by t2.a,t2.b,t7.a,t7.b;
 Query Plan
 =========================================================
 |ID|OPERATOR                 |NAME|EST.ROWS|EST.TIME(us)|
 ---------------------------------------------------------
-|0 |SORT                     |    |13      |9           |
-|1 |└─NESTED-LOOP OUTER JOIN |    |13      |5           |
+|0 |SORT                     |    |13      |12          |
+|1 |└─NESTED-LOOP OUTER JOIN |    |13      |8           |
 |2 |  ├─TABLE FULL SCAN      |t2  |13      |3           |
 |3 |  └─MATERIAL             |    |5       |4           |
 |4 |    └─TABLE FULL SCAN    |t7  |5       |3           |
@@ -1694,13 +1724,15 @@ a	b	c	a	b	c	d
 5	B	5.0000000000	NULL	NULL	NULL	NULL
 6	6666	5.5000000000	NULL	NULL	NULL	NULL
 6	AB	6.0000000000	NULL	NULL	NULL	NULL
+Warnings:
+Warning	1292	Truncated incorrect DECIMAL value: 'B'
 ********** join condition 必须和 ordering 排序一致
 explain select /*+use_merge(t8 t9)*/ * from t8 join t9 on t8.c = t9.c and t8.b = t9.b;
 Query Plan
 ====================================================
 |ID|OPERATOR         |NAME   |EST.ROWS|EST.TIME(us)|
 ----------------------------------------------------
-|0 |MERGE JOIN       |       |7       |6           |
+|0 |MERGE JOIN       |       |8       |6           |
 |1 |├─TABLE FULL SCAN|t8(idx)|6       |3           |
 |2 |└─TABLE FULL SCAN|t9(idx)|7       |3           |
 ====================================================
@@ -1761,7 +1793,7 @@ Query Plan
 ====================================================
 |ID|OPERATOR         |NAME   |EST.ROWS|EST.TIME(us)|
 ----------------------------------------------------
-|0 |MERGE OUTER JOIN |       |7       |6           |
+|0 |MERGE OUTER JOIN |       |8       |6           |
 |1 |├─TABLE FULL SCAN|t8(idx)|6       |3           |
 |2 |└─TABLE FULL SCAN|t9(idx)|7       |3           |
 ====================================================
@@ -1827,7 +1859,7 @@ Query Plan
 ==========================================================
 |ID|OPERATOR               |NAME   |EST.ROWS|EST.TIME(us)|
 ----------------------------------------------------------
-|0 |MERGE RIGHT OUTER JOIN |       |7       |6           |
+|0 |MERGE RIGHT OUTER JOIN |       |8       |6           |
 |1 |├─TABLE FULL SCAN      |t8(idx)|6       |3           |
 |2 |└─TABLE FULL SCAN      |t9(idx)|7       |3           |
 ==========================================================
@@ -1895,7 +1927,7 @@ Query Plan
 ==========================================================
 |ID|OPERATOR               |NAME   |EST.ROWS|EST.TIME(us)|
 ----------------------------------------------------------
-|0 |MERGE RIGHT OUTER JOIN |       |7       |6           |
+|0 |MERGE RIGHT OUTER JOIN |       |8       |6           |
 |1 |├─TABLE FULL SCAN      |t8(idx)|6       |3           |
 |2 |└─TABLE FULL SCAN      |t9(idx)|7       |3           |
 ==========================================================

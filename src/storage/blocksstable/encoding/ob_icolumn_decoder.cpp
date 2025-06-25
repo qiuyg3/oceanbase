@@ -14,6 +14,7 @@
 
 #include "ob_icolumn_decoder.h"
 #include "ob_encoding_bitset.h"
+#include "storage/access/ob_aggregate_base.h"
 
 namespace oceanbase
 {
@@ -351,13 +352,15 @@ int ObSpanColumnDecoder::decode_exception_vector(
     LOAD_VEC_BY_TYPE(uint8_t, D_INTEGER);
     break;
   }
-  case VEC_TC_DATE: {
+  case VEC_TC_DATE:
+  case VEC_TC_MYSQL_DATE: {
     // int32_t
     LOAD_VEC_BY_TYPE(int32_t, D_INTEGER);
     break;
   }
   case VEC_TC_INTEGER:
   case VEC_TC_DATETIME:
+  case VEC_TC_MYSQL_DATETIME:
   case VEC_TC_TIME:
   case VEC_TC_UNKNOWN:
   case VEC_TC_INTERVAL_YM: {

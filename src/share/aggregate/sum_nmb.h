@@ -187,7 +187,7 @@ public:
   }
 
   template <typename ColumnFmt>
-  inline int add_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
+  OB_INLINE int add_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
                      const int32_t agg_col_id, char *aggr_cell, void *tmp_res, int64_t &calc_info)
   {
     UNUSEDx(agg_ctx, columns, row_num, agg_col_id, aggr_cell, tmp_res, calc_info);
@@ -196,7 +196,7 @@ public:
   }
 
   template <typename ColumnFmt>
-  inline int add_nullable_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
+  OB_INLINE int add_nullable_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
                               const int32_t agg_col_id, char *agg_cell, void *tmp_res,
                               int64_t &calc_info)
   {
@@ -227,7 +227,7 @@ public:
   }
 
   template <typename ColumnFmt>
-  int add_or_sub_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
+  OB_INLINE int add_or_sub_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
                      const int32_t agg_col_id, char *agg_cell, void *tmp_res, int64_t &calc_info)
   {
     int ret = OB_SUCCESS;
@@ -256,6 +256,50 @@ public:
       agg_ctx.removal_info_.null_cnt_++;
     } else {
       agg_ctx.removal_info_.null_cnt_--;
+    }
+    return ret;
+  }
+  virtual int rollup_aggregation(RuntimeContext &agg_ctx, const int32_t agg_col_idx,
+                                 AggrRowPtr group_row, AggrRowPtr rollup_row,
+                                 int64_t cur_rollup_group_idx,
+                                 int64_t max_group_cnt = INT64_MIN) override
+  {
+    int ret = OB_SUCCESS;
+    UNUSEDx(cur_rollup_group_idx, max_group_cnt);
+    char *curr_agg_cell = agg_ctx.row_meta().locate_cell_payload(agg_col_idx, group_row);
+    char *rollup_agg_cell = agg_ctx.row_meta().locate_cell_payload(agg_col_idx, rollup_row);
+    const NotNullBitVector &curr_not_nulls = agg_ctx.locate_notnulls_bitmap(agg_col_idx, curr_agg_cell);
+    NotNullBitVector &rollup_not_nulls = agg_ctx.locate_notnulls_bitmap(agg_col_idx, rollup_agg_cell);
+    if (curr_not_nulls.at(agg_col_idx) && rollup_not_nulls.at(agg_col_idx)) {
+      ObNumber curr_num(*reinterpret_cast<const ObCompactNumber *>(curr_agg_cell));
+      ObNumber rollup_num(*reinterpret_cast<const ObCompactNumber *>(rollup_agg_cell));
+      char res_buf[ObNumber::MAX_CALC_BYTE_LEN] = {0};
+      ObCompactNumber *res_cnum = reinterpret_cast<ObCompactNumber *>(res_buf);
+      ObNumber::Desc &res_desc = res_cnum->desc_;
+      uint32_t *res_digits = res_cnum->digits_;
+      if (ObNumber::try_fast_add(curr_num, rollup_num, res_digits, res_desc)) {
+        int32_t cp_len = sizeof(ObNumberDesc) + res_desc.len_ * sizeof(uint32_t);
+        MEMCPY(rollup_agg_cell, res_buf, cp_len);
+      } else {
+        const ObCompactNumber *curr_num = reinterpret_cast<const ObCompactNumber *>(curr_agg_cell);
+        const ObCompactNumber *rollup_num = reinterpret_cast<const ObCompactNumber *>(rollup_agg_cell);
+        ret = add_values(*curr_num, *rollup_num, rollup_agg_cell, ObNumber::MAX_CALC_BYTE_LEN);
+        if (OB_FAIL(ret)) {
+          SQL_LOG(WARN, "adder number failed", K(ret));
+        }
+      }
+    } else if (OB_LIKELY(curr_not_nulls.at(agg_col_idx))) {
+      rollup_not_nulls.set(agg_col_idx);
+      const number::ObCompactNumber *curr_cnum =
+        reinterpret_cast<const number::ObCompactNumber *>(curr_agg_cell);
+      number::ObCompactNumber *rollup_cnum =
+        reinterpret_cast<number::ObCompactNumber *>(rollup_agg_cell);
+      rollup_cnum->desc_ = curr_cnum->desc_;
+      MEMCPY(&(rollup_cnum->digits_[0]), &(curr_cnum->digits_[0]),
+             curr_cnum->desc_.len_ * sizeof(uint32_t));
+      rollup_not_nulls.set(agg_col_idx);
+    } else {
+      // do nothing
     }
     return ret;
   }

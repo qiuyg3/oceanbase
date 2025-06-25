@@ -44,7 +44,21 @@ public:
   int init(const common::ObIArray<ObExpr *> &exprs, ObEvalCtx &eval_ctx);
   int save(const int64_t batch_size);
   int restore() const;
-  void reset() {  }
+  int restore_single_row(int64_t from_idx, int64_t to_idx) const;
+  int drive_row_extended(int64_t from_idx, int64_t start_dst_idx, int64_t size);
+  VectorFormat get_single_row_restore_format(VectorFormat src_format, const ObExpr *expr) const
+  {
+    // continuous format don't support restore single row, so if the backup vector is continuous format, we need to convert it to other format
+    return src_format == VEC_CONTINUOUS ? expr->get_default_res_format() : src_format;
+  }
+  void clear_saved_size() { saved_size_ = 0; }
+
+  void reset()
+  {
+    saved_ = false;
+    saved_size_ = 0;
+  }
+  void destroy();
   static int calc_backup_size(const common::ObIArray<ObExpr *> &exprs, ObEvalCtx &eval_ctx, int32_t &mem_size);
 private:
   template<VectorFormat>
@@ -59,6 +73,7 @@ private:
                                                 expr_(expr), frame_nulls_(nullptr), frame_datums_(nullptr),
                                                 frame_data_(nullptr), frame_lens_(nullptr), frame_ptrs_(nullptr),
                                                 frame_offsets_(nullptr), frame_continuous_data_(nullptr) {}
+    void reset(common::ObIAllocator &alloc);
     int copy_vector_base(const ObVectorBase &vec);
     int copy_bitmap_null_base(const ObBitmapNullVectorBase &vec,
                               common::ObIAllocator &alloc,
@@ -83,12 +98,40 @@ private:
 
     void restore_vector_base(ObVectorBase &vec) const;
     void restore_bitmap_null_base(ObBitmapNullVectorBase &vec, const int64_t batch_size, ObEvalCtx &eval_ctx) const;
+
+
     void restore_fixed_base(ObFixedLengthBase &vec, const int64_t batch_size, ObEvalCtx &eval_ctx) const;
     void restore_discrete_base(ObDiscreteBase &vec, const int64_t batch_size, ObEvalCtx &eval_ctx) const;
     void restore_continuous_base(ObContinuousBase &vec, const int64_t batch_size, ObEvalCtx &eval_ctx) const;
     void restore_uniform_base(const ObExpr *expr, ObUniformBase &vec,
                               bool is_const, ObEvalCtx &eval_ctx,
                               const int64_t batch_size) const;
+    int save(ObIAllocator &alloc, const int64_t batch_size, ObEvalCtx *eval_ctx);
+    int restore(const int64_t saved_size, ObEvalCtx *eval_ctx);
+
+    void restore_bitmap_null_base_single_row(ObBitmapNullVectorBase &vec, int64_t from_idx, int64_t to_idx, ObEvalCtx &eval_ctx) const;
+    void restore_base_single_row(ObVectorBase &vec, int64_t from_idx, int64_t to_idx, ObEvalCtx &eval_ctx) const;
+    void restore_fixed_base_single_row(ObFixedLengthBase &vec, int64_t from_idx, int64_t to_idx, ObEvalCtx &eval_ctx) const;
+    void restore_discrete_base_single_row(ObDiscreteBase &vec, int64_t from_idx, int64_t to_idx, ObEvalCtx &eval_ctx) const;
+    void restore_continuous_base_single_row(ObExpr *expr, int64_t from_idx, int64_t to_idx, VectorFormat dst_fmt,ObEvalCtx &eval_ctx) const;
+    void restore_uniform_base_single_row(const ObExpr *expr, ObUniformBase &vec,
+                              int64_t from_idx, int64_t to_idx, ObEvalCtx &eval_ctx, bool is_const) const;
+    int restore_nested_single_row(const ObExpr &expr, ObEvalCtx &eval_ctx, const VectorFormat extend_format,
+                                  int64_t from_idx, int64_t to_idx) const;
+    int extend_nested_rows(const ObExpr &expr, ObEvalCtx &eval_ctx, const VectorFormat extend_format,
+                                 int64_t from_idx, int64_t start_dst_idx, int64_t size) const;
+
+    void extend_fixed_base_vector(ObFixedLengthBase &vec, int64_t from_idx, int64_t start_dst_idx, int64_t size, ObEvalCtx &eval_ctx) const;
+
+    void extend_discrete_base_vector(ObDiscreteBase &vec, int64_t from_idx, int64_t start_dst_idx, int64_t size, ObEvalCtx &eval_ctx) const;
+
+    void extend_uniform_base_vector(const ObExpr *expr, ObUniformBase &vec, int64_t from_idx, int64_t start_dst_idx, int64_t size, ObEvalCtx &eval_ctx,  bool is_const) const;
+
+    void extend_continuous_base_vector(ObExpr *expr, int64_t from_idx, int64_t start_dst_idx, int64_t size, VectorFormat dst_fmt, ObEvalCtx &eval_ctx) const;
+
+    void convert_continuous_to_fixed(ObFixedLengthBase &vec, int64_t from_idx, int64_t to_idx, ObEvalCtx &eval_ctx) const;
+    void convert_continuous_to_discrete(ObDiscreteBase &vec, int64_t from_idx, int64_t to_idx, ObEvalCtx &eval_ctx) const;
+    void convert_continuous_to_uniform(ObExpr *expr, int64_t from_idx, int64_t to_idx, ObEvalCtx &eval_ctx) const;
     VectorHeader header_;
     int64_t max_row_cnt_;  //ObVectorBase
 

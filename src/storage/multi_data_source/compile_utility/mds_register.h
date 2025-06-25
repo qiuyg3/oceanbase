@@ -62,6 +62,8 @@
   #include "src/storage/tablet/ob_tablet_delete_mds_helper.h"
   #include "src/storage/tablet/ob_tablet_binding_helper.h"
   #include "src/storage/tablet/ob_tablet_binding_mds_user_data.h"
+  #include "src/storage/tablet/ob_tablet_split_mds_helper.h"
+  #include "src/storage/tablet/ob_tablet_split_mds_user_data.h"
   #include "src/share/ob_tablet_autoincrement_param.h"
   #include "src/storage/compaction/ob_medium_compaction_info.h"
   #include "src/storage/tablet/ob_tablet_start_transfer_mds_helper.h"
@@ -69,9 +71,18 @@
   #include "src/share/balance/ob_balance_task_table_operator.h"
   #include "src/storage/tablet/ob_tablet_transfer_tx_ctx.h"
   #include "src/storage/multi_data_source/ob_tablet_create_mds_ctx.h"
+  #include "src/share/ob_standby_upgrade.h"
+  #include "src/storage/tablet/ob_tablet_abort_transfer_mds_helper.h"
+  #include "src/storage/multi_data_source/ob_tablet_create_mds_ctx.h"
   #include "src/storage/multi_data_source/ob_start_transfer_in_mds_ctx.h"
   #include "src/storage/multi_data_source/ob_finish_transfer_in_mds_ctx.h"
+  #include "src/storage/multi_data_source/ob_abort_transfer_in_mds_ctx.h"
   #include "src/share/ob_standby_upgrade.h"
+  #include "src/storage/mview/ob_major_mv_merge_info.h"
+  #include "src/storage/truncate_info/ob_truncate_info.h"
+  #include "src/storage/truncate_info/ob_truncate_info_mds_helper.h"
+  #include "src/storage/mview/ob_mview_mds.h"
+  #include "src/storage/tablet/ob_tablet_ddl_complete_mds_data.h"
 #endif
 /**************************************************************************************************/
 
@@ -156,31 +167,63 @@ _GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION_(HELPER_CLASS, BUFFER_CTX_TYPE, ID, ENU
                                           ::oceanbase::storage::ObTransferDestPrepareTxCtx,\
                                           28,\
                                           TRANSFER_DEST_PREPARE)
-  // GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletUnbindLobMdsHelper,\
-  //                                         ::oceanbase::storage::mds::MdsCtx,\
-  //                                         29,\
-  //                                         UNBIND_LOB_TABLET)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletUnbindLobMdsHelper,\
+                                          ::oceanbase::storage::mds::MdsCtx,\
+                                          29,\
+                                          UNBIND_LOB_TABLET)
   GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObChangeTabletToTableHelper,\
                                           ::oceanbase::storage::mds::MdsCtx,\
                                           30,\
                                           CHANGE_TABLET_TO_TABLE_MDS)
-  // GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletSplitMdsHelper,\
-  //                                         ::oceanbase::storage::mds::MdsCtx,\
-  //                                         31,\
-  //                                         TABLET_SPLIT)
-  // GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletAbortTransferHelper,\
-  //                                         ::oceanbase::storage::mds::ObAbortTransferInMdsCtx,\
-  //                                         32,\
-  //                                         TRANSFER_IN_ABORTED)
-  // GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::share::ObUpgradeDataVersionMDSHelper, \
-  //                                         ::oceanbase::storage::mds::MdsCtx, \
-  //                                         33,\
-  //                                         STANDBY_UPGRADE_DATA_VERSION)
-  // # 余留位置（此行之前占位）
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletSplitMdsHelper,\
+                                           ::oceanbase::storage::mds::MdsCtx,\
+                                           31,\
+                                           TABLET_SPLIT)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletAbortTransferHelper,\
+                                          ::oceanbase::storage::mds::ObAbortTransferInMdsCtx,\
+                                          32,\
+                                          TRANSFER_IN_ABORTED)
   GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::share::ObUpgradeDataVersionMDSHelper, \
                                           ::oceanbase::storage::mds::MdsCtx, \
                                           33,\
                                           STANDBY_UPGRADE_DATA_VERSION)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletBindingMdsHelper,\
+                                          ::oceanbase::storage::mds::MdsCtx,\
+                                          34,\
+                                          TABLET_BINDING)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObMVPublishSCNHelper,\
+                                          ::oceanbase::storage::ObUnUseCtx, \
+                                          35,\
+                                          MV_PUBLISH_SCN)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObMVNoticeSafeHelper,\
+                                          ::oceanbase::storage::ObUnUseCtx, \
+                                          36,\
+                                          MV_NOTICE_SAFE)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObMVUpdateSCNHelper,\
+                                          ::oceanbase::storage::ObUnUseCtx, \
+                                          37,\
+                                          MV_UPDATE_SCN)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTruncateInfoMdsHelper,\
+                                          ::oceanbase::storage::mds::MdsCtx, \
+                                          38,\
+                                          SYNC_TRUNCATE_INFO)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObMVMergeSCNHelper,\
+                                          ::oceanbase::storage::ObUnUseCtx, \
+                                          39,\
+                                          MV_MERGE_SCN)
+  GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObMViewMdsOpHelper,\
+                                          ::oceanbase::storage::ObMViewMdsOpCtx, \
+                                          40,\
+                                          MVIEW_MDS_OP)
+  // GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletDDLCompleteMdsHelper,\
+  //                                         ::oceanbase::storage::mds::MdsCtx,\
+  //                                         41,\
+  //                                         DDL_COMPLETE_MDS)
+  // GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletSplitInfoMdsHelper,\
+  //                                         ::oceanbase::storage::mds::MdsCtx,\
+  //                                         42,\
+  //                                         TABLET_SPLIT_INFO)
+  // # 余留位置（此行之前占位）
 #undef GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION
 #endif
 /**************************************************************************************************/
@@ -230,6 +273,9 @@ _GENERATE_MDS_UNIT_(KEY_TYPE, VALUE_TYPE, NEED_MULTI_VERSION)
   GENERATE_MDS_UNIT(::oceanbase::unittest::ExampleUserKey,\
                     ::oceanbase::unittest::ExampleUserData1,\
                     false)// need multi row, no need multi version
+  GENERATE_MDS_UNIT(::oceanbase::unittest::ExampleUserKey,\
+                    ::oceanbase::unittest::ExampleUserData2,\
+                    true)// need multi row & need multi version
 #endif
 
 #ifdef GENERATE_NORMAL_MDS_TABLE
@@ -245,9 +291,18 @@ _GENERATE_MDS_UNIT_(KEY_TYPE, VALUE_TYPE, NEED_MULTI_VERSION)
   GENERATE_MDS_UNIT(::oceanbase::compaction::ObMediumCompactionInfoKey,\
                     ::oceanbase::compaction::ObMediumCompactionInfo,\
                     false)
-  // GENERATE_MDS_UNIT(::oceanbase::storage::mds::DummyKey,\
-  //                   ::oceanbase::storage::ObTabletSplitMdsUserData,\
-  //                   false)
+  GENERATE_MDS_UNIT(::oceanbase::storage::mds::DummyKey,\
+                    ::oceanbase::storage::ObTabletSplitMdsUserData,\
+                    false)
+  GENERATE_MDS_UNIT(::oceanbase::storage::ObTruncateInfoKey,\
+                    ::oceanbase::storage::ObTruncateInfo,\
+                    false)
+  GENERATE_MDS_UNIT(::oceanbase::storage::mds::DummyKey,\
+                    ::oceanbase::storage::ObTabletDDLCompleteMdsUserData,\
+                    false)
+//GENERATE_MDS_UNIT(::oceanbase::storage::mds::DummyKey,\
+//                  ::oceanbase::storage::ObTabletSplitInfoMdsUserData,\
+//                  false)
   // # 余留位置（此行之前占位）
 #endif
 

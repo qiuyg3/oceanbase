@@ -25,20 +25,39 @@
 </p>
 
 <p align="center">
-    <a href="https://join.slack.com/t/oceanbase/shared_invite/zt-1e25oz3ol-lJ6YNqPHaKwY_mhhioyEuw">
-        <img alt="Join Slack" src="https://img.shields.io/badge/slack-Join%20Oceanbase-brightgreen?logo=slack" />
+    <a href="https://ask.oceanbase.com">
+        <img alt="中文论坛" src="https://img.shields.io/badge/Support-Join%20OceanBase-brightgreen?logo=support" />
     </a>
-    <a href="https://stackoverflow.com/questions/tagged/oceanbase">
-        <img alt="Stack Overflow" src="https://img.shields.io/badge/Stack-Stack%20Overflow-brightgreen?logo=stackoverflow" />
+    <a href="images/dingtalk.png">
+        <img alt="DingTalk" src="https://img.shields.io/badge/Dingtalk-Dingtalk-brightgreen?logo=Dingtalk" />
+    </a>
+        <a href="https://www.youtube.com/@OceanBaseDB">
+        <img alt="Static Badge" src="https://img.shields.io/badge/YouTube-red?logo=youtube">
+    </a>
+    <a href="https://www.linkedin.com/company/oceanbase" target="_blank">
+        <img src="https://custom-icon-badges.demolab.com/badge/LinkedIn-0A66C2?logo=linkedin-white&logoColor=fff" alt="follow on LinkedIn">
+    </a>
+    <a href="https://en.oceanbase.com/">
+        <img alt="Static Badge" src="https://img.shields.io/badge/OceanBase-Official%20Website-blue">
+    </a>
+    <a href="https://oceanbase.github.io/docs/blogs/users/1st-financial">
+        <img alt="Static Badge" src="https://img.shields.io/badge/OceanBase-Official%20Blog-blue">
+    </a>
+    <a href="https://x.com/OceanBaseDB">
+        <img alt="Static Badge" src="https://img.shields.io/badge/Follow-%40OceanBaseDB-white?logo=x&labelColor=black">
+    </a>
+    <a href="https://github.com/oceanbase/oceanbase/graphs/commit-activity" target="_blank">
+        <img alt="Static Badge" src="https://img.shields.io/badge/commit%20activity%201020%2Fmonth-yellow">
     </a>
 </p>
 
-[English](README.md) | 中文版
+[English](README.md) | 中文版 | [日本語版](README_JA.md)
 
-**OceanBase Database** 是一个分布式关系型数据库。完全由蚂蚁集团自主研发。 OceanBase 基于 [Paxos](https://lamport.azurewebsites.net/pubs/lamport-paxos.pdf) 协议以及分布式架构，实现了高可用和线性扩展。OceanBase 数据库运行在常见的服务器集群上，不依赖特殊的硬件架构。
+**OceanBase Database** 是一个分布式关系型数据库。完全由蚂蚁集团自主研发。 OceanBase 基于 [Paxos](https://lamport.azurewebsites.net/pubs/lamport-paxos.pdf) 协议以及分布式架构，实现了高可用和线性扩展。OceanBase 数据库运行在常见的服务器集群上，不依赖特殊的硬件架构，并支持向量数据库功能，为 AI 和大规模检索场景提供高效的向量查询能力。
 
 # 关键特性
 
+- **向量检索**：支持向量索引和高效查询，可用于 AI 应用、推荐系统和语义搜索，提供高吞吐、低延迟的向量搜索能力；
 - **水平扩展**：单机群支持超过1500节点、PB级数据量和单表超万亿行数据；
 - **极致性能**：TPC-C 7.07亿tmpC和TPC-H 1526 万 QphH @30000GB；
 - **低成本**：存储成本节省70%-90%；
@@ -70,20 +89,28 @@ obd demo
 
 ## 🐳 使用 docker
 
+**注意**: 我们在 [dockerhub](https://hub.docker.com/r/oceanbase/oceanbase-ce/tags), [quay.io](https://quay.io/repository/oceanbase/oceanbase-ce?tab=tags) 和 [ghcr.io](https://github.com/oceanbase/docker-images/pkgs/container/oceanbase-ce) 提供镜像。如果您在从 dockerhub 拉取镜像时遇到问题，请尝试其他两个镜像库。
+
 1. 启动 OceanBase 数据库实例
 
     ```shell
     # 部署一个mini模式实例
     docker run -p 2881:2881 --name oceanbase-ce -e MODE=mini -d oceanbase/oceanbase-ce
+
+    # 使用 quay.io 仓库的镜像部署 OceanBase.
+    # docker run -p 2881:2881 --name oceanbase-ce -e MODE=mini -d quay.io/oceanbase/oceanbase-ce
+
+    # 使用 ghcr.io 仓库的镜像部署 OceanBase.
+    # docker run -p 2881:2881 --name oceanbase-ce -e MODE=mini -d ghcr.io/oceanbase/oceanbase-ce
     ```
 
 2. 连接 OceanBase
 
     ```shell
-    docker exec -it oceanbase-ce ob-mysql sys # 连接root用户sys租户
+    docker exec -it oceanbase-ce obclient -h127.0.0.1 -P2881 -uroot # 连接root用户sys租户
     ```
 
-更多信息参考[docker 文档](https://github.com/oceanbase/docker-images/tree/main/oceanbase-ce)。
+更多信息参考[docker 文档](https://github.com/oceanbase/docker-images/blob/main/oceanbase-ce/README_CN.md)。
 
 ## ☸️ 使用 Kubernetes
 
@@ -99,7 +126,7 @@ obd demo
 
 # 案例
 
-OceanBase 已服务超过 1000 家来自不同行业的客户，包括金融服务、电信、零售、互联网等。
+OceanBase 已服务超过 2000 家来自不同行业的客户，包括金融服务、电信、零售、互联网等。
 
 更详细的信息请参考[客户案例](https://www.oceanbase.com/customer/home)和[谁在使用 OceanBase](https://github.com/oceanbase/oceanbase/issues/1301)。
 
@@ -120,7 +147,6 @@ OceanBase 数据库根据 Mulan 公共许可证版本 2 获得许可。有关详
 有以下加入社区的方法：
 
 * [中文论坛](https://ask.oceanbase.com/)
-* [Slack Workspace](https://join.slack.com/t/oceanbase/shared_invite/zt-1e25oz3ol-lJ6YNqPHaKwY_mhhioyEuw)
 * [Ask on Stack Overflow](https://stackoverflow.com/questions/tagged/oceanbase)
-* 钉钉群: 33254054 ([二维码](images/dingtalk.svg))
+* 钉钉群:  [33254054](images/dingtalk.png)
 * 微信群 (添加微信小助手: OBCE666)

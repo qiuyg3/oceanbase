@@ -12,7 +12,6 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_stats_estimator.h"
-#include "share/stat/ob_dbms_stats_utils.h"
 #include "observer/ob_inner_sql_connection_pool.h"
 #include "sql/optimizer/ob_opt_selectivity.h"
 
@@ -52,6 +51,32 @@ int ObStatsEstimator::gen_select_filed()
     } else if (OB_FAIL(select_fields_.append(buf, pos))) {
       LOG_WARN("failed to append stat item expr", K(ret));
     }
+  }
+  return ret;
+}
+
+int ObStatsEstimator::add_from_table(common::ObIAllocator &allocator,
+                                     const ObString &db_name,
+                                     const ObString &table_name)
+{
+  int ret = OB_SUCCESS;
+  ObString new_db_name;
+  ObString new_tbl_name;
+  if (OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
+              allocator,
+              db_name,
+              new_db_name,
+              lib::is_oracle_mode()))) {
+    LOG_WARN("fail to generate new name with escape character", K(ret), K(db_name));
+  } else if (OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
+                    allocator,
+                    table_name,
+                    new_tbl_name,
+                    lib::is_oracle_mode()))) {
+    LOG_WARN("fail to generate new name with escape character", K(ret), K(table_name));
+  } else {
+    db_name_ = new_db_name;
+    from_table_ = new_tbl_name;
   }
   return ret;
 }
@@ -369,7 +394,7 @@ int ObStatsEstimator::fill_group_by_info(ObIAllocator &allocator,
   return ret;
 }
 
-int ObStatsEstimator::do_estimate(uint64_t tenant_id,
+int ObStatsEstimator::do_estimate(const ObOptStatGatherParam &gather_param,
                                   const ObString &raw_sql,
                                   bool need_copy_basic_stat,
                                   ObOptStat &src_opt_stat,
@@ -378,7 +403,7 @@ int ObStatsEstimator::do_estimate(uint64_t tenant_id,
   int ret = OB_SUCCESS;
   common::ObOracleSqlProxy oracle_proxy; // TODO, check the usage, is there any postprocess
   ObCommonSqlProxy *sql_proxy = ctx_.get_sql_proxy();
-  ObArenaAllocator tmp_alloc("OptStatGather", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+  ObArenaAllocator tmp_alloc("OptStatGather", OB_MALLOC_NORMAL_BLOCK_SIZE, gather_param.tenant_id_);
   sql::ObSQLSessionInfo::StmtSavedValue *session_value = NULL;
   void *ptr = NULL;
   ObSQLSessionInfo *session = ctx_.get_my_session();
@@ -394,6 +419,9 @@ int ObStatsEstimator::do_estimate(uint64_t tenant_id,
                                        K(session), K(raw_sql.empty()));
     } else if (OB_FAIL(session->save_session(*session_value))) {
       LOG_WARN("failed to save session", K(ret));
+    } else if (session->is_in_external_catalog()
+               && OB_FAIL(session->set_internal_catalog_db())) {
+      LOG_WARN("failed to set catalog", K(ret));
     } else if (lib::is_oracle_mode()) {
       if (OB_FAIL(oracle_proxy.init(ctx_.get_sql_proxy()->get_pool()))) {
         LOG_WARN("failed to init oracle proxy", K(ret));
@@ -416,7 +444,8 @@ int ObStatsEstimator::do_estimate(uint64_t tenant_id,
       } else if (OB_ISNULL(conn)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("conn is null", K(ret), K(conn));
-      } else if (OB_FAIL(conn->execute_read(tenant_id, raw_sql.ptr(), proxy_result))) {
+      } else if (OB_FALSE_IT(conn->set_group_id(static_cast<int64_t>(gather_param.consumer_group_id_)))) {
+      } else if (OB_FAIL(conn->execute_read(gather_param.tenant_id_, raw_sql.ptr(), proxy_result))) {
         LOG_WARN("failed to execute sql", K(ret), K(raw_sql));
       } else if (OB_ISNULL(client_result = proxy_result.get_result())) {
         ret = OB_ERR_UNEXPECTED;

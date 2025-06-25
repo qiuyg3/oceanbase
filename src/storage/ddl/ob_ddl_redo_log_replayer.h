@@ -35,6 +35,12 @@ public:
   int replay_start(const ObDDLStartLog &log, const share::SCN &scn);
   int replay_redo(const ObDDLRedoLog &log, const share::SCN &scn);
   int replay_commit(const ObDDLCommitLog &log, const share::SCN &scn);
+  int replay_split_start(const ObTabletSplitStartLog &log, const share::SCN &scn);
+  int replay_split_finish(const ObTabletSplitFinishLog &log, const share::SCN &scn);
+  int replay_tablet_freeze(const ObTabletFreezeLog &log, const share::SCN &scn);
+  #ifdef OB_BUILD_SHARED_STORAGE
+  int replay_finish(const ObDDLFinishLog &log, const share::SCN &scn);
+  #endif
   int replay_inc_start(const ObDDLIncStartLog &log, const share::SCN &scn);
   int replay_inc_commit(const ObDDLIncCommitLog &log, const share::SCN &scn);
 private:

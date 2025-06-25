@@ -11,19 +11,11 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
-#include "sql/das/ob_das_location_router.h"
-#include "sql/das/ob_das_define.h"
-#include "share/ob_ls_id.h"
-#include "observer/ob_server_struct.h"
-#include "share/location_cache/ob_location_service.h"
+#include "ob_das_location_router.h"
 #include "share/schema/ob_part_mgr_util.h"
-#include "share/schema/ob_multi_version_schema_service.h"
-#include "share/schema/ob_schema_utils.h"
-#include "sql/das/ob_das_utils.h"
-#include "sql/ob_sql_context.h"
 #include "storage/tx/wrs/ob_black_list.h"
 #include "storage/tx/ob_trans_service.h"
-#include "lib/rc/context.h"
+#include "sql/engine/ob_exec_context.h"
 
 namespace oceanbase
 {
@@ -314,8 +306,14 @@ int ObDASTabletMapper::get_tablet_and_object_id(const ObPartitionLevel part_leve
         object_id = table_schema_->get_object_id();
       } else if (PARTITION_LEVEL_ONE == part_level) {
         ObPartition *partition = NULL;
+        int64_t default_idx = -1;
         for (int64_t i = 0; OB_SUCC(ret) && partition == NULL && i < table_schema_->get_partition_num(); i++) {
           const ObIArray<common::ObNewRow> &list_row_values = table_schema_->get_part_array()[i]->get_list_row_values();
+          if (list_row_values.count() == 1 &&
+              list_row_values.at(0).get_count() >= 1 &&
+              list_row_values.at(0).get_cell(0).is_max_value()) {
+            default_idx = i;
+          }
           for (int64_t j = 0; OB_SUCC(ret) && partition == NULL && j < list_row_values.count(); j++) {
             const ObNewRow &list_row = list_row_values.at(j);
             if (row == list_row) {
@@ -325,6 +323,11 @@ int ObDASTabletMapper::get_tablet_and_object_id(const ObPartitionLevel part_leve
             }
           } // end for
         } // end dor
+        if (OB_SUCC(ret) && partition == nullptr && default_idx != -1) {
+          partition = table_schema_->get_part_array()[default_idx];
+          tablet_id = partition->get_object_id();
+          object_id = partition->get_object_id();
+        }
       }
     } else if (PARTITION_LEVEL_ZERO == part_level) {
       if (OB_FAIL(ObPartitionUtils::get_tablet_and_object_id(
@@ -374,6 +377,67 @@ int ObDASTabletMapper::get_tablet_and_object_id(const ObPartitionLevel part_leve
     } else if (OB_FAIL(mock_vtable_related_tablet_id_map(tablet_id, object_id))) {
       LOG_WARN("fail to mock vtable related tablet id map", KR(ret), K(tablet_id), K(object_id));
     }
+  }
+  return ret;
+}
+
+int ObDASTabletMapper::get_tablet_and_object_id(const share::schema::ObPartitionLevel part_level,
+                             const common::ObPartID part_id,
+                             const int64_t target_partition_id,
+                             common::ObTabletID &tablet_id,
+                             common::ObObjectID &object_id)
+{
+  int ret = OB_SUCCESS;
+  tablet_id = ObTabletID::INVALID_TABLET_ID;
+  if (OB_NOT_NULL(table_schema_)) {
+    share::schema::RelatedTableInfo *related_info_ptr = nullptr;
+    if (related_info_.related_tids_ != nullptr && !related_info_.related_tids_->empty()) {
+      related_info_ptr = &related_info_;
+    }
+    if (OB_FAIL(ret)) {
+    } else if (table_schema_->is_external_table()) {
+      if (PARTITION_LEVEL_ZERO == part_level) {
+        tablet_id = table_schema_->get_object_id();
+        object_id = table_schema_->get_object_id();
+      } else if (PARTITION_LEVEL_ONE == part_level) {
+        ObPartition *partition = NULL;
+        for (int64_t i = 0; OB_SUCC(ret) && partition == NULL && i < table_schema_->get_partition_num(); i++) {
+          if (target_partition_id == table_schema_->get_part_array()[i]->get_part_id()) {
+            partition = table_schema_->get_part_array()[i];
+            tablet_id = partition->get_object_id();
+            object_id = partition->get_object_id();
+          }
+        } // end dor
+      }
+    } else if (PARTITION_LEVEL_ZERO == part_level) {
+      if (OB_FAIL(ObPartitionUtils::get_tablet_and_object_id(
+          *table_schema_, tablet_id, object_id, related_info_ptr))) {
+        LOG_WARN("fail to get tablet_id and object_id", KR(ret), KPC_(table_schema));
+      } else if (object_id != target_partition_id) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected partition id", K(target_partition_id), K(object_id));
+      }
+    } else if (PARTITION_LEVEL_ONE == part_level) {
+      if (OB_FAIL(ObPartitionUtils::get_tablet_and_part_id(
+          *table_schema_, target_partition_id, tablet_id, object_id, related_info_ptr))) {
+        LOG_WARN("fail to get tablet_id and part_id", KR(ret), K(target_partition_id), KPC_(table_schema));
+      }
+    } else if (PARTITION_LEVEL_TWO == part_level) {
+      if (OB_FAIL(ObPartitionUtils::get_tablet_and_subpart_id(
+          *table_schema_, part_id, target_partition_id, tablet_id, object_id, related_info_ptr))) {
+        LOG_WARN("fail to get tablet_id and part_id", KR(ret), K(part_id), K(target_partition_id), KPC_(table_schema));
+      } else if (OB_FAIL(set_partition_id_map(part_id, object_id))) {
+        LOG_WARN("failed to set partition id map");
+      }
+    } else {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid part level", KR(ret), K(part_level));
+    }
+  } else {
+    //virtual table, only supported partition by list(svr_ip, svr_port) ...
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("get partition id by target partition for virtual table not support", KR(ret));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "get partition id by target partition for virtual table");
   }
   return ret;
 }
@@ -792,14 +856,18 @@ ObDASLocationRouter::~ObDASLocationRouter()
 
 int ObDASLocationRouter::nonblock_get_readable_replica(const uint64_t tenant_id,
                                                        const ObTabletID &tablet_id,
-                                                       ObDASTabletLoc &tablet_loc)
+                                                       ObDASTabletLoc &tablet_loc,
+                                                       const ObRoutePolicyType route_policy)
 {
   int ret = OB_SUCCESS;
   ObLSLocation ls_loc;
   tablet_loc.tablet_id_ = tablet_id;
   if (OB_FAIL(all_tablet_list_.push_back(tablet_id))) {
     LOG_WARN("store access tablet id failed", K(ret));
-  } else if (OB_FAIL(GCTX.location_service_->nonblock_get(tenant_id,
+  } else if (is_shared_storage_sslog_table(tablet_id.id())
+          && FALSE_IT(tablet_loc.ls_id_ = SSLOG_LS)) {
+  } else if (!is_shared_storage_sslog_table(tablet_id.id())
+          && OB_FAIL(GCTX.location_service_->nonblock_get(tenant_id,
                                                           tablet_id,
                                                           tablet_loc.ls_id_))) {
     LOG_WARN("nonblock get ls id failed", K(ret), K(tenant_id), K(tablet_id));
@@ -836,7 +904,12 @@ int ObDASLocationRouter::nonblock_get_readable_replica(const uint64_t tenant_id,
     } else if (OB_FAIL(ObBLService::get_instance().check_in_black_list(bl_key, in_black_list))) {
       LOG_WARN("check in black list failed", K(ret));
     } else if (!in_black_list) {
-      if (tmp_replica_loc.get_server() == GCTX.self_addr()) {
+      if ((route_policy == COLUMN_STORE_ONLY && tmp_replica_loc.get_replica_type() != REPLICA_TYPE_COLUMNSTORE) ||
+          (route_policy != COLUMN_STORE_ONLY && tmp_replica_loc.get_replica_type() == REPLICA_TYPE_COLUMNSTORE) ||
+          (route_policy == FORCE_READONLY_ZONE && tmp_replica_loc.get_replica_type() != REPLICA_TYPE_READONLY)) {
+        // skip the tmp_replica_loc
+        LOG_TRACE("skip the replica due to the replica policy.", K(ret), K(tmp_replica_loc.get_replica_type()), K(tmp_replica_loc));
+      } else if (tmp_replica_loc.get_server() == GCTX.self_addr()) {
         //prefer choose the local replica
         local_replica = &tmp_replica_loc;
       } else if (OB_FAIL(remote_replicas.push_back(&tmp_replica_loc))) {
@@ -849,9 +922,13 @@ int ObDASLocationRouter::nonblock_get_readable_replica(const uint64_t tenant_id,
   if (OB_SUCC(ret)) {
     if (local_replica != nullptr) {
       tablet_loc.server_ = local_replica->get_server();
+    } else if (route_policy == COLUMN_STORE_ONLY && remote_replicas.empty()) {
+      //do not retry
+      ret = OB_NO_REPLICA_VALID;
+      LOG_USER_ERROR(OB_NO_REPLICA_VALID);
     } else if (remote_replicas.empty()) {
       ret = OB_NO_READABLE_REPLICA;
-      LOG_WARN("there has no readable replica", K(ret), K(tablet_id), K(ls_loc));
+      LOG_WARN("there has no readable replica", K(ret), K(tablet_id), K(ls_loc), K(route_policy));
     } else {
       //no local copy, randomly select a readable replica
       int64_t select_idx = rand() % remote_replicas.count();
@@ -886,7 +963,10 @@ int ObDASLocationRouter::nonblock_get(const ObDASTableLocMeta &loc_meta,
     ObLSID ls_id;
     if (OB_FAIL(all_tablet_list_.push_back(tablet_id))) {
       LOG_WARN("store all tablet list failed", K(ret), K(tablet_id));
-    } else if (OB_FAIL(GCTX.location_service_->nonblock_get(tenant_id, tablet_id, ls_id))) {
+    } else if (is_shared_storage_sslog_table(tablet_id.id())
+            && FALSE_IT(ls_id = SSLOG_LS)) {
+    } else if (!is_shared_storage_sslog_table(tablet_id.id())
+            && OB_FAIL(GCTX.location_service_->nonblock_get(tenant_id, tablet_id, ls_id))) {
       LOG_WARN("nonblock get ls id failed", K(ret));
     } else if (OB_FAIL(GCTX.location_service_->nonblock_get(GCONF.cluster_id,
                                                             tenant_id,
@@ -943,7 +1023,8 @@ int ObDASLocationRouter::nonblock_get_candi_tablet_locations(const ObDASTableLoc
         if (OB_FAIL(candi_tablet_loc.set_part_loc_with_only_readable_replica(partition_ids.at(i),
                                                                              first_level_part_id,
                                                                              tablet_ids.at(i),
-                                                                             location))) {
+                                                                             location,
+                                                                             static_cast<ObRoutePolicyType>(loc_meta.route_policy_)))) {
           LOG_WARN("fail to set partition location with only readable replica",
                    K(ret),K(i), K(location), K(candi_tablet_locs), K(tablet_ids), K(partition_ids));
         }
@@ -972,7 +1053,8 @@ int ObDASLocationRouter::get_tablet_loc(const ObDASTableLocMeta &loc_meta,
       //if this statement is retried because of OB_NOT_MASTER, we will choose the leader directly
       ret = nonblock_get_leader(tenant_id, tablet_id, tablet_loc);
     } else {
-      ret = nonblock_get_readable_replica(tenant_id, tablet_id, tablet_loc);
+      ret = nonblock_get_readable_replica(tenant_id, tablet_id, tablet_loc,
+                                          static_cast<ObRoutePolicyType>(loc_meta.route_policy_));
     }
   }
   return ret;
@@ -989,25 +1071,29 @@ int ObDASLocationRouter::nonblock_get_leader(const uint64_t tenant_id,
   bool is_local_leader = false;
   if (OB_FAIL(all_tablet_list_.push_back(tablet_id))) {
     LOG_WARN("store access tablet id failed", K(ret), K(tablet_id));
-  } else if (get_total_retry_cnt() > 0 || OB_FAIL(trans_service->check_and_get_ls_info(tablet_id, tablet_loc.ls_id_, is_local_leader))) {
-    ret = OB_SUCCESS;
-    if (OB_FAIL(GCTX.location_service_->nonblock_get(tenant_id,
-                                                     tablet_id,
-                                                     tablet_loc.ls_id_))) {
-      LOG_WARN("nonblock get ls id failed", K(ret), K(tablet_id));
-    } else if (OB_FAIL(GCTX.location_service_->nonblock_get_leader(GCONF.cluster_id,
-                                                                   tenant_id,
-                                                                   tablet_loc.ls_id_,
-                                                                   tablet_loc.server_))) {
-      LOG_WARN("nonblock get ls location failed", K(ret), K(tablet_loc));
-    }
-  } else if (is_local_leader) {
+  } else if (get_total_retry_cnt() == 0
+             && OB_SUCC(trans_service->check_and_get_ls_info(tablet_id, tablet_loc.ls_id_, is_local_leader))
+             && is_local_leader) {
+    // when not in retry, try local leader optimization
     tablet_loc.server_ = GCTX.self_addr();
+  } else if (is_shared_storage_sslog_table(tablet_id.id())
+          && FALSE_IT(tablet_loc.ls_id_ = SSLOG_LS)) {
+  } else if (!is_shared_storage_sslog_table(tablet_id.id())
+          && OB_FAIL(GCTX.location_service_->nonblock_get(tenant_id,
+                                                          tablet_id,
+                                                          tablet_loc.ls_id_))) {
+    LOG_WARN("nonblock get ls id failed", K(ret), K(tablet_id));
   } else if (OB_FAIL(GCTX.location_service_->nonblock_get_leader(GCONF.cluster_id,
                                                                  tenant_id,
                                                                  tablet_loc.ls_id_,
                                                                  tablet_loc.server_))) {
     LOG_WARN("nonblock get ls location failed", K(ret), K(tablet_loc));
+  }
+  if (OB_SUCC(ret) && get_total_retry_cnt() > 0 && last_errno_ == OB_NOT_MASTER) {
+    // flush ls cache when OB_NOT_MASTER
+    if (OB_FAIL(trans_service->remove_tablet(tablet_id, tablet_loc.ls_id_))) {
+      LOG_WARN("failed to remove tablet cache", K(ret), K(tablet_id));
+    }
   }
   if (is_partition_change_error(ret)) {
     /*During the execution phase, if nonblock location interface is used to obtain the location
@@ -1040,11 +1126,13 @@ int ObDASLocationRouter::get_leader(const uint64_t tenant_id,
   int ret = OB_SUCCESS;
   bool is_cache_hit = false;
   ObLSID ls_id;
-  if (OB_FAIL(GCTX.location_service_->get(tenant_id,
-                                          tablet_id,
-                                          expire_renew_time,
-                                          is_cache_hit,
-                                          ls_id))) {
+  if (is_shared_storage_sslog_table(tablet_id.id()) && FALSE_IT(ls_id = SSLOG_LS)) {
+  } else if (!is_shared_storage_sslog_table(tablet_id.id())
+          && OB_FAIL(GCTX.location_service_->get(tenant_id,
+                                                 tablet_id,
+                                                 expire_renew_time,
+                                                 is_cache_hit,
+                                                 ls_id))) {
     LOG_WARN("nonblock get ls id failed", K(ret));
   } else if (OB_FAIL(GCTX.location_service_->get_leader(GCONF.cluster_id,
                                                         tenant_id,
@@ -1262,11 +1350,13 @@ int ObDASLocationRouter::block_renew_tablet_location(const ObTabletID &tablet_id
   }
   //the timeout limit for "refresh location" is within 1s
   THIS_WORKER.set_timeout_ts(timeout_ctx.get_abs_timeout());
-  if (OB_FAIL(GCTX.location_service_->get(MTL_ID(),
-                                          tablet_id,
-                                          expire_renew_time,
-                                          is_cache_hit,
-                                          ls_id))) {
+  if (is_shared_storage_sslog_table(tablet_id.id()) && FALSE_IT(ls_id = SSLOG_LS)) {
+  } else if (!is_shared_storage_sslog_table(tablet_id.id())
+          && OB_FAIL(GCTX.location_service_->get(MTL_ID(),
+                                                 tablet_id,
+                                                 expire_renew_time,
+                                                 is_cache_hit,
+                                                 ls_id))) {
     LOG_WARN("fail to get ls id", K(ret));
   } else if (OB_FAIL(GCTX.location_service_->get(GCONF.cluster_id,
                                                  MTL_ID(),
@@ -1305,6 +1395,286 @@ int ObDASLocationRouter::get_external_table_ls_location(ObLSLocation &location)
 }
 
 OB_SERIALIZE_MEMBER(ObDASLocationRouter, all_tablet_list_);
+
+/* only for list part */
+int ObDASTabletMapper::get_tablet_and_object_id(
+    const ObPartitionLevel part_level,
+    const ObPartID part_id,
+    ObExecContext &exec_ctx,
+    const ParamStore &params,
+    const ObDataTypeCastParams &dtc_params,
+    const common::ObIArray<ValueItemExpr*> &vies,
+    ObIArray<ObTabletID> &tablet_ids,
+    ObIArray<ObObjectID> &object_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObTabletID, 4> tmp_tablet_ids;
+  ObSEArray<ObObjectID, 4> tmp_part_ids;
+  if (OB_NOT_NULL(table_schema_)) {
+    share::schema::RelatedTableInfo *related_info_ptr = nullptr;
+    if (related_info_.related_tids_ != nullptr && !related_info_.related_tids_->empty()) {
+      related_info_ptr = &related_info_;
+    }
+    if (OB_FAIL(ret)) {
+    } else if (table_schema_->is_external_table()) {
+      if (PARTITION_LEVEL_ZERO == part_level) {
+        if (OB_FAIL(tmp_tablet_ids.push_back(ObTabletID(table_schema_->get_object_id())))) {
+          LOG_WARN("fail to push back tablet_id", KR(ret));
+        } else if (OB_FAIL(tmp_part_ids.push_back(table_schema_->get_object_id()))) {
+          LOG_WARN("fail to push back object_id", KR(ret));
+        }
+      } else if (PARTITION_LEVEL_ONE == part_level) {
+        if (OB_FAIL(get_tablet_and_part_id_for_list_part(
+          *table_schema_, exec_ctx, params, dtc_params, vies, tmp_tablet_ids, tmp_part_ids, related_info_ptr))) {
+          LOG_WARN("fail to get tablet_id and part_id", KR(ret), KPC_(table_schema));
+        } else if (tmp_tablet_ids.count() != tmp_part_ids.count()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("tablet ids should be empty", K(tmp_tablet_ids), K(tmp_part_ids));
+        }
+      }
+    } else if (PARTITION_LEVEL_ZERO == part_level) {
+      ObTabletID tablet_id;
+      ObObjectID object_id;
+      if (OB_FAIL(ObPartitionUtils::get_tablet_and_object_id(
+          *table_schema_, tablet_id, object_id, related_info_ptr))) {
+        LOG_WARN("fail to get tablet_id and object_id", KR(ret), KPC_(table_schema));
+      } else if (OB_FAIL(tmp_tablet_ids.push_back(tablet_id))) {
+        LOG_WARN("fail to push back tablet_id", KR(ret), K(tablet_id));
+      } else if (OB_FAIL(tmp_part_ids.push_back(object_id))) {
+        LOG_WARN("fail to push back object_id", KR(ret), K(object_id));
+      }
+    } else if (PARTITION_LEVEL_ONE == part_level) {
+      if (OB_FAIL(get_tablet_and_part_id_for_list_part(
+          *table_schema_, exec_ctx, params, dtc_params, vies, tmp_tablet_ids, tmp_part_ids, related_info_ptr))) {
+        LOG_WARN("fail to get tablet_id and part_id", KR(ret), KPC_(table_schema));
+      }
+    } else if (PARTITION_LEVEL_TWO == part_level) {
+      if (OB_FAIL(get_tablet_and_subpart_id_for_list_part(
+          *table_schema_, part_id, exec_ctx, params, dtc_params, vies, tmp_tablet_ids, tmp_part_ids, related_info_ptr))) {
+        LOG_WARN("fail to get tablet_id and part_id", KR(ret), K(part_id), KPC_(table_schema));
+      } else if (OB_FAIL(set_partition_id_map(part_id, tmp_part_ids))) {
+        LOG_WARN("failed to set partition id map");
+      }
+    } else {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid part level", KR(ret), K(part_level));
+    }
+    OZ(append_array_no_dup(tablet_ids, tmp_tablet_ids));
+    OZ(append_array_no_dup(object_ids, tmp_part_ids));
+  } else {
+    if (part_level == PARTITION_LEVEL_TWO) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("virtual table with subpartition table not supported", KR(ret), KPC(vt_svr_pair_));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "virtual table with subpartition table");
+    } else if (OB_FAIL(vt_svr_pair_->get_all_part_and_tablet_id(object_ids, tablet_ids))) {
+      LOG_WARN("get all part and tablet id failed", K(ret));
+    } else if (OB_FAIL(mock_vtable_related_tablet_id_map(tablet_ids, object_ids))) {
+      LOG_WARN("fail to mock vtable related tablet id map", KR(ret), K(tablet_ids), K(object_ids));
+    }
+  }
+  return ret;
+}
+
+int ObDASTabletMapper::get_tablet_and_part_id_for_list_part(const share::schema::ObTableSchema &table_schema,
+                                                            ObExecContext &exec_ctx,
+                                                            const ParamStore &params,
+                                                            const ObDataTypeCastParams &dtc_params,
+                                                            const common::ObIArray<ValueItemExpr*> &vies,
+                                                            common::ObIArray<common::ObTabletID> &tablet_ids,
+                                                            common::ObIArray<common::ObObjectID> &part_ids,
+                                                            RelatedTableInfo *related_table /*= NULL*/)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<PartitionIndex, 4> partition_indexes;
+  ObPartitionLevel part_level = table_schema.get_part_level();
+  const uint64_t table_id = table_schema.get_table_id();
+  if (OB_FAIL(ObPartitionUtils::check_param_valid(table_schema, related_table))) {
+    LOG_WARN("fail to check param", K(table_schema), KP(related_table));
+  } else if (PARTITION_LEVEL_ONE != part_level && PARTITION_LEVEL_TWO != part_level) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not supported part level", K(table_id), K(part_level));
+  } else if (!table_schema.is_list_part()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not suppored part option", K(table_id), "part_option", table_schema.get_part_option());
+  } else {
+    ObPartition * const* part_array = table_schema.get_part_array();
+    const int64_t part_num = table_schema.get_partition_num();
+    if (OB_ISNULL(part_array) || OB_UNLIKELY(part_num <= 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected part array", KP(part_array), K(part_num));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < part_num; i++) {
+        const ObIArray<common::ObNewRow> &list_row_values = part_array[i]->get_list_row_values();
+        bool is_match = false;
+        // partition with default value always match
+        if (list_row_values.count() == 1 &&
+            list_row_values.at(0).get_count() >= 1 &&
+            list_row_values.at(0).get_cell(0).is_max_value()) {
+          is_match = true;
+        }
+        for (int64_t j = 0; OB_SUCC(ret) && !is_match && j < list_row_values.count(); j++) {
+          const ObNewRow &list_row = list_row_values.at(j);
+          bool all_match = true;
+          for (int64_t k = 0; OB_SUCC(ret) && all_match && k < vies.count(); ++k) {
+            ObObj res;
+            if (OB_ISNULL(vies.at(k))) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("get null vie");
+            } else {
+              ObCastCtx cast_ctx(&exec_ctx.get_allocator(), &dtc_params, CM_NONE, vies.at(k)->dst_cs_type_);
+              if (OB_FAIL(ObTableLocation::se_calc_value_item(cast_ctx, exec_ctx, params,
+                                                              *vies.at(k), list_row, res))) {
+                LOG_WARN("failed to calc value item");
+              } else if (res.get_int() == 0) {
+                all_match = false;
+              }
+            }
+          }
+          if (OB_SUCC(ret) && all_match) {
+            is_match = true;
+          }
+        } // end for
+        if (OB_SUCC(ret) && is_match) {
+          if (OB_FAIL(partition_indexes.push_back(PartitionIndex(i, OB_INVALID_INDEX)))) {
+            LOG_WARN("fail to push back part_idx", K(i));
+          }
+        }
+      } // end dor
+
+      if (OB_SUCC(ret)) {
+        if (OB_UNLIKELY(partition_indexes.empty())) {
+          // return invalid part_id/tablet_id if partition not found.
+          LOG_TRACE("partition not found");
+        }
+      }
+    }
+
+    const bool fill_tablet_id = (PARTITION_LEVEL_ONE == part_level);
+    if (FAILEDx(ObPartitionUtils::fill_tablet_and_object_ids(fill_tablet_id,
+                                                             OB_INVALID_INDEX /*part_idx*/,
+                                                             partition_indexes,
+                                                             table_schema,
+                                                             related_table,
+                                                             tablet_ids,
+                                                             part_ids))) {
+      LOG_WARN("fail to fill tablet and part_ids", K(fill_tablet_id), K(table_id), K(partition_indexes));
+    }
+  }
+  LOG_TRACE("table schema get tablet and part id", K(table_id), K(tablet_ids), K(part_ids), K(partition_indexes));
+  return ret;
+}
+
+int ObDASTabletMapper::get_tablet_and_subpart_id_for_list_part(const ObTableSchema &table_schema,
+                                                               const ObPartID &part_id,
+                                                               ObExecContext &exec_ctx,
+                                                               const ParamStore &params,
+                                                               const ObDataTypeCastParams &dtc_params,
+                                                               const ObIArray<ValueItemExpr*> &vies,
+                                                               ObIArray<ObTabletID> &tablet_ids,
+                                                               ObIArray<ObObjectID> &subpart_ids,
+                                                               RelatedTableInfo *related_table /*= NULL*/)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<PartitionIndex, 4> partition_indexes;
+  ObPartitionLevel part_level = table_schema.get_part_level();
+  const uint64_t table_id = table_schema.get_table_id();
+  const ObPartition *partition = NULL;
+  int64_t part_idx = OB_INVALID_ID;
+  if (OB_FAIL(ObPartitionUtils::check_param_valid(table_schema, related_table))) {
+    LOG_WARN("fail to check param", K(table_schema), KP(related_table));
+  } else if (PARTITION_LEVEL_TWO != part_level) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not supported part level", K(part_level));
+  } else if (!table_schema.is_list_subpart()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not supported subpart option", K(table_id), "subpart_option", table_schema.get_sub_part_option());
+  } else if (OB_FAIL(table_schema.get_partition_index_by_id(part_id,
+                                                            CHECK_PARTITION_MODE_NORMAL,
+                                                            part_idx))) {
+    LOG_WARN("fail to get part_idx by part_id", K(part_id));
+  } else if (OB_FAIL(table_schema.get_partition_by_partition_index(part_idx,
+                                                                   CHECK_PARTITION_MODE_NORMAL,
+                                                                   partition))) {
+    LOG_WARN("fail to get partition by part_idx", K(part_idx));
+  } else if (OB_ISNULL(partition)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("partition not exist", K(part_id), K(part_idx));
+  } else {
+    ObSubPartition * const* subpart_array = partition->get_subpart_array();
+    int64_t subpart_num = partition->get_subpartition_num();
+    if (OB_ISNULL(subpart_array) || OB_UNLIKELY(subpart_num <= 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected subpartition array", KP(subpart_array), K(subpart_num));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < subpart_num; i++) {
+        const ObIArray<common::ObNewRow> &list_row_values = subpart_array[i]->get_list_row_values();
+        bool is_match = false;
+        // partition with default value always match
+        if (list_row_values.count() == 1
+            && list_row_values.at(0).get_count() >= 1
+            && list_row_values.at(0).get_cell(0).is_max_value()) {
+          is_match = true;
+        }
+        for (int64_t j = 0; OB_SUCC(ret) && !is_match && j < list_row_values.count(); j++) {
+          const ObNewRow &list_row = list_row_values.at(j);
+          bool all_match = true;
+          for (int64_t k = 0; OB_SUCC(ret) && all_match && k < vies.count(); ++k) {
+            ObObj res;
+            if (OB_ISNULL(vies.at(k))) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("get null vie");
+            } else {
+              ObCastCtx cast_ctx(&exec_ctx.get_allocator(), &dtc_params, CM_NONE, vies.at(k)->dst_cs_type_);
+              if (OB_FAIL(ObTableLocation::se_calc_value_item(cast_ctx, exec_ctx, params,
+                                                              *vies.at(k), list_row, res))) {
+                LOG_WARN("failed to calc value item");
+              } else if (res.get_int() == 0) {
+                all_match = false;
+              }
+            }
+          }
+          if (OB_SUCC(ret) && all_match) {
+            is_match = true;
+          }
+        } // end for
+        if (OB_SUCC(ret) && is_match) {
+          const ObSubPartition *subpartition = NULL;
+          if (OB_ISNULL(subpartition = subpart_array[i])) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("subpartition is null", K(i));
+          } else if (OB_UNLIKELY(static_cast<ObPartID>(subpartition->get_part_id()) != part_id)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("part_id not match", KPC(subpartition), K(part_id));
+          } else if (OB_UNLIKELY(!subpartition->get_tablet_id().is_valid())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("invalid tablet_id", KPC(subpartition), K(i));
+          } else if (OB_FAIL(partition_indexes.push_back(PartitionIndex(OB_INVALID_INDEX, i)))) {
+            LOG_WARN("fail to push back subpart_idx", K(i));
+          }
+        }
+      } // end dor
+
+      if (OB_SUCC(ret)) {
+        if (OB_UNLIKELY(partition_indexes.empty())) {
+          // return invalid part_id/tablet_id if partition not found.
+          LOG_TRACE("subpartition not found");
+        }
+      }
+    }
+    const bool fill_tablet_id = true;
+    if (FAILEDx(ObPartitionUtils::fill_tablet_and_object_ids(fill_tablet_id,
+                                                             part_idx,
+                                                             partition_indexes,
+                                                             table_schema,
+                                                             related_table,
+                                                             tablet_ids,
+                                                             subpart_ids))) {
+      LOG_WARN("fail to fill tablet and subpart_ids", K(fill_tablet_id), K(table_id), K(partition_indexes));
+    }
+    LOG_TRACE("table schema get tablet and subpart id", K(table_id), K(tablet_ids), K(subpart_ids));
+  }
+  return ret;
+}
 
 }  // namespace sql
 }  // namespace oceanbase

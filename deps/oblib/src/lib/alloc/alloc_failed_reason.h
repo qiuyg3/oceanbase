@@ -20,9 +20,10 @@ namespace oceanbase
 {
 namespace lib
 {
-enum AllocFailedReason
+enum AllocFailedReason // FARM COMPAT WHITELIST
 {
   UNKNOWN = 0,
+  INVALID_ALLOC_SIZE,
   SINGLE_ALLOC_SIZE_OVERFLOW,
   CTX_HOLD_REACH_LIMIT,
   TENANT_HOLD_REACH_LIMIT,
@@ -65,17 +66,14 @@ public:
     return reason_ == lib::PHYSICAL_MEMORY_EXHAUST;
 
   }
-  bool reach_limit_except_ctx() const
-  {
-    return reason_ == lib::TENANT_HOLD_REACH_LIMIT ||
-           reason_ == lib::SERVER_HOLD_REACH_LIMIT ||
-           reason_ == lib::PHYSICAL_MEMORY_EXHAUST;
-  }
 };
 
 char *alloc_failed_msg();
 
 AllocFailedCtx &g_alloc_failed_ctx();
+void print_alloc_failed_msg(uint64_t tenant_id, uint64_t ctx_id,
+                            int64_t ctx_hold, int64_t ctx_limit,
+                            int64_t tenant_hold, int64_t tenant_limit);
 
 } // end of namespace lib
 } // end of namespace oceanbase

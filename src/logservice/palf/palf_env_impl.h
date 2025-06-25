@@ -35,11 +35,13 @@
 #include "block_gc_timer_task.h"
 #include "log_updater.h"
 #include "log_io_utils.h"
+#include "log_io_adapter.h"
 namespace oceanbase
 {
 namespace common
 {
 class ObILogAllocatr;
+class ObIOManager;
 }
 namespace rpc
 {
@@ -51,6 +53,11 @@ class ObReqTransport;
 namespace obrpc
 {
 class ObBatchRpc;
+}
+namespace share
+{
+class ObLocalDevice;
+class ObResourceManager;
 }
 namespace palf
 {
@@ -204,6 +211,7 @@ public:
   virtual int update_replayable_point(const SCN &replayable_scn) = 0;
   virtual int get_throttling_options(PalfThrottleOptions &option) = 0;
   virtual void period_calc_disk_usage() = 0;
+  virtual LogSharedQueueTh *get_log_shared_queue_thread() = 0;
   virtual int get_options(PalfOptions &options) = 0;
   VIRTUAL_TO_STRING_KV("IPalfEnvImpl", "Dummy");
 
@@ -225,7 +233,10 @@ public:
            obrpc::ObBatchRpc *batch_rpc,
            common::ObILogAllocator *alloc_mgr,
            ILogBlockPool *log_block_pool,
-           PalfMonitorCb *monitor);
+           PalfMonitorCb *monitor,
+           share::ObLocalDevice *log_local_device,
+           share::ObResourceManager *resource_manager,
+           common::ObIOManager *io_manager);
 
   // start函数包含两层含义：
   //
@@ -276,6 +287,7 @@ public:
   int update_replayable_point(const SCN &replayable_scn) override final;
   int get_throttling_options(PalfThrottleOptions &option);
   void period_calc_disk_usage() override final;
+  LogSharedQueueTh *get_log_shared_queue_thread() override final;
   INHERIT_TO_STRING_KV("IPalfEnvImpl", IPalfEnvImpl, K_(self), K_(log_dir), K_(disk_options_wrapper),
       KPC(log_alloc_mgr_));
   // =================== disk space management ==================
@@ -394,6 +406,7 @@ private:
   LogIOWorkerConfig log_io_worker_config_;
   bool diskspace_enough_;
   int64_t tenant_id_;
+  LogIOAdapter io_adapter_;
   bool is_inited_;
   bool is_running_;
 private:

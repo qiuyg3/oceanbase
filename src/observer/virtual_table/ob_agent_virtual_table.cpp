@@ -13,12 +13,7 @@
 #define USING_LOG_PREFIX SERVER
 
 #include "ob_agent_virtual_table.h"
-#include "share/ob_i_tablet_scan.h"
-#include "share/schema/ob_schema_struct.h"
-#include "observer/ob_server_struct.h"
 #include "observer/ob_inner_sql_result.h"
-#include "lib/string/ob_sql_string.h"
-#include "observer/ob_server_struct.h"
 
 namespace oceanbase
 {
@@ -267,7 +262,7 @@ int ObAgentVirtualTable::inner_get_next_row(common::ObNewRow *&row)
         cur_row_.cells_[i].set_null();
       } else if (lib::Worker::CompatMode::MYSQL == mode_) {
         cur_row_.cells_[i] = input;
-        LOG_INFO("mysql compat mode agent do not do convert", KR(ret), K(input));
+        LOG_TRACE("mysql compat mode agent do not do convert", KR(ret), K(input));
       } else if (OB_FAIL(mapping_[scan_param_->column_ids_.at(i)].convert_func_(
           input, cur_row_.cells_[i], convert_alloc_))) {
         LOG_WARN("convert obj failed", K(ret), K(input),

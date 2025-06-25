@@ -14,18 +14,8 @@
 #include "ob_common_ls_service.h"
 #include "ob_ls_service_helper.h"
 #include "ob_balance_ls_primary_zone.h"
-#include "lib/profile/ob_trace_id.h"
-#include "share/ob_errno.h"
-#include "share/ob_max_id_fetcher.h"
-#include "share/schema/ob_schema_struct.h"//ObTenantInfo
 #include "share/ls/ob_ls_creator.h" //ObLSCreator
-#include "share/ls/ob_ls_life_manager.h"//ObLSLifeAgentManager
-#include "share/ob_primary_zone_util.h"//ObPrimaryZoneUtil
-#include "share/ob_share_util.h"//ObShareUtil
-#include "share/ob_tenant_info_proxy.h"//ObAllTenantInfo
-#include "share/ob_common_rpc_proxy.h"//common_rpc_proxy
-#include "observer/ob_server_struct.h"//GCTX
-#include "logservice/palf/palf_base_info.h"//PalfBaseInfo
+#include "src/share/ob_common_rpc_proxy.h"
 
 namespace oceanbase
 {
@@ -125,7 +115,7 @@ void ObCommonLSService::do_work()
           }
         }
         // update primary ip list in every 10s
-        if (REACH_TENANT_TIME_INTERVAL(10 * 1000 * 1000)) {
+        if (REACH_THREAD_TIME_INTERVAL(10 * 1000 * 1000)) {
           (void)try_update_primary_ip_list();
         }
       }
@@ -357,14 +347,14 @@ void ObCommonLSService::try_update_primary_ip_list()
     } else if (OB_FAIL(restore_source_mgr.get_source(item))) {
       if (OB_ENTRY_NOT_EXIST == ret) {
         log_restore_source_exist = false;
-        if (REACH_TENANT_TIME_INTERVAL(60 * 1000 * 1000)) {
+        if (REACH_THREAD_TIME_INTERVAL(60 * 1000 * 1000)) {
           LOG_INFO("log restore source is empty, just skip", K(ret), K(user_tenant_id));
         }
       } else {
         LOG_WARN("get source failed", K(user_tenant_id), K(ret));
       }
     } else if (! need_update_ip_list_(item)) {
-      if (REACH_TENANT_TIME_INTERVAL(60 * 1000 * 1000)) {
+      if (REACH_THREAD_TIME_INTERVAL(60 * 1000 * 1000)) {
         LOG_INFO("log restore source not exists or the log restore source type is not service" , K(item));
       }
     } else if (OB_FAIL(get_restore_source_value_(item, standby_source_value))) {

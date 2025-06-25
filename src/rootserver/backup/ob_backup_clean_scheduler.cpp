@@ -14,14 +14,11 @@
 #include "ob_backup_clean_scheduler.h"
 #include "ob_backup_clean_ls_task_mgr.h"
 #include "ob_backup_clean_task_mgr.h"
-#include "ob_backup_schedule_task.h"
 #include "ob_backup_task_scheduler.h"
 #include "share/backup/ob_backup_clean_operator.h"
 #include "share/backup/ob_archive_persist_helper.h"
-#include "rootserver/ob_root_utils.h"
 #include "share/backup/ob_backup_helper.h"
 #include "share/backup/ob_archive_persist_helper.h"
-#include "share/backup/ob_backup_store.h"
 
 namespace oceanbase
 {
@@ -249,15 +246,10 @@ int ObBackupCleanScheduler::build_task_(
 {
   int ret = OB_SUCCESS;
   int64_t task_deep_copy_size = 0;
-  void *raw_ptr = nullptr;
   ObBackupCleanLSTask tmp_task;
   if (OB_FAIL(tmp_task.build(task_attr, ls_task))) {
     LOG_WARN("failed to build task", K(ret), K(task_attr), K(ls_task));
-  } else if (FALSE_IT(task_deep_copy_size = tmp_task.get_deep_copy_size())) {
-  } else if (nullptr == (raw_ptr = allocator.alloc(task_deep_copy_size))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("fail to allocate task", K(ret));
-  } else if (OB_FAIL(tmp_task.clone(raw_ptr, task))) {
+  } else if (OB_FAIL(tmp_task.clone(allocator, task))) {
     LOG_WARN("fail to clone input task", K(ret));
   } else if (nullptr == task) {
     ret = OB_ERR_UNEXPECTED;
@@ -858,7 +850,7 @@ int ObUserTenantBackupDeleteMgr::check_data_backup_dest_validity_()
     }
   } else if (backup_dest_str.is_empty()) {
     // do nothing
-  } else if (OB_FAIL(dest_mgr.init(job_attr_->tenant_id_, ObBackupDestType::TYPE::DEST_TYPE_BACKUP_DATA, backup_dest_str,  *sql_proxy_))) {
+  } else if (OB_FAIL(dest_mgr.init(job_attr_->tenant_id_, ObBackupDestType::TYPE::DEST_TYPE_BACKUP_DATA, backup_dest_str, *sql_proxy_))) {
     LOG_WARN("failed to init dest manager", K(ret), K(job_attr_), K(backup_dest_str));
   } else if (OB_FAIL(dest_mgr.check_dest_validity(*rpc_proxy_, true/*need_format_file*/))) {
     LOG_WARN("failed to check backup dest validity", K(ret), K(job_attr_), K(backup_dest_str));
@@ -923,9 +915,7 @@ int ObUserTenantBackupDeleteMgr::process()
     ObBackupCleanStatus::Status status = job_attr_->status_.status_;
     switch (status) {
       case ObBackupCleanStatus::Status::INIT: {
-        if (OB_FAIL(check_dest_validity_())) {
-          LOG_WARN("failed to check clean dest validity", K(ret), K(*job_attr_));
-        } else if (OB_FAIL(persist_backup_clean_task_())) {
+        if (OB_FAIL(persist_backup_clean_task_())) {
           LOG_WARN("failed to persist log stream task", K(ret), K(*job_attr_));
         }
         break;
@@ -1134,8 +1124,14 @@ int ObUserTenantBackupDeleteMgr::do_backup_clean_tasks_(const ObArray<ObBackupCl
     SMART_VAR(ObBackupCleanTaskMgr, task_mgr) {
       const ObBackupCleanTaskAttr &task_attr = task_attrs.at(i);
       if (ObBackupCleanStatus::Status::FAILED == task_attr.status_.status_) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("set task status can not be failed", K(ret), K(task_attr));  
+        if (OB_OBJECT_STORAGE_OBJECT_LOCKED_BY_WORM == task_attr.result_) {
+          // do nothing
+          // The clean task failed due to the worm.
+          // The failure of a single task does not affect the execution of other tasks.
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("set task status can not be failed", K(ret), K(task_attr));
+        }
       } else if (ObBackupCleanStatus::Status::COMPLETED == task_attr.status_.status_
           || ObBackupCleanStatus::Status::CANCELED == task_attr.status_.status_) {
         // do nothing
@@ -1159,6 +1155,7 @@ int ObUserTenantBackupDeleteMgr::handle_backup_clean_task(
   result = OB_SUCCESS;
   next_status.status_ = ObBackupCleanStatus::Status::MAX_STATUS;
   bool has_failed = false;
+  bool has_failed_by_worm = false;
   bool has_task = false;
   int64_t success_task_count = 0;
   for (int i = 0; OB_SUCC(ret) && i < task_attrs.count(); i++) {
@@ -1171,28 +1168,44 @@ int ObUserTenantBackupDeleteMgr::handle_backup_clean_task(
         || ObBackupCleanStatus::Status::CANCELING == task_attr.status_.status_) {
       has_task = true;
     } else if (ObBackupCleanStatus::Status::FAILED == task_attr.status_.status_ && !has_failed) { // return first failed
-      has_failed = true;
-      result = task_attr.result_;
+      if (OB_OBJECT_STORAGE_OBJECT_LOCKED_BY_WORM == task_attr.result_) {
+        // Unlike other failures, a failure due to the worm does not affect the execution of other tasks.
+        // However, when all tasks are completed or failed due to worm,
+        // the job should be marked as failed, with the error code recorded as OB_OBJECT_STORAGE_OBJECT_LOCKED_BY_WORM.
+        has_failed_by_worm = true;
+      } else {
+        result = task_attr.result_;
+        has_failed = true;
+      }
     } else if (ObBackupCleanStatus::Status::COMPLETED == task_attr.status_.status_) {
       success_task_count++; 
     }
   }
   job_attr_->success_task_count_ = success_task_count;
   if (OB_FAIL(ret)) {
-  } else if (!has_failed && has_task) {
-    if (OB_FAIL(do_backup_clean_tasks_(task_attrs))) {
-      LOG_WARN("failed to do set tasks", K(ret)); 
-    } 
-  } else if (has_failed && has_task) {
-    if (OB_FAIL(do_cancel_())) {
-      LOG_WARN("failed to cancel task", K(ret)); 
+  } else if (has_task) {
+    if (!has_failed) {
+      if (OB_FAIL(do_backup_clean_tasks_(task_attrs))) {
+        LOG_WARN("failed to do set tasks", K(ret));
+      }
+    } else {
+      if (OB_FAIL(do_cancel_())) {
+        LOG_WARN("failed to cancel task", K(ret));
+      }
     }
-  } else if (has_failed && !has_task) {
-    next_status.status_ = ObBackupCleanStatus::Status::FAILED; 
   } else {
-    next_status.status_ = ObBackupCleanStatus::Status::COMPLETED;
+    if (has_failed) {
+      next_status.status_ = ObBackupCleanStatus::Status::FAILED;
+    } else if (has_failed_by_worm) {
+      result = OB_OBJECT_STORAGE_OBJECT_LOCKED_BY_WORM;
+      next_status.status_ = ObBackupCleanStatus::Status::FAILED;
+    } else {
+      next_status.status_ = ObBackupCleanStatus::Status::COMPLETED;
+    }
   }
-  FLOG_INFO("[BACKUP_CLEAN]handle backup clean task", K(ret), K(*job_attr_), K(next_status.status_), K(has_failed), K(has_task)); 
+
+  FLOG_INFO("[BACKUP_CLEAN]handle backup clean task", K(ret),
+      K(*job_attr_), K(next_status.status_), K(has_failed), K(has_task));
   return ret;
 }
 
@@ -1255,7 +1268,7 @@ int ObUserTenantBackupDeleteMgr::get_delete_backup_set_infos_(ObArray<ObBackupSe
 int ObUserTenantBackupDeleteMgr::get_delete_backup_piece_infos_(ObArray<ObTenantArchivePieceAttr> &piece_list)
 {
   int ret = OB_SUCCESS;
-  // TODO(wenjinyu.wjy) 4.3 support
+  // TODO(xingzhi) 4.4 support
   return ret;
 }
 
@@ -1318,6 +1331,9 @@ int ObUserTenantBackupDeleteMgr::get_delete_obsolete_backup_set_infos_(
       } else if (need_deleted && OB_FAIL(set_list.push_back(backup_set_info))) {
         LOG_WARN("failed to push back set list", K(ret));
       }
+    }
+    if (OB_SUCC(ret)) {
+      lib::ob_sort(set_list.begin(), set_list.end(), backup_set_info_cmp);
     }
     LOG_INFO("[BACKUP_CLEAN]finish get delete obsolete backup set infos ", K(ret), K(clog_data_clean_point), K(set_list)); 
   }

@@ -13,14 +13,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "ob_px_ms_coord_op.h"
-#include "share/ob_rpc_share.h"
-#include "share/schema/ob_part_mgr_util.h"
-#include "sql/engine/px/ob_px_util.h"
-#include "sql/dtl/ob_dtl_channel_group.h"
-#include "sql/dtl/ob_dtl_channel_loop.h"
-#include "sql/dtl/ob_dtl_msg_type.h"
-#include "sql/engine/px/ob_px_dtl_msg.h"
-#include "sql/engine/px/ob_px_dtl_proc.h"
 
 namespace oceanbase
 {
@@ -99,6 +91,7 @@ ObPxMSCoordOp::ObPxMSCoordOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOp
   opt_stats_gather_piece_msg_proc_(exec_ctx, msg_proc_),
   sp_winfunc_px_piece_msg_proc_(exec_ctx, msg_proc_),
   rd_winfunc_px_piece_msg_proc_(exec_ctx, msg_proc_),
+  join_filter_count_row_piece_msg_proc_(exec_ctx, msg_proc_),
   store_rows_(),
   last_pop_row_(nullptr),
   row_heap_(),
@@ -135,7 +128,7 @@ int ObPxMSCoordOp::inner_open()
   } else if (OB_FAIL(setup_loop_proc())) {
     LOG_WARN("fail setup loop proc", K(ret));
   } else {
-    if (1 == px_dop_) {
+    if (use_serial_scheduler_) {
       msg_proc_.set_scheduler(&serial_scheduler_);
     } else {
       msg_proc_.set_scheduler(&parallel_scheduler_);
@@ -179,6 +172,7 @@ int ObPxMSCoordOp::setup_loop_proc()
       .register_processor(opt_stats_gather_piece_msg_proc_)
       .register_processor(sp_winfunc_px_piece_msg_proc_)
       .register_processor(rd_winfunc_px_piece_msg_proc_)
+      .register_processor(join_filter_count_row_piece_msg_proc_)
       .register_interrupt_processor(interrupt_proc_);
   msg_loop_.set_tenant_id(ctx_.get_my_session()->get_effective_tenant_id());
   return ret;
@@ -337,10 +331,10 @@ int ObPxMSCoordOp::inner_get_next_row()
     int64_t nth_channel = OB_INVALID_INDEX_INT64;
     // Note:
     //   ObPxMSCoordOp::inner_get_next_row is invoked in two pathes (batch vs
-    //   non-batch). The eval flag should be cleared with seperated flags
+    //   non-batch). The eval flag should be cleared with separated flags
     //   under each invoke path (batch vs non-batch). Therefore call the overriding
     //   API do_clear_datum_eval_flag() to replace clear_evaluated_flag
-    // TODO qubin.qb: Implement seperated ObPxMSCoordOp::inner_get_next_batch to
+    // TODO qubin.qb: Implement separated ObPxMSCoordOp::inner_get_next_batch to
     // isolate them
     do_clear_datum_eval_flag();
     clear_dynamic_const_parent_flag();
@@ -388,7 +382,7 @@ int ObPxMSCoordOp::inner_get_next_row()
     } else if (OB_FAIL(ctx_.fast_check_status())) {
       LOG_WARN("fail check status, maybe px query timeout", K(ret));
     } else if (OB_FAIL(msg_loop_.process_one_if(&receive_order_, nth_channel))) {
-      if (OB_EAGAIN == ret) {
+      if (OB_DTL_WAIT_EAGAIN == ret) {
         LOG_TRACE("no message, try again", K(ret));
         ret = OB_SUCCESS;
         // if no data, then unblock blocked data channel, if not, dtl maybe hang
@@ -430,6 +424,7 @@ int ObPxMSCoordOp::inner_get_next_row()
         case ObDtlMsgType::DH_OPT_STATS_GATHER_PIECE_MSG:
         case ObDtlMsgType::DH_SP_WINFUNC_PX_PIECE_MSG:
         case ObDtlMsgType::DH_RD_WINFUNC_PX_PIECE_MSG:
+        case ObDtlMsgType::DH_JOIN_FILTER_COUNT_ROW_PIECE_MSG:
           // 这几种消息都在 process 回调函数里处理了
           break;
         default:

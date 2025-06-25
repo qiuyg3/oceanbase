@@ -12,10 +12,6 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_block_batched_row_store.h"
-#include "sql/engine/expr/ob_expr.h"
-#include "storage/ob_i_store.h"
-#include "storage/blocksstable/ob_micro_block_reader.h"
-#include "storage/blocksstable/encoding/ob_micro_block_decoder.h"
 #include "storage/access/ob_table_access_context.h"
 
 namespace oceanbase
@@ -48,8 +44,9 @@ ObBlockBatchedRowStore::~ObBlockBatchedRowStore()
   reset();
 }
 
-int ObBlockBatchedRowStore::init(const ObTableAccessParam &param)
+int ObBlockBatchedRowStore::init(const ObTableAccessParam &param, common::hash::ObHashSet<int32_t> *agg_col_mask)
 {
+  UNUSED(agg_col_mask);
   int ret = OB_SUCCESS;
   void *buf = nullptr;
   void *len_array_buf = nullptr;

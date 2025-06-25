@@ -133,7 +133,8 @@ public:
     UNUSED(pending_end_lsn);
     return OB_SUCCESS;
   }
-  int seek(const palf::LSN &start_lsn, palf::PalfBufferIterator &iter)
+  int seek(const palf::LSN &start_lsn,
+           palf::PalfBufferIterator &iter)
   {
     UNUSED(start_lsn);
     UNUSED(iter);
@@ -146,20 +147,6 @@ public:
     UNUSED(iter);
     return OB_SUCCESS;
   };
-  int seek(const share::SCN &start_scn,
-           palf::PalfGroupBufferIterator &iter)
-  {
-    UNUSED(start_scn);
-    UNUSED(iter);
-    return OB_SUCCESS;
-  }
-  int seek(const int64_t start_ts_ns,
-           palf::PalfGroupBufferIterator &iter)
-  {
-    UNUSED(start_ts_ns);
-    UNUSED(iter);
-    return OB_SUCCESS;
-  }
   int set_initial_member_list(const common::ObMemberList &member_list,
                               const int64_t paxos_replica_num,
                               const common::GlobalLearnerList &learner_list)
@@ -204,6 +191,14 @@ public:
                                              common::GlobalLearnerList &learner_list) const
   {
     UNUSEDx(member_list, paxos_replica_num, learner_list);
+    return OB_SUCCESS;
+  }
+  int get_stable_membership(palf::LogConfigVersion &config_version,
+                            common::ObMemberList &member_list,
+                            int64_t &paxos_replica_num,
+                            common::GlobalLearnerList &learner_list) const
+  {
+    UNUSEDx(config_version, member_list, paxos_replica_num, learner_list);
     return OB_SUCCESS;
   }
   int get_max_lsn(palf::LSN &lsn) const
@@ -312,6 +307,14 @@ public:
     return OB_SUCCESS;
   }
   int force_set_as_single_replica()
+  {
+    return OB_SUCCESS;
+  }
+  int force_set_as_single_replica(const palf::LogConfigVersion &config_version, const int64_t timeout_us)
+  {
+    return OB_SUCCESS;
+  }
+  int force_set_member_list(const common::ObMemberList &new_member_list, const int64_t new_replica_num)
   {
     return OB_SUCCESS;
   }
@@ -521,6 +524,7 @@ public:
   bool is_offline() const {return false;};
   int offline() {return OB_SUCCESS;};
   int online(const LSN &lsn, const share::SCN &scn) { UNUSED(lsn); UNUSED(scn); return OB_SUCCESS;};
+  int is_replay_fatal_error(bool &has_fatal_error) {has_fatal_error = false; return OB_SUCCESS;}
 };
 
 }  // namespace storage

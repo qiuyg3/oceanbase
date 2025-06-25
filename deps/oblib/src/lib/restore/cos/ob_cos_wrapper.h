@@ -16,6 +16,8 @@
 #include <string.h>
 #include "ob_singleton.h"
 #include <dirent.h>
+#include "apr_pools.h"
+#include "apr_tables.h"
 
 namespace oceanbase
 {
@@ -40,7 +42,7 @@ public:
 
   ObCosEnv() : ObSingleton<ObCosEnv>(), is_inited_(false) {}
   // global init cos env resource, must and only can be called once
-  int init();
+  int init(apr_abortfunc_t abort_fn);
 
   void destroy();
 
@@ -48,6 +50,13 @@ private:
   bool is_inited_;
   Conf conf_;
 };
+
+OB_PUBLIC_API int ob_copy_apr_tables(apr_table_t *dst, const apr_table_t *src);
+OB_PUBLIC_API int ob_set_retry_headers(
+    apr_pool_t *p,
+    apr_table_t *&headers,
+    apr_table_t *&origin_headers_,
+    apr_table_t **&ref_headers_);
 
 static constexpr int MAX_TAGGING_STR_LEN = 16;
 
@@ -108,6 +117,12 @@ struct OB_PUBLIC_API CosStringBuffer
 
   CosStringBuffer(const char *ptr, int len) : data_(ptr), size_(len) {}
 
+  void assign_ptr(const char *ptr, int len)
+  {
+    data_ = ptr;
+    size_ = len;
+  }
+
   ~CosStringBuffer() {}
 
   bool empty() const
@@ -138,6 +153,11 @@ struct OB_PUBLIC_API CosStringBuffer
     return (!empty() && '\0' == data_[size_ - 1]) ? size_ - 1 : size_;
   }
 
+  int get_safe_str_len() const
+  {
+    return data_ != nullptr ? strlen(data_) : 0;
+  }
+
   bool is_prefix_of(const char *str, const int32_t str_len) const
   {
     bool match = false;
@@ -155,6 +175,11 @@ struct OB_PUBLIC_API CosStringBuffer
   bool is_end_with_slash_and_null() const
   {
     return (NULL != data_ && size_ >= 2 && data_[size_ - 1] == '\0' && data_[size_ - 2] == '/');
+  }
+
+  bool is_null_or_end_with_slash() const
+  {
+    return (NULL == data_ || (is_end_with_slash_and_null()));
   }
 };
 
@@ -205,6 +230,7 @@ public:
     OB_COS_customMem &custom_mem,
     const struct ObCosAccount &account,
     const bool check_md5,
+    const char *cos_sts_token,
     Handle **h);
 
   // You can not use handle any more after destroy_cos_handle is called.
@@ -241,6 +267,15 @@ public:
     const CosStringBuffer &bucket_name,
     const CosStringBuffer &object_name);
 
+  static int batch_del(
+    Handle *h,
+    const CosStringBuffer &bucket_name,
+    const CosStringBuffer *objects_to_delete_list,
+    const char **succeed_deleted_objects_list,
+    int64_t *succeed_deleted_objects_len_list,
+    const int64_t n_objects_to_delete,
+    int64_t &n_succeed_deleted_objects);
+
   // Tag one object from cos
   static int tag(
     Handle *h,
@@ -271,6 +306,7 @@ public:
     char *buf,
     const int64_t buf_size,
     const bool is_range_read,
+    const bool has_meta,
     int64_t &read_size);
 
   // Get whole object
@@ -300,7 +336,7 @@ public:
 
     CosListObjPara()
       : arg_(NULL), cur_obj_full_path_(NULL),
-        full_path_size_(0), cur_object_size_str_(NULL),
+        full_path_size_(0), cur_object_size_str_(NULL), cur_object_size_str_len_(0),
         next_flag_(false), type_(CosListType::COS_LIST_INVALID),
         next_token_(NULL), next_token_size_(0), finish_part_list_(false)
     {
@@ -311,13 +347,15 @@ public:
     int set_cur_obj_meta(
         char *obj_full_path,
         const int64_t full_path_size,
-        char *object_size_str);
+        char *object_size_str,
+        const int64_t object_size_len);
 
     void *arg_;
     char *cur_obj_full_path_;
     struct dirent last_container_name_;
     int64_t full_path_size_;
     char *cur_object_size_str_;
+    int64_t cur_object_size_str_len_;
     bool next_flag_;
     CosListType type_;
     char *next_token_;
@@ -361,11 +399,18 @@ public:
     const CosStringBuffer &dir_name,
     bool &is_empty_dir);
 
+  static int add_part_info(
+    Handle *h,
+    void *complete_part_list,
+    const int partnum,
+    const char *etag_header_str);
+
   static int init_multipart_upload(
     Handle *h,
     const CosStringBuffer &bucket_name,
     const CosStringBuffer &object_name,
-    char *&upload_id_str);
+    char *&upload_id_str,
+    void *&complete_part_list);
 
   static int upload_part_from_buffer(
     Handle *h,
@@ -374,13 +419,15 @@ public:
     const CosStringBuffer &upload_id_str,
     const int part_num, /*the sequence number of this part, [1, 10000]*/
     const char *buf,
-    const int64_t buf_size);
+    const int64_t buf_size,
+    const char *&etag_header_str);
 
   static int complete_multipart_upload(
     Handle *h,
     const CosStringBuffer &bucket_name,
     const CosStringBuffer &object_name,
-    const CosStringBuffer &upload_id_str);
+    const CosStringBuffer &upload_id_str,
+    void *complete_part_list);
 
   static int abort_multipart_upload(
     Handle *h,

@@ -9,18 +9,12 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PubL v2 for more details.
  */
-
-#include "sql/plan_cache/ob_plan_cache.h"
-#include "sql/plan_cache/ob_lib_cache_node_factory.h"
-#include "sql/plan_cache/ob_lib_cache_object_manager.h"
-#include "sql/plan_cache/ob_lib_cache_register.h"
-#include "sql/plan_cache/ob_pcv_set.h"
-#include "pl/ob_pl.h"
-#include "pl/ob_pl_package.h"
-#include "observer/table/ob_table_cache.h"
-#include "sql/resolver/cmd/ob_call_procedure_stmt.h"
-
 #define USING_LOG_PREFIX SQL_PC
+
+#include "sql/plan_cache/ob_pcv_set.h"
+#include "pl/ob_pl_package.h"
+#include "src/observer/table/ob_table_cache.h"
+#include "sql/resolver/cmd/ob_call_procedure_stmt.h"
 
 using namespace oceanbase::common;
 namespace oceanbase

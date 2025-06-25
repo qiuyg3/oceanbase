@@ -19,6 +19,8 @@
 #include "lib/container/ob_se_array.h"
 #include "common/storage/ob_device_common.h"
 #include "ob_storage_info.h"
+#include "ob_object_storage_base.h"
+#include <opendal.h>
 
 namespace oceanbase
 {
@@ -28,6 +30,7 @@ namespace common
 static constexpr int64_t MAX_APPENDABLE_FRAGMENT_SUFFIX_LENGTH = 64;
 static constexpr int64_t MAX_APPENDABLE_FRAGMENT_LENGTH = 128;
 static constexpr char APPENDABLE_OBJECT_ALLOCATOR[] = "AppendableAlloc";
+static constexpr int64_t IO_HANDLED_SIZE_ZERO = 0;
 
 enum StorageOpenMode
 {
@@ -48,7 +51,11 @@ enum ObStorageObjectMetaType
 
 // check the str is end with '/' or not
 bool is_end_with_slash(const char *str);
+bool is_null_or_end_with_slash(const char *str);
+int get_safe_str_len(const char* str);
+int c_str_to_int(const char *str, const int64_t length, int64_t &num);
 int c_str_to_int(const char *str, int64_t &num);
+int get_storage_prefix_from_path(const common::ObString &uri, const char *&prefix);
 int handle_listed_object(ObBaseDirEntryOperator &op,
     const char *obj_name, const int64_t obj_name_len, const int64_t obj_size);
 int handle_listed_directory(ObBaseDirEntryOperator &op,
@@ -59,6 +66,15 @@ int construct_fragment_full_name(const ObString &logical_appendable_object_name,
     const char *fragment_name, char *name_buf, const int64_t name_buf_len);
 int construct_fragment_full_name(const ObString &logical_appendable_object_name,
     const int64_t start, const int64_t end, char *name_buf, const int64_t name_buf_len);
+// Used for batch_del_files
+// check files are not null and files's idx are valid
+int check_files_map_validity(const hash::ObHashMap<ObString, int64_t> &files_to_delete);
+// Used for batch_del_files
+// record all files's idx remained in files_to_delete
+int record_failed_files_idx(const hash::ObHashMap<ObString, int64_t> &files_to_delete,
+                            ObIArray<int64_t> &failed_files_idx);
+int ob_set_field(const char *value, char *field, const uint32_t field_length);
+int ob_apr_abort_fn(int retcode);
 
 struct ObStorageObjectMetaBase
 {
@@ -67,13 +83,19 @@ public:
   ObStorageObjectMetaBase() : type_(ObStorageObjectMetaType::OB_OBJ_INVALID) { reset(); }
   ~ObStorageObjectMetaBase() { reset(); }
 
-  void reset() { is_exist_ = false; length_ = -1; }
+  void reset()
+  {
+    is_exist_ = false;
+    length_ = -1;
+    mtime_s_ = -1;
+  }
 
-  TO_STRING_KV(K_(is_exist), K_(length));
+  TO_STRING_KV(K_(is_exist), K_(length), K(type_), K(mtime_s_));
 
   bool is_exist_;
   int64_t length_;
   ObStorageObjectMetaType type_;
+  int64_t mtime_s_; // time of last modification, aligned with ObIODFileStat
 };
 
 // Each fragment meta corresponds to a normal object in a 'dir'.
@@ -141,11 +163,15 @@ public:
     return (type_ == ObStorageObjectMetaType::OB_OBJ_NORMAL) ||
            (type_ == ObStorageObjectMetaType::OB_FS_FILE);
   }
+  bool is_dir_type() const
+  {
+    return type_ == ObStorageObjectMetaType::OB_FS_DIR;
+  }
   bool is_simulate_append_type() const { return type_ == ObStorageObjectMetaType::OB_OBJ_SIMULATE_APPEND; }
 
   static bool fragment_meta_cmp_func(const ObAppendableFragmentMeta &left, const ObAppendableFragmentMeta &right);
 
-  TO_STRING_KV(K_(is_exist), K_(length), K_(type), K_(fragment_metas));
+  INHERIT_TO_STRING_KV("ObStorageObjectMetaBase", ObStorageObjectMetaBase, K(fragment_metas_));
 
   ObSEArray<ObAppendableFragmentMeta, 10> fragment_metas_;
 };
@@ -160,10 +186,15 @@ public:
   bool has_next_; // list result can only return up-to 1000 objects once, thus may need to multi operation.
   bool need_size_; // If true, that means when we list items, we also need to get each item's size
   int64_t *size_arr_; // save all the length of each object/file (the order is the same with name_arr)
+  int64_t cur_listed_count_;
+  int64_t total_list_limit_;  // The maximum number of objects required to be listed. <= 0 means there is no limit
+  opendal_lister *opendal_lister_; // The intermediate state of the list is kept in opendal, and we save opendal_lister to access the next page
 
   ObStorageListCtxBase()
     : max_list_num_(0), name_arr_(NULL), max_name_len_(0), rsp_num_(0),
-      has_next_(false), need_size_(false), size_arr_(NULL)
+      has_next_(false), need_size_(false), size_arr_(NULL),
+      cur_listed_count_(0), total_list_limit_(-1),
+      opendal_lister_(nullptr)
   {}
 
   virtual ~ObStorageListCtxBase() { reset(); }
@@ -173,6 +204,9 @@ public:
   void reset();
 
   bool is_valid() const;
+  void set_total_list_limit(const int64_t limit);
+  void inc_cur_listed_count();
+  bool has_reached_list_limit() const;
 
   TO_STRING_KV(K_(max_list_num), K_(max_name_len), K_(rsp_num), K_(has_next), K_(need_size),
     KP_(name_arr), KP_(size_arr));
@@ -185,9 +219,11 @@ public:
   char *next_token_; // save marker/continuation_token
   int64_t next_token_buf_len_; // length of marker/continuation_token should not be longer than this value
   char *cur_appendable_full_obj_path_;
+  const char *marker_;
 
   ObStorageListObjectsCtx()
-    : next_token_(NULL), next_token_buf_len_(0), cur_appendable_full_obj_path_(NULL)
+    : next_token_(NULL), next_token_buf_len_(0), cur_appendable_full_obj_path_(NULL),
+      marker_(nullptr)
   {}
 
   virtual ~ObStorageListObjectsCtx() { reset(); }
@@ -199,6 +235,7 @@ public:
   bool is_valid() const { return ObStorageListCtxBase::is_valid() && (next_token_ != NULL)
                                  && (next_token_buf_len_ > 0); }
   int set_next_token(const bool has_next, const char *next_token, const int64_t next_token_len);
+  int set_marker(const char *marker);
   int handle_object(const char *obj_path, const int obj_path_len, const int64_t obj_size);
 
   INHERIT_TO_STRING_KV("ObStorageListCtxBase", ObStorageListCtxBase,
@@ -226,21 +263,20 @@ public:
   INHERIT_TO_STRING_KV("ObStorageListCtxBase", ObStorageListCtxBase, K_(already_open_dir));
 };
 
+
 class ObIStorageUtil
 {
 public:
-  enum {
-    NONE = 0,
-    DELETE = 1,
-    TAGGING = 2,
-    MAX
-  };
   virtual int open(common::ObObjectStorageInfo *storage_info) = 0;
   virtual void close() = 0;
   virtual int is_exist(const common::ObString &uri, bool &exist) = 0;
   virtual int get_file_length(const common::ObString &uri, int64_t &file_length) = 0;
   virtual int head_object_meta(const common::ObString &uri, ObStorageObjectMetaBase &obj_meta) = 0;
   virtual int del_file(const common::ObString &uri) = 0;
+  virtual int batch_del_files(
+      const ObString &uri,
+      hash::ObHashMap<ObString, int64_t> &files_to_delete,
+      ObIArray<int64_t> &failed_files_idx) = 0;
   virtual int write_single_file(const common::ObString &uri, const char *buf, const int64_t size) = 0;
   virtual int mkdir(const common::ObString &uri) = 0;
   // list all objects which are 'prefix-matched'
@@ -276,6 +312,7 @@ public:
   virtual bool is_opened() const = 0;
 };
 
+// TODO @fangdan: delete this interface
 class ObIStorageMultiPartWriter
 {
 public:
@@ -288,6 +325,88 @@ public:
   virtual int64_t get_length() const = 0;
   virtual bool is_opened() const = 0;
 };
+
+class ObIStorageParallelMultipartWriter
+{
+public:
+  virtual int open(const common::ObString &uri, common::ObObjectStorageInfo *storage_info) = 0;
+  virtual int upload_part(const char *buf, const int64_t size, const int64_t part_id) = 0;
+  virtual int complete() = 0;
+  virtual int abort() = 0;
+  virtual int close() = 0;
+  virtual bool is_opened() const = 0;
+};
+
+class ObStoragePartInfoHandler
+{
+public:
+  // [etag, checksum]
+  using PartInfo = std::pair<const char *, const char *>;
+  // part_id -> [etag, checksum]
+  using PartInfoMap = hash::ObHashMap<int64_t, PartInfo>;
+
+  ObStoragePartInfoHandler();
+  virtual ~ObStoragePartInfoHandler();
+  void reset_part_info();
+
+  int init();
+  bool is_init() const { return is_inited_; }
+  int add_part_info(const int64_t part_id, const char *etag, const char *checksum);
+  int64_t size() const { return part_info_map_.size(); }
+
+
+protected:
+  bool is_inited_;
+  ObArenaAllocator part_info_allocator_;  // ObArenaAllocator is not thread safe
+  PartInfoMap part_info_map_;
+  SpinRWLock lock_;
+
+private:
+  static constexpr const char *PART_INFO_ALLOCATOR_TAG = "PART_INFO_ALLOC";
+  static constexpr const char *PART_INFO_MAP_TAG = "PART_INFO_MAP";
+};
+
+class ObObjectStorageGuard : public lib::ObMallocHookAttrGuard
+{
+public:
+  ObObjectStorageGuard(
+      const char *file, const int64_t line, const char *func,
+      const int &ob_errcode,
+      const ObObjectStorageInfo *storage_info,
+      const ObString &uri,
+      const int64_t &handled_size);
+  ~ObObjectStorageGuard();
+
+private:
+  void print_access_storage_log_() const;
+  bool is_slow_io_(const int64_t cost_time_us) const;
+
+private:
+  static constexpr int64_t SMALL_IO_SIZE = 128LL * 1024LL;             // 128KB
+  static constexpr int64_t MEDIUM_IO_SIZE = 2LL * 1024LL * 1024LL;     // 2MB
+
+  static constexpr int64_t UTIL_IO_WARN_THRESHOLD_TIME_US = 50LL * 1000;       // 50ms
+  static constexpr int64_t SMALL_IO_WARN_THRESHOLD_TIME_US = 100LL * 1000;     // 100ms
+  static constexpr int64_t MEDIUM_IO_WARN_THRESHOLD_TIME_US = 200LL * 1000;    // 200ms
+  static constexpr int64_t LARGE_IO_WARN_THRESHOLD_TIME_US = 300LL * 1000;     // 300ms
+
+  const char *file_name_;
+  const int64_t line_;
+  const char *func_name_;
+  const int &ob_errcode_;
+  const ObObjectStorageInfo *storage_info_;
+  const int64_t start_time_us_;
+  // Note: We don't use a reference here because if passing a `const char *` to the constructor
+  // creates a temporary `ObString` object. This temporary object is destroyed when the constructor
+  // exits, leaving the reference dangling.
+  const ObString uri_;
+  const int64_t &handled_size_;
+};
+
+#define OBJECT_STORAGE_GUARD(storage_info, uri, handled_size) \
+    common::ObObjectStorageGuard object_storage_guard_(       \
+        __FILE__, __LINE__, __FUNCTION__,                     \
+        ret, storage_info, uri, handled_size)
 
 }//common
 }//oceanbase

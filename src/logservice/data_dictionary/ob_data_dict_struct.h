@@ -51,6 +51,11 @@ class ObTableSchema;
 }
 }
 
+namespace sql
+{
+class ObLocalSessionVar;
+}
+
 namespace datadict
 {
 
@@ -83,7 +88,8 @@ public:
   // NOTICE: update DEFAULT_VERSION if modify serialized fields in DictxxxMeta
   // update to 2 in 4.1 bp1: add column_ref_ids_ in ObDictColumnMeta
   // update to 3 in 4.2: add udt_set_id_ and sub_type_ in ObDictColumnMeta
-  const static int64_t DEFAULT_VERSION = 3;
+  // update to 4 in 4.2.5: add local_session_vars_ in ObDictColumnMeta
+  const static int64_t DEFAULT_VERSION = 4;
 public:
   OB_INLINE bool is_valid() const
   {
@@ -286,6 +292,9 @@ public:
   OB_INLINE bool is_autoincrement() const { return is_autoincrement_; }
   OB_INLINE bool is_hidden() const { return is_hidden_; }
   OB_INLINE bool is_tbl_part_key_column() const { return is_part_key_col_; }
+  OB_INLINE bool is_not_null_for_read() const { return is_not_null_for_read_; }
+  OB_INLINE bool is_not_null_for_write() const { return is_not_null_for_write_; }
+  OB_INLINE bool is_not_null_validate_column() const { return is_not_null_validate_column_; }
   OB_INLINE bool is_rowkey_column() const { return rowkey_position_ > 0; }
   OB_INLINE bool is_index_column() const { return index_position_ > 0; }
   OB_INLINE bool is_enum_or_set() const { return meta_type_.is_enum_or_set(); }
@@ -303,13 +312,17 @@ public:
 
   OB_INLINE uint64_t get_udt_set_id() const { return udt_set_id_; }
   OB_INLINE uint64_t get_sub_data_type() const { return sub_type_; }
+  OB_INLINE uint64_t get_srs_id() const { return srs_id_; }
+  OB_INLINE sql::ObLocalSessionVar &get_local_session_var() { return local_session_vars_; }
+  OB_INLINE sql::ObLocalSessionVar const &get_local_session_var() const { return local_session_vars_; }
   OB_INLINE bool is_udt_column() const { return udt_set_id_ > 0 && OB_INVALID_ID != udt_set_id_; }
-  OB_INLINE bool is_udt_hidden_column() const { return is_udt_column() && is_hidden(); }
   OB_INLINE bool is_xmltype() const {
     return is_udt_column()
         && (((meta_type_.is_ext() || meta_type_.is_user_defined_sql_type()) && sub_type_ == T_OBJ_XML)
             || meta_type_.is_xml_sql_type());
   }
+
+  OB_INLINE bool is_collection() const { return meta_type_.is_collection_sql_type(); }
 
   NEED_SERIALIZE_AND_DESERIALIZE_DICT;
   TO_STRING_KV(
@@ -330,7 +343,12 @@ private:
   static const int8_t AUTO_INC_BIT = 1;
   static const int8_t HIDDEN_BIT = 1;
   static const int8_t PART_KEY_BIT = 1;
-  static const int8_t RESERVE_BIT = 27;
+  static const int8_t NOT_NULL_FOR_READ_BIT = 1;
+  static const int8_t NOT_NULL_FOR_WRITE_BIT = 1;
+  static const int8_t NOT_NULL_VALIDATE_BIT = 1;
+  static const int8_t ROWKEY_BIT = 1;
+  static const int8_t INDEX_BIT = 1;
+  static const int8_t RESERVE_BIT = 22;
 private:
   ObIAllocator *allocator_;
   uint64_t column_id_;
@@ -342,12 +360,17 @@ private:
   union {
     uint32_t colulmn_properties_;
     struct{
-      uint32_t is_nullable_       : NULLABLE_BIT;
-      uint32_t is_zero_fill_      : ZERO_FILL_BIT;
-      uint32_t is_autoincrement_  : AUTO_INC_BIT;
-      uint32_t is_hidden_         : HIDDEN_BIT;
-      uint32_t is_part_key_col_   : PART_KEY_BIT;
-      uint32_t reserved_          : RESERVE_BIT;
+      uint32_t is_nullable_                  : NULLABLE_BIT;
+      uint32_t is_zero_fill_                 : ZERO_FILL_BIT;
+      uint32_t is_autoincrement_             : AUTO_INC_BIT;
+      uint32_t is_hidden_                    : HIDDEN_BIT;
+      uint32_t is_part_key_col_              : PART_KEY_BIT;
+      uint32_t is_not_null_for_read_         : NOT_NULL_FOR_READ_BIT;
+      uint32_t is_not_null_for_write_        : NOT_NULL_FOR_WRITE_BIT;
+      uint32_t is_not_null_validate_column_  : NOT_NULL_VALIDATE_BIT;
+      uint32_t is_rowkey_column_             : ROWKEY_BIT;
+      uint32_t is_index_column_              : INDEX_BIT;
+      uint32_t reserved_                     : RESERVE_BIT;
     };
   };
   int64_t column_flags_;
@@ -361,6 +384,8 @@ private:
   common::ObSEArray<uint64_t, 2> column_ref_ids_;
   uint64_t udt_set_id_;
   uint64_t sub_type_;
+  uint64_t srs_id_;
+  sql::ObLocalSessionVar local_session_vars_;
 }; // end of ObDictColumnMeta
 
 class ObDictTableMeta
@@ -401,12 +426,20 @@ public:
         || share::schema::ObTableType::TMP_TABLE_ORA_TRX == table_type_
         || share::schema::ObTableType::TMP_TABLE_ORA_SESS == table_type_;
   }
+  // same meaning as the functions with the same names in TableSchema
+  // todo@lanyi 可以在schema模块内抽出一些类似share::schema::is_index_table的方法，简化这里的逻辑
+  OB_INLINE bool is_table_with_pk() const
+  { return share::schema::TOM_TABLE_WITH_PK == (enum share::schema::ObTablePrimaryKeyExistsMode)table_mode_.pk_exists_; }
+  OB_INLINE bool is_table_with_hidden_pk_column() const
+  { return (share::schema::TOM_HEAP_ORGANIZED == (enum share::schema::ObTableOrganizationMode)table_mode_.table_organization_mode_ ||
+           (share::schema::TOM_INDEX_ORGANIZED == (enum share::schema::ObTableOrganizationMode)table_mode_.table_organization_mode_ &&
+            share::schema::TOM_TABLE_WITHOUT_PK == (enum share::schema::ObTablePrimaryKeyExistsMode)table_mode_.pk_exists_)); }
+  OB_INLINE bool is_table_without_pk() const
+  { return share::schema::TOM_TABLE_WITHOUT_PK == (enum share::schema::ObTablePrimaryKeyExistsMode)table_mode_.pk_exists_; }
   OB_INLINE bool is_aux_lob_meta_table() const { return share::schema::ObTableType::AUX_LOB_META == table_type_; }
   OB_INLINE bool is_aux_lob_piece_table() const { return share::schema::ObTableType::AUX_LOB_PIECE == table_type_; }
   OB_INLINE bool is_aux_lob_table() const { return is_aux_lob_meta_table() || is_aux_lob_piece_table(); }
   OB_INLINE bool is_aux_vp_table() const { return share::schema::ObTableType::AUX_VERTIAL_PARTITION_TABLE == table_type_; }
-  OB_INLINE bool is_heap_table() const
-  { return share::schema::TOM_HEAP_ORGANIZED == (enum share::schema::ObTableOrganizationMode)table_mode_.organization_mode_; }
   OB_INLINE bool is_vir_table() const { return share::schema::ObTableType::VIRTUAL_TABLE == table_type_; }
   OB_INLINE bool is_view_table() const
   {
@@ -416,6 +449,7 @@ public:
   }
   OB_INLINE share::schema::ObIndexType get_index_type() const { return index_type_; }
   OB_INLINE bool is_index_table() const { return share::schema::is_index_table(table_type_); }
+  OB_INLINE bool is_mlog_table() const { return share::schema::is_mlog_table(table_type_); }
   OB_INLINE bool is_normal_index() const
   {
     return share::schema::INDEX_TYPE_NORMAL_LOCAL == index_type_
@@ -426,11 +460,16 @@ public:
   {
     return share::schema::INDEX_TYPE_UNIQUE_LOCAL == index_type_
         || share::schema::INDEX_TYPE_UNIQUE_GLOBAL == index_type_
-        || share::schema::INDEX_TYPE_UNIQUE_GLOBAL_LOCAL_STORAGE == index_type_;
+        || share::schema::INDEX_TYPE_UNIQUE_GLOBAL_LOCAL_STORAGE == index_type_
+        || share::schema::INDEX_TYPE_HEAP_ORGANIZED_TABLE_PRIMARY == index_type_;
   }
   OB_INLINE bool is_global_normal_index_table() const { return share::schema::INDEX_TYPE_NORMAL_GLOBAL == index_type_; }
   OB_INLINE bool is_global_unique_index_table() const { return share::schema::INDEX_TYPE_UNIQUE_GLOBAL == index_type_; }
   OB_INLINE bool is_global_index_table() const { return is_global_normal_index_table() || is_global_unique_index_table(); }
+  OB_INLINE bool is_ddl_table_ignored_to_sync_cdc() const
+  {
+    return share::schema::DONT_SYNC_LOG_FOR_CDC == table_mode_.ddl_table_ignore_sync_cdc_flag_;
+  }
   OB_INLINE uint64_t get_data_table_id() const { return data_table_id_; }
   OB_INLINE int64_t get_index_tid_count() const { return unique_index_tid_arr_.count(); } // NOTICE: only return unique_index_table count.
   OB_INLINE const ObIArray<uint64_t> &get_unique_index_table_id_arr() const { return unique_index_tid_arr_; }

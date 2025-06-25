@@ -12,20 +12,7 @@
 
 #define USING_LOG_PREFIX RS_LB
 #include "ob_server_balancer.h"
-#include "ob_balance_info.h"
-#include "lib/container/ob_array_iterator.h"
-#include "observer/ob_server_struct.h"
-#include "storage/ob_file_system_router.h"
-#include "rootserver/ob_zone_manager.h"
-#include "rootserver/ob_unit_stat_manager.h"
-#include "rootserver/ob_root_utils.h"
 #include "rootserver/ob_root_service.h"
-#include "storage/ob_file_system_router.h"
-#include "share/ob_all_server_tracer.h"
-#include "share/ob_server_table_operator.h"
-#include "rootserver/ob_heartbeat_service.h"
-#include "share/ob_share_util.h" // ObShareUtil
-#include "lib/utility/ob_tracepoint.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::common::hash;
@@ -333,9 +320,12 @@ int ObServerBalancer::distribute_for_standalone_sys_unit()
   } else if (!enable_sys_unit_standalone) {
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("sys unit standalone deployment is disabled", K(ret));
-  } else if (OB_FAIL(unit_mgr_->get_tenant_unit_servers(
+  } else if (OB_ISNULL(GCTX.root_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), KP(GCTX.root_service_));
+  } else if (OB_FAIL(GCTX.root_service_->get_unit_mgr().get_tenant_unit_servers(
           OB_SYS_TENANT_ID, empty_zone, sys_unit_server_array))) {
-    LOG_WARN("fail to get tenant unit server array", K(ret));
+    LOG_WARN("fail to get tenant unit server array", KR(ret));
   } else {
     ObHashMap<uint64_t, share::ObResourcePool *>::const_iterator iter = unit_mgr_->get_id_pool_map().begin();
     ObHashMap<uint64_t, share::ObResourcePool *>::const_iterator end = unit_mgr_->get_id_pool_map().end();
@@ -878,7 +868,8 @@ int ObServerBalancer::check_can_execute_rebalance(
         } else if (OB_UNLIKELY(nullptr == unit_loads)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unit loads ptr is null", K(ret));
-        } else if (OB_FAIL(unit_mgr_->calc_sum_load(unit_loads, sum_load))) {
+        } else if (OB_FAIL(unit_mgr_->calc_sum_load(unit_loads, sum_load,
+                                                    false/*include_ungranted_unit*/))) {
           LOG_WARN("fail to calc sum load", K(ret));
         }
         if (OB_FAIL(ret)) {
@@ -1230,9 +1221,9 @@ int ObServerBalancer::generate_available_servers(
     } else if (OB_UNLIKELY(zone.is_empty())) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid argument", K(ret), K(zone));
-    } else if (OB_ISNULL(zone_mgr_) || OB_ISNULL(unit_mgr_)) {
+    } else if (OB_ISNULL(zone_mgr_)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("zone_mgr_ or unit_mgr_ is null", K(ret), KP(unit_mgr_), KP(zone_mgr_));
+      LOG_WARN("zone_mgr_ is null", K(ret), KP(zone_mgr_));
     } else if (OB_FAIL(zone_mgr_->get_zone(zone, zone_info))) {
       LOG_WARN("fail to get zone info", K(ret), K(zone));
     } else if (ObZoneStatus::ACTIVE != zone_info.status_) {
@@ -1240,9 +1231,12 @@ int ObServerBalancer::generate_available_servers(
       LOG_WARN("zone is not in active", K(ret), K(zone_info));
     } else if (OB_FAIL(SVR_TRACER.get_servers_of_zone(zone, server_list))) {
       LOG_WARN("fail to get servers of zone", K(ret), K(zone));
-    } else if (OB_FAIL(unit_mgr_->get_tenant_unit_servers(
+    } else if (OB_ISNULL(GCTX.root_service_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid argument", KR(ret), KP(GCTX.root_service_));
+    } else if (OB_FAIL(GCTX.root_service_->get_unit_mgr().get_tenant_unit_servers(
             OB_SYS_TENANT_ID, zone, sys_unit_server_array))) {
-      LOG_WARN("fail to get tenant unit server array", K(ret));
+      LOG_WARN("fail to get tenant unit server array", KR(ret), K(zone));
     } else {
       available_servers.reset();
       for (int64_t i = 0; OB_SUCC(ret) && i < server_list.count(); ++i) {
@@ -4297,8 +4291,10 @@ int ObServerBalancer::check_single_server_resource_enough(
               && (static_cast<double>(this_load.load_sum_.log_disk_size())
                   + static_cast<double>(server_load.load_sum_.load_sum_.log_disk_size())
                 <= static_cast<double>(server_load.resource_info_.log_disk_total_))
-              && (static_cast<double>(my_unit_stat.get_required_size() + disk_statistic.disk_in_use_)
-                <= static_cast<double>(disk_statistic.disk_total_) * disk_waterlevel));
+              && (GCTX.is_shared_storage_mode() ||   // in shared-storage mode, skip check disk_usage
+                  (static_cast<double>(my_unit_stat.get_required_size() + disk_statistic.disk_in_use_)
+                  <= static_cast<double>(disk_statistic.disk_total_) * disk_waterlevel))
+             );
   }
   return ret;
 }
@@ -4929,11 +4925,11 @@ int ObServerBalancer::make_available_servers_balance_by_cm(
   } else {
     common::ObArray<UnitMigrateStat> task_array;
     if (OB_FAIL(do_non_ttg_unit_balance_by_cm(
-            task_array, not_grant_units, over_server_loads, under_server_loads,
+            task_array, standalone_units, over_server_loads, under_server_loads,
             upper_lmt, g_res_weights, weights_count))) {
       LOG_WARN("fail to do non ttg unit balance by units", K(ret));
     } else if (OB_FAIL(do_non_ttg_unit_balance_by_cm(
-            task_array, standalone_units, over_server_loads, under_server_loads,
+            task_array, not_grant_units, over_server_loads, under_server_loads,
             upper_lmt, g_res_weights, weights_count))) {
       LOG_WARN("fail to do non ttg unit balance by units", K(ret));
     } else if (task_array.count() > 0) {
@@ -5234,38 +5230,47 @@ int ObServerBalancer::make_available_servers_balance(
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (OB_FAIL(get_server_balance_critical_disk_waterlevel(disk_waterlevel))) {
-    LOG_WARN("fail to get disk waterlevel", K(ret));
-  } else if (OB_FAIL(zone_disk_statistic_.check_all_available_servers_over_disk_waterlevel(
-          disk_waterlevel, all_available_servers_disk_over))) {
-    LOG_WARN("fail to check all available servers over disk waterlevel", K(ret));
-  } else if (all_available_servers_disk_over) {
-    // The disk usage of all servers exceeds the warning water mark,
-    // used a complete disk balancing strategy.
-    // balance the disk usage when the cpu and memory can be accommodated.
-    ObArray<ServerTotalLoad *> available_server_loads;
-    if (OB_FAIL(generate_available_server_loads(
-            over_server_loads, under_server_loads, available_server_loads))) {
-      LOG_WARN("fail to generate available server loads", K(ret));
-    } else if (OB_FAIL(make_available_servers_disk_balance(
-            standalone_units, available_server_loads, balance_task_count))) {
-      LOG_WARN("fail to make available servers disk balance", K(ret));
-    } else {
-      balance_reason = "disk_balance_as_all_server_disk_over";
+  }
+  // check need balance by disk waterlevel
+  if (OB_SUCC(ret) && 0 == balance_task_count
+      && ! GCTX.is_shared_storage_mode()) {
+    // in shared_nothing mode, high disk waterlevel is allowed, no need to balance.
+    if (OB_FAIL(get_server_balance_critical_disk_waterlevel(disk_waterlevel))) {
+      LOG_WARN("fail to get disk waterlevel", K(ret));
+    } else if (OB_FAIL(zone_disk_statistic_.check_all_available_servers_over_disk_waterlevel(
+            disk_waterlevel, all_available_servers_disk_over))) {
+      LOG_WARN("fail to check all available servers over disk waterlevel", K(ret));
+    } else if (all_available_servers_disk_over) {
+      // The disk usage of all servers exceeds the warning water mark,
+      // used a complete disk balancing strategy.
+      // balance the disk usage when the cpu and memory can be accommodated.
+      ObArray<ServerTotalLoad *> available_server_loads;
+      if (OB_FAIL(generate_available_server_loads(
+              over_server_loads, under_server_loads, available_server_loads))) {
+        LOG_WARN("fail to generate available server loads", K(ret));
+      } else if (OB_FAIL(make_available_servers_disk_balance(
+              standalone_units, available_server_loads, balance_task_count))) {
+        LOG_WARN("fail to make available servers disk balance", K(ret));
+      } else {
+        balance_reason = "disk_balance_as_all_server_disk_over";
+      }
+    } else if (zone_disk_statistic_.over_disk_waterlevel()) {
+      // No need to deal with not grant, because they do not occupy disk
+      ObArray<ServerTotalLoad *> available_server_loads;
+      if (OB_FAIL(generate_available_server_loads(
+              over_server_loads, under_server_loads, available_server_loads))) {
+        LOG_WARN("fail to generate available server loads", K(ret));
+      } else if (OB_FAIL(make_available_servers_balance_by_disk(
+              standalone_units, available_server_loads, balance_task_count))) {
+        LOG_WARN("fail to make available servers balance by disk", K(ret));
+      } else {
+        balance_reason = "disk_balance_as_over_disk_waterlevel";
+      }
     }
-  } else if (zone_disk_statistic_.over_disk_waterlevel()) {
-    // No need to deal with not grant, because they do not occupy disk
-    ObArray<ServerTotalLoad *> available_server_loads;
-    if (OB_FAIL(generate_available_server_loads(
-            over_server_loads, under_server_loads, available_server_loads))) {
-      LOG_WARN("fail to generate available server loads", K(ret));
-    } else if (OB_FAIL(make_available_servers_balance_by_disk(
-            standalone_units, available_server_loads, balance_task_count))) {
-      LOG_WARN("fail to make available servers balance by disk", K(ret));
-    } else {
-      balance_reason = "disk_balance_as_over_disk_waterlevel";
-    }
-  } else {
+  }
+
+  // check need balance by cpu, mem, log_disk
+  if (OB_SUCC(ret) && 0 == balance_task_count) {
     if (OB_FAIL(make_available_servers_balance_by_cm(
             standalone_units, not_grant_units, over_server_loads, under_server_loads,
             upper_lmt, g_res_weights, weights_count, balance_task_count))) {
@@ -5625,6 +5630,7 @@ int ObServerBalancer::calc_global_balance_resource_weights(
       "cpu_weights", resource_weights[RES_CPU],
       "mem_weights", resource_weights[RES_MEM],
       "log_disk_weights", resource_weights[RES_LOG_DISK],
+      "data_disk_weights", resource_weights[RES_DATA_DISK],
       K(available_servers));
   return ret;
 }
@@ -7256,6 +7262,9 @@ double ObServerBalancer::ServerResourceLoad::get_true_capacity(const ObResourceT
   case RES_LOG_DISK:
     ret = static_cast<double>(resource_info_.log_disk_total_);
     break;
+  case RES_DATA_DISK:
+    ret = static_cast<double>(resource_info_.data_disk_total_);
+    break;
   default:
     ret = -1;
     break;
@@ -7276,6 +7285,9 @@ double ObServerBalancer::ServerLoad::get_intra_ttg_resource_capacity(
     break;
   case RES_LOG_DISK:
     ret = static_cast<double>(intra_ttg_resource_info_.log_disk_total_);
+    break;
+  case RES_DATA_DISK:
+    ret = static_cast<double>(intra_ttg_resource_info_.data_disk_total_);
     break;
   default:
     ret = -1;
@@ -7511,7 +7523,8 @@ bool ObServerBalancer::LoadSum::is_valid() const
   return load_sum_.min_cpu() >= 0
          && load_sum_.max_cpu() >= load_sum_.min_cpu()
          && load_sum_.memory_size() >= 0
-         && load_sum_.log_disk_size() >= 0;
+         && load_sum_.log_disk_size() >= 0
+         && load_sum_.data_disk_size() >= 0;
 }
 
 void ObServerBalancer::LoadSum::reset()
@@ -7531,6 +7544,9 @@ double ObServerBalancer::LoadSum::get_required(const ObResourceType resource_typ
     break;
   case RES_LOG_DISK:
     ret = static_cast<double>(load_sum_.log_disk_size());
+    break;
+  case RES_DATA_DISK:
+    ret = static_cast<double>(load_sum_.data_disk_size());
     break;
   default:
     ret = -1;
@@ -7628,8 +7644,7 @@ int ObServerBalancer::LoadSum::append_load(
 bool ObServerBalancer::ResourceSum::is_valid() const
 {
   return resource_sum_.cpu_ > 0
-         && resource_sum_.mem_total_ > 0
-         && resource_sum_.disk_total_ > 0;
+         && resource_sum_.mem_total_ > 0;
 }
 
 void ObServerBalancer::ResourceSum::reset()
@@ -7650,6 +7665,9 @@ double ObServerBalancer::ResourceSum::get_capacity(const ObResourceType resource
   case RES_LOG_DISK:
     ret = static_cast<double>(resource_sum_.log_disk_total_);
     break;
+  case RES_DATA_DISK:
+    ret = static_cast<double>(resource_sum_.data_disk_total_);
+    break;
   default:
     ret = -1;
     break;
@@ -7663,7 +7681,7 @@ int ObServerBalancer::ResourceSum::append_resource(
   int ret = OB_SUCCESS;
   resource_sum_.cpu_ += resource.cpu_;
   resource_sum_.mem_total_ += resource.mem_total_;
-  resource_sum_.disk_total_ += resource.disk_total_;
+  resource_sum_.data_disk_total_ += resource.data_disk_total_;
   resource_sum_.log_disk_total_ += resource.log_disk_total_;
   return ret;
 }
@@ -7674,7 +7692,7 @@ int ObServerBalancer::ResourceSum::append_resource(
   int ret = OB_SUCCESS;
   resource_sum_.cpu_ += resource.resource_sum_.cpu_;
   resource_sum_.mem_total_ += resource.resource_sum_.mem_total_;
-  resource_sum_.disk_total_ += resource.resource_sum_.disk_total_;
+  resource_sum_.data_disk_total_ += resource.resource_sum_.data_disk_total_;
   resource_sum_.log_disk_total_ += resource.resource_sum_.log_disk_total_;
   return ret;
 }
@@ -7873,7 +7891,7 @@ int ObServerBalancer::generate_zone_server_disk_statistic(
         disk_statistic.server_ = server;
         disk_statistic.wild_server_ = false;
         if (OB_SUCC(ERRSIM_SERVER_DISK_ASSIGN)) {
-          disk_statistic.disk_in_use_ = server_resource_info.disk_in_use_;
+          disk_statistic.disk_in_use_ = server_resource_info.data_disk_in_use_;
         } else {
           // ONLY FOR TEST, errsim triggered, make disk_in_use equal to (1GB * unit_num)
           ObArray<ObUnitManager::ObUnitLoad> *unit_loads_ptr;
@@ -7888,7 +7906,7 @@ int ObServerBalancer::generate_zone_server_disk_statistic(
           }
           LOG_ERROR("errsim triggered, assign server disk_in_use as unit count * 1GB", KR(ret), K(disk_statistic));
         }
-        disk_statistic.disk_total_ = server_resource_info.disk_total_;
+        disk_statistic.disk_total_ = server_resource_info.data_disk_total_;
         if (static_cast<double>(disk_statistic.disk_in_use_)
             > disk_waterlevel * static_cast<double>(disk_statistic.disk_total_)) {
           zone_disk_statistic_.over_disk_waterlevel_ = true;
@@ -7896,8 +7914,8 @@ int ObServerBalancer::generate_zone_server_disk_statistic(
       } else if (server_info.is_deleting() || server_info.is_permanent_offline()) {
         disk_statistic.server_ = server;
         disk_statistic.wild_server_ = true;
-        disk_statistic.disk_in_use_ = server_resource_info.disk_in_use_;
-        disk_statistic.disk_total_ = server_resource_info.disk_total_;
+        disk_statistic.disk_in_use_ = server_resource_info.data_disk_in_use_;
+        disk_statistic.disk_total_ = server_resource_info.data_disk_total_;
       } else {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unknow server_info", K(ret), K(server_info));

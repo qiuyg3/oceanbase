@@ -13,13 +13,10 @@
 #define USING_LOG_PREFIX SQL_PARSER
 #include "ob_parser.h"
 #include "lib/oblog/ob_log.h"
-#include "common/sql_mode/ob_sql_mode_utils.h"
 #include "parse_malloc.h"
 #include "parse_node.h"
 #include "ob_sql_parser.h"
 #include "pl/parser/ob_pl_parser.h"
-#include "lib/utility/ob_tracepoint.h"
-#include "lib/json/ob_json_print_utils.h"
 using namespace oceanbase::pl;
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -61,7 +58,9 @@ bool ObParser::is_pl_stmt(const ObString &stmt, bool *is_create_func, bool *is_c
       case S_BEGIN:
       case S_DROP:
       case S_ALTER:
-      case S_UPDATE: {
+      case S_UPDATE:
+      case S_SUBMIT:
+      case S_CANCEL: {
         if (ISSPACE(*p)) {
           p++;
         } else {
@@ -362,6 +361,7 @@ ObParser::State ObParser::transform_normal(ObString &normal)
   ELSIF(9, S_PROCEDURE, "procedure")
   ELSIF(7, S_PACKAGE, "package")
   ELSIF(7, S_TRIGGER, "trigger")
+  ELSIF(5, S_EVENT, "event")
   ELSIF(4, S_TYPE, "type")
   ELSIF(2, S_OR, "or")
   ELSIF(7, S_REPLACE, "replace")
@@ -381,6 +381,9 @@ ObParser::State ObParser::transform_normal(ObString &normal)
   ELSIF(6, S_SIGNAL, "signal")
   ELSIF(8, S_RESIGNAL, "resignal")
   ELSIF(5, S_FORCE, "force")
+  ELSIF(6, S_SUBMIT, "submit")
+  ELSIF(6, S_CANCEL, "cancel")
+  ELSIF(3, S_JOB, "job")
   ELSE()
 
   if (S_INVALID == state
@@ -412,6 +415,7 @@ ObParser::State ObParser::transform_normal(
         case S_FUNCTION:
         case S_PACKAGE:
         case S_TRIGGER:
+        case S_EVENT:
         case S_TYPE:
         case S_SIGNAL:
         case S_RESIGNAL: {
@@ -429,7 +433,9 @@ ObParser::State ObParser::transform_normal(
         case S_BEGIN:
         case S_DROP:
         case S_ALTER:
-        case S_UPDATE: {
+        case S_UPDATE:
+        case S_SUBMIT:
+        case S_CANCEL: {
           state = token;
         } break;
         case S_INVALID:
@@ -444,6 +450,7 @@ ObParser::State ObParser::transform_normal(
         case S_PROCEDURE:
         case S_PACKAGE:
         case S_TRIGGER:
+        case S_EVENT:
         case S_TYPE:
         case S_DEFINER: {
           is_pl = true;
@@ -484,7 +491,7 @@ ObParser::State ObParser::transform_normal(
     case S_ALTER: {
       State token = transform_normal(normal);
       if (S_PROCEDURE == token || S_FUNCTION == token
-          || S_PACKAGE == token || S_TRIGGER == token || S_TYPE == token) {
+          || S_PACKAGE == token || S_TRIGGER == token ||  S_EVENT == token || S_TYPE == token || S_DEFINER == token) {
         is_pl = true;
       } else {
         is_not_pl = true;
@@ -492,6 +499,15 @@ ObParser::State ObParser::transform_normal(
     } break;
     case S_UPDATE: {
       if (S_OF == transform_normal(normal)) {
+        is_pl = true;
+      } else {
+        is_not_pl = true;
+      }
+    } break;
+    case S_SUBMIT:
+    case S_CANCEL: {
+      State token = transform_normal(normal);
+      if (S_JOB == token) {
         is_pl = true;
       } else {
         is_not_pl = true;
@@ -1023,7 +1039,8 @@ int ObParser::parse(const ObString &query,
                     const bool is_batched_multi_stmt_split_on,
                     const bool no_throw_parser_error,
                     const bool is_pl_inner_parse,
-                    const bool is_dbms_sql)
+                    const bool is_dbms_sql,
+                    const bool is_parse_dynamic_sql)
 {
   int ret = OB_SUCCESS;
 
@@ -1085,7 +1102,7 @@ int ObParser::parse(const ObString &query,
   }
 
   parse_result.pl_parse_info_.is_inner_parse_ = is_pl_inner_parse;
-
+  parse_result.pl_parse_info_.is_parse_dynamic_sql_ = is_parse_dynamic_sql;
   if (INS_MULTI_VALUES == parse_mode) {
     void *buffer = nullptr;
     if (OB_ISNULL(buffer = allocator_->alloc(sizeof(InsMultiValuesResult)))) {

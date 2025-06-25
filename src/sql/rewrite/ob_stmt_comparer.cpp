@@ -15,9 +15,6 @@
 #include "ob_stmt_comparer.h"
 #include "ob_transform_utils.h"
 #include "sql/optimizer/ob_optimizer_util.h"
-#include "sql/ob_sql_context.h"
-#include "common/ob_smart_call.h"
-#include "objit/expr/ob_iraw_expr.h"
 
 
 using namespace oceanbase::sql;
@@ -99,15 +96,20 @@ void ObStmtCompareContext::init(const ObIArray<ObHiddenColumnItem> *calculable_i
   calculable_items_ = calculable_items;
 }
 
-void ObStmtCompareContext::init(const ObDMLStmt *inner,
-                                const ObDMLStmt *outer,
-                                const ObStmtMapInfo &map_info,
-                                const ObIArray<ObHiddenColumnItem> *calculable_items)
+int ObStmtCompareContext::init(const ObDMLStmt *inner,
+                               const ObDMLStmt *outer,
+                               const ObStmtMapInfo &map_info,
+                               const ObIArray<ObHiddenColumnItem> *calculable_items)
 {
-  inner_ = inner;
-  outer_ = outer;
-  map_info_ = map_info;
-  calculable_items_ = calculable_items;
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(map_info_.assign(map_info))) {
+    LOG_WARN("failed to assign", K(ret));
+  } else {
+    inner_ = inner;
+    outer_ = outer;
+    calculable_items_ = calculable_items;
+  }
+  return ret;
 }
 
 int ObStmtCompareContext::get_table_map_idx(uint64_t l_table_id, uint64_t r_table_id)
@@ -165,6 +167,104 @@ bool ObStmtCompareContext::compare_column(const ObColumnRefRawExpr &inner,
   return bret;
 }
 
+int ObStmtComparer::get_map_table(const ObStmtMapInfo& map_info,
+                                  const ObSelectStmt *outer_stmt,
+                                  const ObSelectStmt *inner_stmt,
+                                  const uint64_t &outer_table_id,
+                                  uint64_t &inner_table_id)
+{
+  int ret = OB_SUCCESS;
+  uint64_t dummy_outer_column_id = OB_INVALID_ID;
+  uint64_t dummy_inner_column_id = OB_INVALID_ID;
+  if (OB_FAIL(get_map_column(map_info, outer_stmt, inner_stmt,
+                             outer_table_id, dummy_outer_column_id, false,
+                             inner_table_id, dummy_inner_column_id))) {
+    LOG_WARN("failed to get map column", K(ret));
+  }
+  return ret;
+}
+
+int ObStmtComparer::get_map_column(const ObStmtMapInfo& map_info,
+                                   const ObSelectStmt *outer_stmt,
+                                   const ObSelectStmt *inner_stmt,
+                                   const uint64_t &outer_table_id,
+                                   const uint64_t &outer_column_id,
+                                   const bool in_same_stmt,
+                                   uint64_t &inner_table_id,
+                                   uint64_t &inner_column_id)
+{
+  int ret = OB_SUCCESS;
+  bool find = false;
+  int64_t outer_table_idx = OB_INVALID_ID;
+  int64_t inner_table_idx = OB_INVALID_ID;
+  inner_table_id = OB_INVALID_ID;
+  inner_column_id = OB_INVALID_ID;
+  if (OB_ISNULL(outer_stmt) || OB_ISNULL(inner_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpect null stmt", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !find && i < outer_stmt->get_table_size(); ++i) {
+    const TableItem *table = outer_stmt->get_table_item(i);
+    if (OB_ISNULL(table)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpect null table item", K(ret));
+    } else if (outer_table_id == table->table_id_) {
+      find =  true;
+      outer_table_idx = i;
+    }
+  }
+  if (OB_SUCC(ret) && (!find || OB_INVALID_ID == outer_table_idx)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table shoud be found in subquery" ,K(outer_table_idx), K(ret));
+  }
+  find = false;
+  for (int64_t i = 0; OB_SUCC(ret) && !find && i < map_info.table_map_.count(); ++i) {
+    if (outer_table_idx == map_info.table_map_.at(i)) {
+      inner_table_idx = i;
+      find = true;
+    }
+  }
+  if (OB_SUCC(ret) && (!find || OB_INVALID_ID == inner_table_idx ||  inner_table_idx < 0 ||
+                       inner_table_idx >= inner_stmt->get_table_size())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("incorrect table idx" , K(inner_table_idx), K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    const TableItem *inner_table = inner_stmt->get_table_item(inner_table_idx);
+    if (OB_ISNULL(inner_table)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpect null table item", K(ret));
+    } else {
+      inner_table_id = inner_table->table_id_;
+    }
+    if (OB_FAIL(ret) || OB_INVALID_ID == outer_column_id) {
+      /* do nothing */
+    } else if (in_same_stmt && inner_table_id == outer_table_id) {
+      inner_column_id = outer_column_id;
+    } else if (OB_UNLIKELY(inner_table_idx >= map_info.view_select_item_map_.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("incorrect id" , K(inner_table_idx), K(ret));
+    } else if (!inner_table->is_generated_table()) {
+      inner_column_id = outer_column_id;
+    } else {
+      int64_t outer_pos = outer_column_id - OB_APP_MIN_COLUMN_ID;
+      const ObIArray<int64_t> &select_item_map = map_info.view_select_item_map_.at(inner_table_idx);
+      find = false;
+      for (int64_t i = 0; OB_SUCC(ret) && !find && i < select_item_map.count(); ++i) {
+        if (outer_pos == select_item_map.at(i)) {
+          inner_column_id = i + OB_APP_MIN_COLUMN_ID;
+          find = true;
+        }
+      }
+      if (OB_SUCC(ret) && (!find || OB_INVALID_ID == inner_column_id)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("column shoud be found in subquery" ,K(outer_pos), K(inner_table_idx), K(select_item_map), K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 bool ObStmtCompareContext::compare_const(const ObConstRawExpr &left, const ObConstRawExpr &right)
 {
   int &ret = err_code_;
@@ -196,8 +296,8 @@ bool ObStmtCompareContext::compare_const(const ObConstRawExpr &left, const ObCon
         bret = false;
       } else if (ignore_param_) {
         bret = ObExprEqualCheckContext::compare_const(left, right);
-      } else if (left.get_result_type().get_param().is_equal(
-                   right.get_result_type().get_param(), CS_TYPE_BINARY)) {
+      } else if (left.get_param().is_equal(
+                   right.get_param(), CS_TYPE_BINARY)) {
         ObPCParamEqualInfo info;
         info.first_param_idx_ = left.get_value().get_unknown();
         info.second_param_idx_ = right.get_value().get_unknown();
@@ -214,7 +314,7 @@ bool ObStmtCompareContext::compare_const(const ObConstRawExpr &left, const ObCon
         ObPCConstParamInfo const_param_info;
         if (OB_FAIL(const_param_info.const_idx_.push_back(unkonwn_expr.get_value().get_unknown()))) {
           LOG_WARN("failed to push back element", K(ret));
-        } else if (OB_FAIL(const_param_info.const_params_.push_back(unkonwn_expr.get_result_type().get_param()))) {
+        } else if (OB_FAIL(const_param_info.const_params_.push_back(unkonwn_expr.get_param()))) {
           LOG_WARN("failed to psuh back param const value", K(ret));
         } else if (OB_FAIL(const_param_info_.push_back(const_param_info))) {
           LOG_WARN("failed to push back const param info", K(ret));
@@ -222,6 +322,37 @@ bool ObStmtCompareContext::compare_const(const ObConstRawExpr &left, const ObCon
       }
     } else {
       bret = left.get_value().is_equal(right.get_value(), CS_TYPE_BINARY);
+    }
+  } else if (OB_SUCC(ret) && ora_numeric_cmp_for_grouping_items_) {
+    // select (a - 1) from t group by grouping sets(a, 1);
+    // `1` parsed as decimal int in `a - 1`
+    // `1' parsed as number in grouping sets
+    // special comparision is needed here to replace const `1`
+    const ObObj l_obj = left.get_value().is_unknown() ? left.get_param() : left.get_value();
+    const ObObj r_obj = right.get_value().is_unknown() ? right.get_param() : right.get_value();
+    if ((l_obj.is_decimal_int() && r_obj.is_number())
+        || (l_obj.is_number() && r_obj.is_decimal_int())) {
+      ObNumber l_nmb, r_nmb;
+      ObNumStackOnceAlloc tmp_alloc;
+      if (l_obj.is_decimal_int()) {
+        if (OB_FAIL(wide::to_number(l_obj.get_decimal_int(),
+                                    l_obj.get_int_bytes(), l_obj.get_scale(),
+                                    tmp_alloc, l_nmb))) {
+          LOG_WARN("wide::to_number failed", K(ret));
+        } else {
+          r_nmb.shadow_copy(r_obj.get_number());
+        }
+      } else if (OB_FAIL(wide::to_number(r_obj.get_decimal_int(),
+                                         r_obj.get_int_bytes(),
+                                         r_obj.get_scale(), tmp_alloc, r_nmb))) {
+        LOG_WARN("wide::to_number", K(ret));
+      } else {
+        l_nmb.shadow_copy(l_obj.get_number());
+      }
+      if (OB_FAIL(ret)) {
+      } else {
+        bret = l_nmb.is_equal(r_nmb);
+      }
     }
   }
   return bret;
@@ -1281,24 +1412,25 @@ int ObStmtComparer::compute_tables_map(const ObDMLStmt *first,
 }
 
 
-int ObStmtComparer::compare_basic_table_item(const ObDMLStmt *first,
-                                            const TableItem *first_table,
-                                            const ObDMLStmt *second,
-                                            const TableItem *second_table,
-                                            QueryRelation &relation)
+int ObStmtComparer::compare_basic_table_item(const TableItem *first_table,
+                                             const TableItem *second_table,
+                                             QueryRelation &relation)
 {
   int ret = OB_SUCCESS;
   relation = QueryRelation::QUERY_UNCOMPARABLE;
-  if (OB_ISNULL(first) || OB_ISNULL(first_table)
-     || OB_ISNULL(second) || OB_ISNULL(second_table)) {
+  if (OB_ISNULL(first_table) || OB_ISNULL(second_table)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("param has null", K(first), K(first_table), K(second), K(second_table));
-  } else if ((first_table->is_basic_table() || first_table->is_link_table()) &&
-            (second_table->is_basic_table() || second_table->is_link_table()) &&
-            first_table->ref_id_ == second_table->ref_id_ && 
-            first_table->flashback_query_type_ == second_table->flashback_query_type_ &&
-            (first_table->flashback_query_expr_ == second_table->flashback_query_expr_ ||
-             first_table->flashback_query_expr_->same_as(*second_table->flashback_query_expr_))) {
+    LOG_WARN("param has null", K(first_table), K(second_table));
+  } else if ((first_table->is_basic_table() || first_table->is_link_table())
+             && (second_table->is_basic_table() || second_table->is_link_table())
+             && first_table->ref_id_ == second_table->ref_id_
+             && first_table->flashback_query_type_ == second_table->flashback_query_type_
+             && (first_table->flashback_query_expr_ == second_table->flashback_query_expr_
+                 || first_table->flashback_query_expr_->same_as(*second_table->flashback_query_expr_))
+             && ((first_table->sample_info_ == NULL &&  second_table->sample_info_ == NULL)
+                 || (first_table->sample_info_ != NULL &&  second_table->sample_info_ != NULL
+                     && first_table->sample_info_->same_as(*second_table->sample_info_)))) {
+                // if sample info is not null the seed != 1 && seed is same then sample info is same
     if (OB_LIKELY(first_table->access_all_part() && second_table->access_all_part())) {
       relation = QueryRelation::QUERY_EQUAL;
     } else if (first_table->access_all_part()) {
@@ -1461,11 +1593,9 @@ int ObStmtComparer::compare_table_item(const ObDMLStmt *first,
     }
   } else if ((first_table->is_basic_table() || first_table->is_link_table()) &&
             (second_table->is_basic_table() || second_table->is_link_table())) {
-    if (OB_FAIL(compare_basic_table_item(first, 
-                                        first_table, 
-                                        second, 
-                                        second_table, 
-                                        relation))) {
+    if (OB_FAIL(compare_basic_table_item(first_table,
+                                         second_table,
+                                         relation))) {
       LOG_WARN("compare table part failed",K(ret), K(first_table), K(second_table));
     } else if (QueryRelation::QUERY_UNCOMPARABLE != relation) {
       const int32_t first_table_index = first->get_table_bit_index(first_table->table_id_);

@@ -11,29 +11,10 @@
  */
 
 #define USING_LOG_PREFIX SQL_PC
-#include "sql/plan_cache/ob_plan_set.h"
 
-#include "lib/trace/ob_trace_event.h"
-#include "lib/number/ob_number_v2.h"
-#include "common/ob_role.h"
-#include "observer/ob_server_struct.h"
-#include "sql/ob_phy_table_location.h"
-#include "sql/ob_sql_utils.h"
-#include "sql/ob_sql_context.h"
-#include "sql/ob_sql_trans_control.h"
-#include "sql/plan_cache/ob_plan_cache.h"
-#include "sql/plan_cache/ob_pcv_set.h"
-#include "sql/plan_cache/ob_plan_cache_value.h"
-#include "sql/plan_cache/ob_cache_object.h"
-#include "sql/plan_cache/ob_dist_plans.h"
-#include "sql/privilege_check/ob_ora_priv_check.h"
-#include "sql/optimizer/ob_log_plan.h"
-#include "sql/engine/ob_physical_plan.h"
-#include "sql/engine/ob_exec_context.h"
-#include "sql/plan_cache/ob_cache_object_factory.h"
-#include "pl/ob_pl.h"
 #include "ob_plan_set.h"
-#include "share/resource_manager/ob_resource_manager.h"
+#include "sql/plan_cache/ob_pcv_set.h"
+#include "sql/privilege_check/ob_ora_priv_check.h"
 
 using namespace oceanbase;
 using namespace common;
@@ -46,12 +27,17 @@ namespace oceanbase
 {
 namespace sql
 {
-ObPlanSet::~ObPlanSet()
-{
-  // Make sure destory planset before destory pre calculable expression.
-  if (OB_ISNULL(pre_cal_expr_handler_)) {
-    // have no pre calculable expression, do nothing
-  } else {
+  const ObPCUserVarMeta ObPlanSet::UNKNOWN_VAR_DEFAULT_META = ObPCUserVarMeta(PRECISION_UNKNOWN_YET,
+                                                                              ObVarcharType,
+                                                                              CS_LEVEL_IMPLICIT,
+                                                                              CS_TYPE_BINARY);
+  ObPlanSet::~ObPlanSet()
+  {
+    // Make sure destory planset before destory pre calculable expression.
+    if (OB_ISNULL(pre_cal_expr_handler_))
+    {
+      // have no pre calculable expression, do nothing
+    } else {
     int64_t ref_cnt = pre_cal_expr_handler_->dec_ref_cnt();
     if (ref_cnt == 0) {
       common::ObIAllocator* alloc = pre_cal_expr_handler_->pc_alloc_;
@@ -60,6 +46,25 @@ ObPlanSet::~ObPlanSet()
       pre_cal_expr_handler_ = NULL;
     }
   }
+}
+
+int ObPlanSet::get_variable_meta(const ObSQLSessionInfo *session_info, const ObString &var_name,
+                                 ObPCUserVarMeta &meta)
+{
+  int ret = OB_SUCCESS;
+  ObSessionVariable sess_var;
+  if (OB_FAIL(session_info->get_user_variable(var_name, sess_var))) {
+    if (ret == OB_ERR_USER_VARIABLE_UNKNOWN) {
+      meta = UNKNOWN_VAR_DEFAULT_META;
+      ret = OB_SUCCESS;
+      LOG_TRACE("ignore unknow variable error", K(ret), K(var_name));
+    } else {
+      LOG_WARN("failed to get user variable", K(ret), K(var_name));
+    }
+  } else {
+    meta.parse_from_variable(sess_var);
+  }
+  return ret;
 }
 
 //used for get plan
@@ -121,11 +126,13 @@ int ObPlanSet::match_params_info(const ParamStore *params,
                  K(ret), K(pc_ctx.sql_ctx_.session_info_));
       } else {
         ObSQLSessionInfo *session_info = pc_ctx.sql_ctx_.session_info_;
+        ObPCUserVarMeta tmp_meta;
         for (int64_t i = 0 ; OB_SUCC(ret) && is_same && i < related_user_var_names_.count(); i++) {
-          if (OB_FAIL(session_info->get_user_variable(related_user_var_names_.at(i), sess_var))) {
-            LOG_WARN("failed to get user variable", K(ret), K(related_user_var_names_.at(i)), K(i));
+          if (OB_FAIL(get_variable_meta(pc_ctx.sql_ctx_.session_info_,
+                related_user_var_names_.at(i), tmp_meta))) {
+            LOG_WARN("failed to get user variable meta", K(ret),
+              K(related_user_var_names_.at(i)), K(i));
           } else {
-            ObPCUserVarMeta tmp_meta(sess_var);
             is_same = (related_user_sess_var_metas_.at(i) == tmp_meta);
           }
         }
@@ -252,21 +259,31 @@ int ObPlanSet::match_param_info(const ObParamInfo &param_info,
     }
 
     if (param.get_collation_type() != param_info.col_type_
-        && !(param.is_user_defined_sql_type() || param.is_collection_sql_type())) {
+        && !(param.get_param_meta().is_ext() || param.is_user_defined_sql_type() || param.is_collection_sql_type())) {
       is_same = false;
     } else if (param.get_param_meta().get_type() != param_info.type_) {
       is_same = false;
+    } else if (ob_is_enumset_inner_tc(param.get_param_meta().get_type())) { // since enunset_inner type param will mock expr use current param, can not resue plan
+      is_same = false;
     } else if (param.is_user_defined_sql_type() || param.is_collection_sql_type()) {
-      uint64_t udt_id_param = param.get_accuracy().get_accuracy();
-      uint64_t udt_id_info = static_cast<uint64_t>(param_info.ext_real_type_) << 32
+      if (param_info.is_oracle_null_value_) {
+        is_same = false;
+      } else {
+        uint64_t udt_id_param = param.get_accuracy().get_accuracy();
+        uint64_t udt_id_info = static_cast<uint64_t>(param_info.ext_real_type_) << 32
                              | static_cast<uint32_t>(param_info.col_type_);
-      is_same = (udt_id_info == udt_id_param) ? true : false;
-    } else if (param.is_ext()) {
+        is_same = (udt_id_info == udt_id_param) ? true : false;
+      }
+    } else if (param.is_ext_sql_array()) {
       ObDataType data_type;
       if (!param_info.flag_.need_to_check_extend_type_) {
         // do nothing
       } else if (OB_FAIL(ObSQLUtils::get_ext_obj_data_type(param, data_type))) {
         LOG_WARN("fail to get obj data_type", K(ret), K(param));
+      } else if (data_type.get_obj_type() == ObDecimalIntType) {
+        is_same = param_info.ext_real_type_ == ObDecimalIntType
+                  && data_type.get_scale() == param_info.scale_
+                  && match_decint_precision(param_info, data_type.get_precision());
       } else if (data_type.get_scale() == param_info.scale_ &&
                  data_type.get_obj_type() == param_info.ext_real_type_) {
         is_same = true;
@@ -275,10 +292,20 @@ int ObPlanSet::match_param_info(const ObParamInfo &param_info,
         LOG_TRACE("ext match param info", K(data_type), K(param_info), K(is_same), K(ret));
       }
       LOG_DEBUG("ext match param info", K(data_type), K(param_info), K(is_same), K(ret));
-    } else if (param_info.is_oracle_empty_string_ && !param.is_null()) { //普通字符串不匹配空串的计划
+    } else if (param.get_param_meta().is_ext()) {
+      if (!param_info.flag_.need_to_check_extend_type_) {
+        // do nothing
+      } else {
+        uint64_t udt_id_param = param.get_accuracy().get_accuracy();
+        uint64_t udt_id_info = static_cast<uint64_t>(param_info.ext_real_type_) << 32
+                             | static_cast<uint32_t>(param_info.col_type_);
+        is_same = (udt_id_info == udt_id_param) ? true : false;
+      }
+      LOG_DEBUG("ext match param info", K(param.get_accuracy()), K(param_info), K(is_same), K(ret));
+    } else if (param_info.is_oracle_null_value_ && !param.is_null()) {
       is_same = false;
-    } else if (ObSQLUtils::is_oracle_empty_string(param)
-               &&!param_info.is_oracle_empty_string_) { //空串不匹配普通字符串的计划
+    } else if (ObSQLUtils::is_oracle_null_with_normal_type(param)
+               &&!param_info.is_oracle_null_value_) { //Typed nulls can only match plans with the same type of nulls.
       is_same = false;
     } else if (param_info.flag_.is_boolean_ != param.is_boolean()) { //bool type not match int type
       is_same = false;
@@ -494,7 +521,6 @@ int ObPlanSet::match_params_info(const Ob2DArray<ObParamInfo,
   int ret = OB_SUCCESS;
   is_same = true;
   ObSQLSessionInfo *session_info = pc_ctx.sql_ctx_.session_info_;
-  ObSessionVariable sess_var;
   if (OB_ISNULL(session_info)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null session_info", K(ret));
@@ -530,18 +556,22 @@ int ObPlanSet::match_params_info(const Ob2DArray<ObParamInfo,
         is_same = false;
       } else {
         int64_t CNT = related_user_var_names_.count();
+        ObPCUserVarMeta tmp_meta;
         for (int64_t i = 0; OB_SUCC(ret) && is_same && i < CNT; i++) {
           if (related_user_var_names_.at(i) != pc_ctx.sql_ctx_.related_user_var_names_.at(i)) {
             is_same = false;
-          } else if (OB_FAIL(session_info->get_user_variable(related_user_var_names_.at(i),
-                                                             sess_var))) {
-            LOG_WARN("failed to get user variable", K(ret), K(sess_var));
+          } else if (OB_FAIL(get_variable_meta(pc_ctx.sql_ctx_.session_info_,
+                      related_user_var_names_.at(i), tmp_meta))) {
+            LOG_WARN("failed to get user variable meta", K(ret),
+              K(related_user_var_names_.at(i)), K(i));
           } else {
-            ObPCUserVarMeta tmp_meta(sess_var);
-            is_same = (tmp_meta == related_user_sess_var_metas_.at(i));
+            is_same = (related_user_sess_var_metas_.at(i) == tmp_meta);
           }
         }
       }
+    }
+    if (OB_SUCC(ret) && OB_NOT_NULL(pc_ctx.sql_ctx_.session_info_) && is_same) {
+      is_same = (is_cli_return_rowid_ == pc_ctx.sql_ctx_.session_info_->is_client_return_rowid());
     }
     if (OB_SUCC(ret) && is_same) {
       if (OB_FAIL(ObPlanCacheObject::match_pre_calc_cons(all_pre_calc_constraints_, pc_ctx,
@@ -687,8 +717,7 @@ int ObPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
     params_info_.reset();
     // set variables for resource map rule
     // if rule changed, plan cache will be flush.
-    res_map_rule_id_ = pc_ctx.sql_ctx_.res_map_rule_id_;
-    res_map_rule_param_idx_ = pc_ctx.sql_ctx_.res_map_rule_param_idx_;
+    resource_map_rule_.deep_copy(pc_ctx.sql_ctx_.resource_map_rule_, alloc_);
 
     if (OB_FAIL(init_pre_calc_exprs(plan, pc_alloc_))) {
       LOG_WARN("failed to init pre calc exprs", K(ret));
@@ -726,13 +755,14 @@ int ObPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
         }
       }
 
-      for (int64_t i = 0; OB_SUCC(ret) && i < related_user_var_names_.count(); i++) {
-        OZ( sql_ctx.session_info_->get_user_variable(related_user_var_names_.at(i),
-                                                     sess_var),
-            ret,
-            related_user_var_names_.at(i),
-            i );
-        OC( (related_user_sess_var_metas_.push_back)(ObPCUserVarMeta(sess_var)) );
+      ObPCUserVarMeta tmp_meta;
+      for (int64_t i = 0 ; OB_SUCC(ret) && i < related_user_var_names_.count(); i++) {
+        if (OB_FAIL(get_variable_meta(pc_ctx.sql_ctx_.session_info_,
+              related_user_var_names_.at(i), tmp_meta))) {
+          LOG_WARN("failed to get user variable meta", K(ret),
+            K(related_user_var_names_.at(i)), K(i));
+        }
+        OC( (related_user_sess_var_metas_.push_back)(tmp_meta) );
       }
 
       if (OB_FAIL(ret)) {
@@ -1250,15 +1280,13 @@ int ObSqlPlanSet::add_plan(ObPhysicalPlan &plan,
             array_binding_plan_ = &plan;
           }
         } else {
+          is_single_table_ = (1 == sql_ctx.partition_infos_.count());
           if (OB_FAIL(add_physical_plan(OB_PHY_PLAN_LOCAL, pc_ctx, plan))) {
             SQL_PC_LOG(TRACE, "fail to add local plan", K(ret));
-          } else if (OB_SUCC(ret)
-#ifdef OB_BUILD_SPM
-                    && is_spm_closed_
-#endif
-                    && FALSE_IT(direct_local_plan_ = &plan)) {
+//           } else if (OB_SUCC(ret)
+//                     && FALSE_IT(direct_local_plan_ = &plan)) {
             // do nothing
-          } else {
+          // } else {
            // local_phy_locations_.reset();
            // if (OB_FAIL(init_phy_location(table_locs.count()))) {
            //   SQL_PC_LOG(WARN, "init phy location failed");
@@ -1278,6 +1306,7 @@ int ObSqlPlanSet::add_plan(ObPhysicalPlan &plan,
         }
       } break;
       case OB_PHY_PLAN_DISTRIBUTED: {
+        is_single_table_ = (1 == sql_ctx.partition_infos_.count());
         SQL_PC_LOG(TRACE, "plan set add plan, distr plan",  K(ret));
         if (OB_FAIL(add_physical_plan(OB_PHY_PLAN_DISTRIBUTED, pc_ctx, plan))) {
           LOG_WARN("failed to add dist plan", K(ret), K(plan));
@@ -1340,19 +1369,10 @@ int ObSqlPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
   outline_param_idx_ = outline_param_idx;
   need_try_plan_ = 0;
   has_duplicate_table_ = false;
-#ifdef OB_BUILD_SPM
-  bool is_spm_on = false;
-#endif
   const ObSQLSessionInfo *session_info = sql_ctx.session_info_;
   if (OB_ISNULL(session_info)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid null plan cache or session info", K(ret), K(session_info));
-#ifdef OB_BUILD_SPM
-  } else if (OB_FAIL(session_info->get_use_plan_baseline(is_spm_on))) {
-    LOG_WARN("failed to get spm configs", K(ret));
-  } else if (FALSE_IT(is_spm_closed_ = (!is_spm_on))) {
-    // do nothing
-#endif
   } else if (OB_ISNULL(pc_malloc_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("pc_allocator has not been initialized.", K(ret));
@@ -1383,6 +1403,13 @@ int ObSqlPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
           && is_virtual_table(schema_obj.object_id_)) {
         is_contain_virtual_table_ = true;
         LOG_DEBUG("contain virtual table", K(is_contain_virtual_table_), K(schema_obj));
+      }
+    } // for end
+    for (int64_t i = 0; !is_contain_inner_table_ && i < plan.get_dependency_table().count(); i++) {
+      const ObSchemaObjVersion &schema_obj = plan.get_dependency_table().at(i);
+      if (is_inner_table(schema_obj.object_id_)) {
+        is_contain_inner_table_ = true;
+        LOG_DEBUG("contain virtual table", K(is_contain_inner_table_), K(schema_obj));
       }
     } // for end
   }
@@ -1598,25 +1625,21 @@ int ObSqlPlanSet::add_physical_plan(const ObPhyPlanType plan_type,
     LOG_WARN("invalid plan type", K(ret), K(plan_type));
 #ifndef OB_BUILD_SPM
   } else if (OB_PHY_PLAN_LOCAL == plan_type) {
-    if (NULL != local_plan_) {
-      ret = OB_SQL_PC_PLAN_DUPLICATE;
-    } else {
-      local_plan_ = &plan;
+    if (OB_FAIL(add_local_plan(pc_ctx, plan))) {
+      LOG_DEBUG("failed to add local plan", K(ret));
     }
   } else if (OB_FAIL(dist_plans_.add_plan(plan, pc_ctx))) {
     LOG_WARN("failed to add dist plan", K(ret), K(plan));
   }
 #else
-  } else if (!pc_ctx.need_evolution_ || is_spm_closed_) {
+  } else if (!pc_ctx.need_evolution_) {
     // Addition of other non-evolving plans is prohibited in plan evolution
     if (OB_PHY_PLAN_LOCAL == plan_type) {
       if (local_evolution_plan_.get_is_evolving_flag()) {
         ret = OB_SQL_PC_PLAN_DUPLICATE;
         LOG_WARN("addition of other non-evolving plans is prohibited in local plan evolution");
-      } else if (NULL != local_plan_) {
-        ret = OB_SQL_PC_PLAN_DUPLICATE;
-      } else {
-        local_plan_ = &plan;
+      } else if (OB_FAIL(add_local_plan(pc_ctx, plan))) {
+        LOG_DEBUG("failed to add local plan", K(ret));
       }
     } else {
       if (OB_FAIL(dist_plans_.add_plan(plan, pc_ctx))) {
@@ -1628,20 +1651,32 @@ int ObSqlPlanSet::add_physical_plan(const ObPhyPlanType plan_type,
     ObSpmCacheCtx& spm_ctx = pc_ctx.sql_ctx_.spm_ctx_;
     if (ObSpmCacheCtx::STAT_ADD_BASELINE_PLAN == spm_ctx.spm_stat_) {
       if (OB_PHY_PLAN_LOCAL == spm_ctx.evolution_plan_type_) {
-        OZ (local_evolution_plan_.add_plan(pc_ctx, &plan));
+        // if local plan start evolving, clear local_plan_ which is added between adding
+        // evolving plan and baseline plan.
+        if (OB_FAIL(local_evolution_plan_.add_plan(pc_ctx, &plan))) {
+          LOG_WARN("failed to add local baseline plan");
+        } else if (local_evolution_plan_.get_is_evolving_flag()) {
+          remove_all_local_plan();
+        }
       } else {
-        OZ (dist_evolution_plan_.add_plan(pc_ctx, &plan));
+        if (OB_FAIL(dist_evolution_plan_.add_plan(pc_ctx, &plan))) {
+          LOG_WARN("failed to add dist baseline plan");
+        } else if (dist_evolution_plan_.get_is_evolving_flag() &&
+                   OB_FAIL(dist_plans_.remove_plan_stat())) {
+          LOG_WARN("failed to remove dist plans");
+        }
       }
     } else {
       if (OB_PHY_PLAN_LOCAL == plan_type) {
-        if (NULL != local_plan_) {
-          remove_cache_obj_entry(local_plan_->get_plan_id());
-          local_plan_ = NULL;
+        if (is_exist_local_plan()) {
+          // if a baseline local plan already exists, no need to evolve
+          ret = OB_SQL_PC_PLAN_DUPLICATE;
+        } else if (OB_FAIL(local_evolution_plan_.add_plan(pc_ctx, &plan))) {
+          LOG_WARN("failed to add local evolving plan");
+        } else {
+          spm_ctx.evolution_plan_type_ = OB_PHY_PLAN_LOCAL;
         }
-        OZ (local_evolution_plan_.add_plan(pc_ctx, &plan));
-        OX (spm_ctx.evolution_plan_type_ = OB_PHY_PLAN_LOCAL);
       } else {
-        OZ (dist_plans_.remove_plan_stat());
         OZ (dist_evolution_plan_.add_plan(pc_ctx, &plan));
         OX (spm_ctx.evolution_plan_type_ = OB_PHY_PLAN_DISTRIBUTED);
       }
@@ -1663,7 +1698,7 @@ int ObSqlPlanSet::get_physical_plan(const ObPhyPlanType plan_type,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid plan type", K(ret), K(plan_type));
   } else if (OB_PHY_PLAN_LOCAL == plan_type) {
-    plan = local_plan_;
+    plan = get_local_plan(pc_ctx);
   } else if (OB_FAIL(dist_plans_.get_plan(pc_ctx, plan))) {
     LOG_DEBUG("failed to get dist plan", K(ret));
   }
@@ -1675,7 +1710,7 @@ int ObSqlPlanSet::get_physical_plan(const ObPhyPlanType plan_type,
     if (OB_FAIL(try_get_local_evolution_plan(pc_ctx, plan, get_next))) {
       LOG_WARN("failed to try get local evolution plan", K(ret));
     } else if (get_next) {
-      plan = local_plan_;
+      plan = get_local_plan(pc_ctx);
     }
     if (OB_SUCC(ret) && NULL == plan) {
       ret = OB_SQL_PC_NOT_EXIST;
@@ -1712,11 +1747,8 @@ int ObSqlPlanSet::add_evolution_plan_for_spm(ObPhysicalPlan *plan, ObPlanCacheCt
     LOG_WARN("not supported type", K(ret), K(plan->get_plan_type()));
   } else if (FALSE_IT(pc = plan_cache_value_->get_pcv_set()->get_plan_cache())) {
   } else if (OB_PHY_PLAN_LOCAL == plan->get_plan_type()) {
-    if (NULL != local_plan_) {
-      ret = OB_SQL_PC_PLAN_DUPLICATE;
-      LOG_WARN("local plan duplicate", K(ret));
-    } else {
-      local_plan_ = plan;
+    if (OB_FAIL(add_local_plan(ctx, *plan))) {
+      LOG_TRACE("failed to add local plan", K(ret));
     }
   } else if (OB_FAIL(dist_plans_.add_evolution_plan(*plan, ctx))) {
     LOG_WARN("failed to add dist plan", K(ret), K(plan));
@@ -1831,8 +1863,8 @@ int ObSqlPlanSet::try_get_local_evolution_plan(ObPlanCacheCtx &pc_ctx,
   int ret = OB_SUCCESS;
   plan = NULL;
   get_next = false;
-  if ((!is_spm_closed_ && local_evolution_plan_.get_is_evolving_flag())
-    || pc_ctx.sql_ctx_.spm_ctx_.force_get_evolution_plan()) {
+  if ((local_evolution_plan_.get_is_evolving_flag())
+      || pc_ctx.sql_ctx_.spm_ctx_.force_get_evolution_plan()) {
     if (OB_FAIL(local_evolution_plan_.get_plan(pc_ctx, plan))) {
       if (OB_SQL_PC_NOT_EXIST == ret) {
         ret = OB_SUCCESS;
@@ -1853,7 +1885,7 @@ int ObSqlPlanSet::try_get_dist_evolution_plan(ObPlanCacheCtx &pc_ctx,
   int ret = OB_SUCCESS;
   plan = NULL;
   get_next = false;
-  if ((!is_spm_closed_ && dist_evolution_plan_.get_is_evolving_flag())
+  if ((dist_evolution_plan_.get_is_evolving_flag())
     || pc_ctx.sql_ctx_.spm_ctx_.force_get_evolution_plan()) {
     if (OB_FAIL(dist_evolution_plan_.get_plan(pc_ctx, plan))) {
       if (OB_SQL_PC_NOT_EXIST == ret) {
@@ -1875,7 +1907,9 @@ int ObSqlPlanSet::try_get_evolution_plan(ObPlanCacheCtx &pc_ctx,
   int ret = OB_SUCCESS;
   plan = NULL;
   get_next = false;
-  if (OB_FAIL(try_get_local_evolution_plan(pc_ctx, plan, get_next))) {
+  if (pc_ctx.try_get_plan_) {
+    get_next = true;
+  } else if (OB_FAIL(try_get_local_evolution_plan(pc_ctx, plan, get_next))) {
     LOG_WARN("failed to try get local evolution plan", K(ret));
   } else if (get_next && OB_FAIL(try_get_dist_evolution_plan(pc_ctx, plan, get_next))) {
     LOG_WARN("failed to try get dist evolution plan", K(ret));
@@ -1891,22 +1925,43 @@ int ObSqlPlanSet::try_get_local_plan(ObPlanCacheCtx &pc_ctx,
   int ret = OB_SUCCESS;
   plan = NULL;
   get_next = false;
+  ObExecContext &exec_ctx = pc_ctx.exec_ctx_;
   ObPhyPlanType real_type = OB_PHY_PLAN_UNINITIALIZED;
   ObSEArray<ObCandiTableLoc, 2> candi_table_locs;
-  if (OB_ISNULL(local_plan_)) {
+  ObPhysicalPlan *local_plan = get_local_plan(pc_ctx);
+  if (OB_ISNULL(local_plan)) {
     LOG_DEBUG("local plan is null");
     get_next = true;
-  } else if (FALSE_IT(plan = local_plan_)) {
-  } else if (OB_FAIL(get_plan_type(plan->get_table_locations(),
-                                    plan->has_uncertain_local_operator(),
-                                    pc_ctx,
-                                    candi_table_locs,
-                                    real_type))) {
-    LOG_WARN("fail to get plan type", K(ret));
-  } else if (OB_PHY_PLAN_LOCAL != real_type) {
-    LOG_DEBUG("not local plan", K(real_type));
-    plan = NULL;
-    get_next = true;
+  } else {
+    pc_ctx.exist_local_plan_ = true;
+    if (FALSE_IT(plan = local_plan)) {
+    } else if (OB_FAIL(get_plan_type(plan->get_table_locations(),
+                                     plan->has_uncertain_local_operator(), pc_ctx, candi_table_locs,
+                                     real_type))) {
+      LOG_WARN("fail to get plan type", K(ret));
+    } else if (OB_PHY_PLAN_LOCAL != real_type) {
+      LOG_DEBUG("not local plan", K(real_type));
+      plan = NULL;
+      get_next = true;
+    } else if (GCONF._enable_adaptive_auto_dop && plan->get_is_use_auto_dop() && is_single_table_
+               && !is_contain_inner_table_ && !plan->stat_.is_inner_) {
+      int64_t dop = -1;
+      bool is_single_part = false;
+      ObAdaptiveAutoDop adaptive_auto_dop(exec_ctx);
+      AutoDopHashMap &auto_dop_map = exec_ctx.get_auto_dop_map();
+      if (OB_FAIL(adaptive_auto_dop.calculate_table_auto_dop(*plan, auto_dop_map, is_single_part))) {
+        LOG_WARN("failed to calculate table auto dop", K(ret));
+      } else if (OB_FAIL(auto_dop_map.get_refactored(0, dop))) {
+        LOG_WARN("failed to get refactored", K(ret));
+      } else if (dop > 1) {
+        plan = NULL;
+        get_next = true;
+      }
+      if (OB_FAIL(ret)) {
+        auto_dop_map.clear();
+      }
+      LOG_TRACE("adaptive px dop", K(ret), K(is_single_part), K(dop));
+    }
   }
   if (OB_SUCC(ret) && NULL == plan) {
     get_next = true;
@@ -1951,10 +2006,30 @@ int ObSqlPlanSet::try_get_dist_plan(ObPlanCacheCtx &pc_ctx,
 {
   int ret = OB_SUCCESS;
   plan = NULL;
+  ObExecContext &exec_ctx = pc_ctx.exec_ctx_;
   if (OB_FAIL(dist_plans_.get_plan(pc_ctx, plan))) {
     LOG_TRACE("failed to get dist plan", K(ret));
   } else if (plan != NULL) {
     LOG_TRACE("succeed to get dist plan", K(*plan));
+    if (GCONF._enable_adaptive_auto_dop && plan->get_is_use_auto_dop() && is_single_table_
+        && !is_contain_inner_table_ && !plan->stat_.is_inner_) {
+      int64_t dop = -1;
+      bool is_single_part = false;
+      ObAdaptiveAutoDop adaptive_auto_dop(exec_ctx);
+      AutoDopHashMap &auto_dop_map = exec_ctx.get_auto_dop_map();
+      if (OB_FAIL(adaptive_auto_dop.calculate_table_auto_dop(*plan, auto_dop_map, is_single_part))) {
+        LOG_WARN("failed to calculate table auto dop", K(ret));
+      } else if (OB_FAIL(auto_dop_map.get_refactored(0, dop))) {
+        LOG_WARN("failed to get refactored", K(ret));
+      } else if (is_single_part && !pc_ctx.exist_local_plan_ && dop <= 1) {
+        plan = NULL;
+        exec_ctx.set_force_gen_local_plan();
+      }
+      if (OB_FAIL(ret)) {
+        auto_dop_map.clear();
+      }
+      LOG_TRACE("adaptive px dop", K(ret), K(dop), K(is_single_part), K(pc_ctx.exist_local_plan_));
+    }
   }
   if (OB_SQL_PC_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
@@ -2008,9 +2083,7 @@ int64_t ObSqlPlanSet::get_mem_size()
   plan_set_mem += local_evolution_plan_.get_mem_size();
   plan_set_mem += dist_evolution_plan_.get_mem_size();
 #endif
-  if (NULL != local_plan_) {
-    plan_set_mem += local_plan_->get_mem_size();
-  }
+  plan_set_mem += get_local_plan_mem_size();
   if (NULL != remote_plan_) {
     plan_set_mem += remote_plan_->get_mem_size();
   }
@@ -2025,6 +2098,7 @@ void ObSqlPlanSet::reset()
   has_duplicate_table_ = false;
   //has_array_binding_ = false;
   is_contain_virtual_table_ = false;
+  is_contain_inner_table_ = false;
   enable_inner_part_parallel_exec_ = false;
   table_locations_.reset();
   if (OB_ISNULL(plan_cache_value_)
@@ -2036,9 +2110,10 @@ void ObSqlPlanSet::reset()
   local_evolution_plan_.reset();
   dist_evolution_plan_.reset();
 #endif
-  local_plan_ = NULL;
   array_binding_plan_ = NULL;
   remote_plan_ = NULL;
+  direct_local_plan_ = NULL;
+  local_plans_.reset();
   dist_plans_.reset();
   //local_phy_locations_.reset();
   //partition_key_.reset();
@@ -2052,16 +2127,16 @@ int ObSqlPlanSet::get_phy_locations(const ObIArray<ObTableLocation> &table_locat
                                     ObIArray<ObCandiTableLoc> &candi_table_locs)
 {
   int ret = OB_SUCCESS;
-  DAS_CTX(pc_ctx.exec_ctx_).clear_all_location_info();
-  if (OB_FAIL(ObPhyLocationGetter::get_phy_locations(table_locations,
-                                                     pc_ctx,
-                                                     candi_table_locs))) {
+  if (!pc_ctx.try_get_plan_) {
+    DAS_CTX(pc_ctx.exec_ctx_).clear_all_location_info();
+  }
+  if (OB_FAIL(ObPhyLocationGetter::get_phy_locations(table_locations, pc_ctx, candi_table_locs))) {
     LOG_WARN("failed to get phy locations", K(ret), K(table_locations));
   } else if (candi_table_locs.empty()) {
     // do nothing.
-  } else if (OB_FAIL(ObPhyLocationGetter::build_candi_table_locs(pc_ctx.exec_ctx_.get_das_ctx(),
-                                                                 table_locations,
-                                                                 candi_table_locs))) {
+  } else if (!pc_ctx.try_get_plan_
+             && OB_FAIL(ObPhyLocationGetter::build_candi_table_locs(
+                  pc_ctx.exec_ctx_.get_das_ctx(), table_locations, candi_table_locs))) {
     LOG_WARN("fail to init table locs", K(ret));
   }
   return ret;
@@ -2363,6 +2438,90 @@ int ObSqlPlanSet::get_plan_type(const ObIArray<ObTableLocation> &table_locations
   return ret;
 }
 
+ObPhysicalPlan *ObSqlPlanSet::get_local_plan(ObPlanCacheCtx &pc_ctx)
+{
+  int ret = OB_SUCCESS;
+  ObPhysicalPlan *plan = nullptr;
+  if (local_plans_.count() < 1) {
+  } else if (pc_ctx.try_get_plan_) {
+    for (int64_t i = 0; i < local_plans_.count(); ++i) {
+      if (pc_ctx.compare_plan_->get_plan_hash_value()
+          == local_plans_.at(i)->get_plan_hash_value()) {
+        plan = local_plans_.at(i);
+        break;
+      }
+    }
+  } else {
+    if (!pc_ctx.enable_adaptive_plan_cache_) {
+      plan = direct_local_plan_;
+    } else {
+      for (int64_t i = 0; i < local_plans_.count(); ++i) {
+        if (local_plans_.at(i)->is_active_status()) {
+          plan = local_plans_.at(i);
+          pc_ctx.has_inactive_plan_ = false;
+          break;
+        } else {
+          pc_ctx.has_inactive_plan_ = true;
+        }
+      }
+    }
+  }
+  return plan;
+}
+
+bool ObSqlPlanSet::is_exist_local_plan()
+{
+  return local_plans_.count() != 0;
+}
+
+int ObSqlPlanSet::add_local_plan(ObPlanCacheCtx &pc_ctx, ObPhysicalPlan &plan)
+{
+  int ret = OB_SUCCESS;
+  if (!pc_ctx.add_with_compare_ && local_plans_.count() != 0) {
+    ret = OB_SQL_PC_PLAN_DUPLICATE;
+  } else {
+    bool exist = false;
+    if (local_plans_.empty()) {
+      direct_local_plan_ = &plan;
+    }
+    if (pc_ctx.add_with_compare_) {
+      for (int64_t i = 0; !exist && i < local_plans_.count(); ++i) {
+        if (plan.get_plan_hash_value() == local_plans_.at(i)->get_plan_hash_value()) {
+          exist = true;
+          ret = OB_SQL_PC_PLAN_DUPLICATE;
+          break;
+        }
+      }
+    }
+    if (!exist && OB_FAIL(local_plans_.push_back(&plan))) {
+      LOG_WARN("failed to add local plan", K(ret));
+    }
+  }
+  return ret;
+}
+
+void ObSqlPlanSet::remove_all_local_plan()
+{
+  for (int64_t i = 0; i < local_plans_.count(); ++i) {
+    if (nullptr != local_plans_.at(i)) {
+      remove_cache_obj_entry(local_plans_.at(i)->get_plan_id());
+    }
+  }
+  direct_local_plan_ = nullptr;
+  local_plans_.reuse();
+}
+
+int64_t ObSqlPlanSet::get_local_plan_mem_size()
+{
+  int64_t mem_size = 0;
+  for (int64_t i = 0; i < local_plans_.count(); ++i) {
+    if (nullptr != local_plans_.at(i)) {
+      mem_size += local_plans_.at(i)->get_mem_size();
+    }
+  }
+  return mem_size;
+}
+
 bool ObSqlPlanSet::is_local_plan_opt_allowed(const int last_retry_err)
 {
   bool ret_bool = false;
@@ -2407,8 +2566,11 @@ int ObSqlPlanSet::get_evolving_evolution_task(EvolutionPlanList &evo_task_list)
 bool ObPlanSet::match_decint_precision(const ObParamInfo &param_info, ObPrecision other_prec) const
 {
   bool ret = false;
-  if (ob_is_decimal_int(param_info.type_)) {
+  if (ob_is_decimal_int(param_info.type_) || ob_is_integer_type(param_info.type_)) {
     ret = (param_info.precision_ == other_prec);
+  } else if (ob_is_extend(param_info.type_) && ob_is_decimal_int(param_info.ext_real_type_)) {
+    ret = wide::ObDecimalIntConstValue::get_int_bytes_by_precision(param_info.precision_)
+          == wide::ObDecimalIntConstValue::get_int_bytes_by_precision(other_prec);
   } else {
     // not decimal_int, return true
     ret = true;

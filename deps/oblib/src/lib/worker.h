@@ -27,6 +27,8 @@ namespace lib
 {
 using common::ObIAllocator;
 
+enum class LogReductionMode {NONE = 0, REFINED, COMPRESSED};
+
 class Worker
 {
 public:
@@ -80,10 +82,18 @@ public:
 
   OB_INLINE void set_curr_request_level(const int32_t level) { curr_request_level_ = level; }
   OB_INLINE int32_t get_curr_request_level() const { return curr_request_level_; }
+  OB_INLINE bool is_th_worker() const { return is_th_worker_; }
+  OB_INLINE void set_group_id_(const uint64_t group_id) { group_id_ = group_id;}
 
-  void set_group_id(int32_t group_id);
-  OB_INLINE int32_t get_group_id() const { return group_id_; }
+  OB_INLINE uint64_t get_group_id() const { return group_id_; }
+  OB_INLINE void set_group(void *group) { group_ = group; };
+  OB_INLINE void *get_group() { return group_;};
+  OB_INLINE bool is_group_worker() const { return OB_NOT_NULL(group_); }
 
+  //OB_INLINE void set_group_id(int32_t group_id) { group_id_ = group_id; }
+
+  OB_INLINE void set_func_type_(uint8_t func_type) { func_type_ = func_type; }
+  OB_INLINE uint8_t get_func_type() const { return func_type_; }
   OB_INLINE void set_rpc_stat_srv(void *rpc_stat_srv) { rpc_stat_srv_ = rpc_stat_srv; }
   OB_INLINE void *get_rpc_stat_srv() const { return rpc_stat_srv_; }
 
@@ -114,6 +124,8 @@ public:
 public:
   static void set_compatibility_mode(CompatMode mode);
   static CompatMode get_compatibility_mode();
+  static LogReductionMode get_log_reduction_mode();
+  static void set_log_reduction_mode(const LogReductionMode log_reduction_mode);
   static Worker& self();
   static void set_worker_to_thread_local(Worker *worker);
 
@@ -121,12 +133,14 @@ public:
   static void set_module_type(const ObErrsimModuleType &module_type);
   static ObErrsimModuleType get_module_type();
 #endif
-
+protected:
+  OB_INLINE void set_is_th_worker(bool is_th_worker) { is_th_worker_ = is_th_worker; }
 public:
   static __thread Worker *self_;
 
 public:
   common::ObDLinkNode<Worker*> worker_node_;
+  void *group_;
 protected:
   // 线程运行时内存从此分配器分配
   // 初始tenant_id=500, 在处理request时，tenant_id被更新成request的租户id
@@ -139,7 +153,9 @@ private:
   // whether worker is in blocking
   int32_t worker_level_;
   int32_t curr_request_level_;
-  int32_t group_id_;
+  bool is_th_worker_;
+  uint64_t group_id_;
+  uint8_t func_type_;
   void *rpc_stat_srv_;
 
   int64_t timeout_ts_;
@@ -186,6 +202,83 @@ inline Worker &this_worker()
 
 #define THIS_WORKER oceanbase::lib::Worker::self()
 
+#define GET_FUNC_TYPE() (THIS_WORKER.get_func_type())
+#define GET_GROUP_ID() (THIS_WORKER.get_group_id())
+
+int SET_GROUP_ID(uint64_t group_id, bool is_background = false);
+
+int CONVERT_FUNCTION_TYPE_TO_GROUP_ID(const uint8_t function_type, uint64_t &group_id);
+
+class ConsumerGroupIdGuard
+{
+public:
+  ConsumerGroupIdGuard(uint64_t group_id)
+    : thread_group_id_(GET_GROUP_ID()), group_changed_(false), ret_(OB_SUCCESS)
+  {
+    group_changed_ = group_id != thread_group_id_;
+    if (is_resource_manager_group(thread_group_id_)) {
+      // has set group id. do nothing.
+    } else if (group_changed_) {
+      ret_ = SET_GROUP_ID(group_id);
+    }
+  }
+  ~ConsumerGroupIdGuard()
+  {
+    if (group_changed_) {
+      SET_GROUP_ID(thread_group_id_);
+    }
+  }
+  int get_ret()
+  {
+    return ret_;
+  }
+
+private:
+  uint64_t thread_group_id_;
+  bool group_changed_;
+  int ret_;
+};
+#define CONSUMER_GROUP_ID_GUARD(group_id) oceanbase::lib::ConsumerGroupIdGuard consumer_group_id_guard_(group_id)
+
+class ConsumerGroupFuncGuard
+{
+public:
+  ConsumerGroupFuncGuard(uint8_t func_type)
+    : thread_group_id_(GET_GROUP_ID()), thread_func_type_(GET_FUNC_TYPE()), group_changed_(false), ret_(OB_SUCCESS)
+  {
+    THIS_WORKER.set_func_type_(func_type);
+    if (is_resource_manager_group(thread_group_id_)) {
+      // has set group id. do nothing.
+    } else {
+      uint64_t group_id = 0;
+      ret_ = CONVERT_FUNCTION_TYPE_TO_GROUP_ID(func_type, group_id);
+      // if (OB_SUCCESS == ret_ && group_id != thread_group_id_) {
+      /* need to move to background even if group_id not changed */
+        group_changed_ = true;
+        ret_ = SET_GROUP_ID(group_id, true /* is_background */);
+      // }
+    }
+  }
+  ~ConsumerGroupFuncGuard()
+  {
+    THIS_WORKER.set_func_type_(thread_func_type_);
+    if (group_changed_) {
+      SET_GROUP_ID(thread_group_id_);
+    }
+  }
+  int get_ret()
+  {
+    return ret_;
+  }
+
+private:
+  uint64_t thread_group_id_;
+  uint8_t thread_func_type_;
+  bool group_changed_;
+  int ret_;
+};
+#define CONSUMER_GROUP_FUNC_GUARD(func_type) oceanbase::lib::ConsumerGroupFuncGuard consumer_group_func_guard_(func_type)
+
 class DisableSchedInterGuard
 {
 public:
@@ -220,6 +313,7 @@ private:
   Worker::CompatMode last_compat_mode_;
 };
 
+
 #ifdef ERRSIM
 //set current errsim module in code snippet and set last errsim module when guard destructor
 class ErrsimModuleGuard final
@@ -243,18 +337,44 @@ private:
 };
 #endif
 
-// used to check compatibility mode.
+struct ObExtraRpcHeader {
+  OB_UNIS_VERSION(1);
+public:
+  ObExtraRpcHeader()
+      : src_addr_()
+  {}
+  ObExtraRpcHeader(const ObAddr &addr)
+      : src_addr_(addr)
+  {}
+  int assign(const ObExtraRpcHeader &arg)
+  {
+    int ret = OB_SUCCESS;
+    src_addr_ = arg.src_addr_;
+    return ret;
+  }
+  void reset()
+  {
+    src_addr_.reset();
+  }
+  ObAddr src_addr_;
+  TO_STRING_KV(K(src_addr_));
+};
+
+// used to check compatibility mode and save extra rpc packet header.
 class ObRuntimeContext
 {
   OB_UNIS_VERSION(1);
 public:
   ObRuntimeContext()
-      : compat_mode_(Worker::CompatMode::MYSQL)
+      : compat_mode_(Worker::CompatMode::MYSQL),
+        log_reduction_mode_(LogReductionMode::NONE)
   {}
   Worker::CompatMode compat_mode_;
 #ifdef ERRSIM
   ObErrsimModuleType module_type_;
 #endif
+  LogReductionMode log_reduction_mode_;
+  ObExtraRpcHeader extra_rpc_header_;
 };
 
 inline ObRuntimeContext &get_ob_runtime_context()
@@ -290,6 +410,28 @@ OB_INLINE void Worker::set_compatibility_mode(Worker::CompatMode mode)
 OB_INLINE Worker::CompatMode Worker::get_compatibility_mode()
 {
   return get_compat_mode();
+}
+
+OB_INLINE bool is_log_reduction() { return get_ob_runtime_context().log_reduction_mode_ != LogReductionMode::NONE; }
+
+OB_INLINE LogReductionMode get_log_reduction() { return get_ob_runtime_context().log_reduction_mode_; }
+
+OB_INLINE void set_log_reduction(const LogReductionMode log_reduction_mode)
+{
+  get_ob_runtime_context().log_reduction_mode_ = log_reduction_mode;
+}
+
+OB_INLINE LogReductionMode Worker::get_log_reduction_mode() { return get_log_reduction(); }
+
+OB_INLINE void Worker::set_log_reduction_mode(const LogReductionMode log_reduction_mode)
+{
+  set_log_reduction(log_reduction_mode);
+}
+
+
+OB_INLINE ObAddr &get_rpc_src_addr()
+{
+  return get_ob_runtime_context().extra_rpc_header_.src_addr_;
 }
 
 #ifdef ERRSIM

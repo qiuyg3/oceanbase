@@ -34,7 +34,8 @@ enum QueryRelation
   QUERY_EQUAL,
   QUERY_UNCOMPARABLE
 };
- struct ObStmtMapInfo {
+
+struct ObStmtMapInfo {
   common::ObSEArray<common::ObSEArray<int64_t, 4>, 4> view_select_item_map_;
   common::ObSEArray<ObExprConstraint, 4> expr_cons_map_;
   common::ObSEArray<ObPCConstParamInfo, 4> const_param_map_;
@@ -113,6 +114,9 @@ struct StmtCompareHelper {
   ObSEArray<ObSelectStmt*, 8> similar_stmts_;
   QbNameList hint_force_stmt_set_;
   ObSelectStmt *stmt_;
+
+private:
+  DISABLE_COPY_ASSIGN(StmtCompareHelper);
 };
 
 // NOTE (link.zt) remember to de-construct the struct
@@ -125,7 +129,8 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     outer_(NULL),
     map_info_(),
     equal_param_info_(),
-    is_in_same_stmt_(true)
+    is_in_same_stmt_(true),
+    ora_numeric_cmp_for_grouping_items_(false)
   {
     init_override_params();
   }
@@ -136,7 +141,8 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     outer_(NULL),
     map_info_(),
     equal_param_info_(),
-    is_in_same_stmt_(true)
+    is_in_same_stmt_(true),
+    ora_numeric_cmp_for_grouping_items_(false)
   {
     init_override_params();
   }
@@ -150,7 +156,8 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     outer_(NULL),
     map_info_(),
     equal_param_info_(),
-    is_in_same_stmt_(is_in_same_stmt)
+    is_in_same_stmt_(is_in_same_stmt),
+    ora_numeric_cmp_for_grouping_items_(false)
   {
     init_override_params();
   }
@@ -166,7 +173,8 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     outer_(outer),
     map_info_(map_info),
     equal_param_info_(),
-    is_in_same_stmt_(is_in_same_stmt)
+    is_in_same_stmt_(is_in_same_stmt),
+    ora_numeric_cmp_for_grouping_items_(false)
   {
     init_override_params();
   }
@@ -185,10 +193,10 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
   void init(const ObIArray<ObHiddenColumnItem> *calculable_items);
 
   // for win_magic rewrite
-  void init(const ObDMLStmt *inner,
-            const ObDMLStmt *outer,
-            const ObStmtMapInfo &map_info,
-            const ObIArray<ObHiddenColumnItem> *calculable_items);
+  int init(const ObDMLStmt *inner,
+           const ObDMLStmt *outer,
+           const ObStmtMapInfo &map_info,
+           const ObIArray<ObHiddenColumnItem> *calculable_items);
   
   int get_table_map_idx(uint64_t l_table_id, uint64_t r_table_id);
 
@@ -216,6 +224,10 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
   common::ObSEArray<ObExprConstraint, 4> expr_cons_info_;
   common::ObSEArray<ObPCConstParamInfo, 4> const_param_info_;
   bool is_in_same_stmt_; // only if the two stmts are in the same parent stmt, can we compare table id and column id directly
+  bool ora_numeric_cmp_for_grouping_items_;
+
+private:
+  DISABLE_COPY_ASSIGN(ObStmtCompareContext);
 };
 
 class ObStmtComparer
@@ -331,11 +343,9 @@ public:
    * 如果两张表相同且没有partition hint，则相等
    * 如果两张表都是generated_table只比较引用的子查询是否相同
    */
-  static int compare_basic_table_item (const ObDMLStmt *first,
-                                      const TableItem *first_table,
-                                      const ObDMLStmt *second,
-                                      const TableItem *second_table,
-                                      QueryRelation &relation);
+  static int compare_basic_table_item (const TableItem *first_table,
+                                       const TableItem *second_table,
+                                       QueryRelation &relation);
 
   /**
    * @brief compare_joined_table_item
@@ -374,6 +384,19 @@ public:
                                        const TableItem *second_table,
                                        ObStmtMapInfo &map_info,
                                        QueryRelation &relation);
+  static int get_map_table(const ObStmtMapInfo& map_info,
+                           const ObSelectStmt *outer_stmt,
+                           const ObSelectStmt *inner_stmt,
+                           const uint64_t &outer_table_id,
+                           uint64_t &inner_table_id);
+  static int get_map_column(const ObStmtMapInfo& map_info,
+                            const ObSelectStmt *outer_stmt,
+                            const ObSelectStmt *inner_stmt,
+                            const uint64_t &outer_table_id,
+                            const uint64_t &outer_column_id,
+                            const bool in_same_stmt,
+                            uint64_t &inner_table_id,
+                            uint64_t &inner_column_id);
 
 };
 

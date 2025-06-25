@@ -12,8 +12,6 @@
 
 #define USING_LOG_PREFIX SQL_EXE
 #include "ob_expr_join_filter.h"
-#include "ob_expr_extract.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/px/p2p_datahub/ob_p2p_dh_mgr.h"
 
@@ -156,7 +154,7 @@ int ObExprJoinFilter::cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_exp
     }
     default: {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected raw expr type", K(ret));
+      LOG_WARN("unexpected runtime filter type", K(ret), K(raw_expr.get_runtime_filter_type()));
     }
   }
 
@@ -213,12 +211,16 @@ int ObExprJoinFilter::check_rf_ready(
         join_filter_ctx->is_ready_ = true;
         join_filter_ctx->ready_ts_ = ObTimeUtility::current_time();
         join_filter_ctx->slide_window_.start_to_work();
+        join_filter_ctx->is_active_ = rf_msg->is_active();
+        join_filter_ctx->by_pass_count_before_ready_ = join_filter_ctx->total_count_;
       }
     }
   } else if (join_filter_ctx->need_check_ready() && rf_msg->check_ready()) {
     join_filter_ctx->ready_ts_ = ObTimeUtility::current_time();
     join_filter_ctx->is_ready_ = true;
     join_filter_ctx->slide_window_.start_to_work();
+    join_filter_ctx->is_active_ = rf_msg->is_active();
+    join_filter_ctx->by_pass_count_before_ready_ = join_filter_ctx->total_count_;
   }
   return ret;
 }
@@ -249,6 +251,8 @@ int ObExprJoinFilter::prepare_storage_white_filter_data(const ObExpr &expr,
         dynamic_filter, eval_ctx, params, is_data_prepared))) {
       LOG_WARN("fail to prepare_storage_white_filter_data", K(ret));
     } else {
+      dynamic_filter.hash_func_ =
+          join_filter_ctx->hash_funcs_.at(dynamic_filter.get_col_idx()).hash_func_;
       dynamic_filter.cmp_func_ =
           join_filter_ctx->cmp_funcs_.at(dynamic_filter.get_col_idx()).cmp_func_;
     }

@@ -16,8 +16,7 @@
 #include "lib/literals/ob_literals.h"
 #include "share/cache/ob_kv_storecache.h"
 #include "storage/meta_mem/ob_meta_obj_struct.h"
-#include "storage/blockstore/ob_shared_block_reader_writer.h"
-#include "storage/tablet/ob_tablet_binding_mds_user_data.h"
+#include "storage/blockstore/ob_shared_object_reader_writer.h"
 
 namespace oceanbase
 {
@@ -70,9 +69,7 @@ public:
     SSTABLE         = 0,
     CO_SSTABLE      = 1,
     TABLE_STORE     = 2,
-    AUTO_INC_SEQ    = 3,
-    AUX_TABLET_INFO = 4,
-    MAX             = 5,
+    MAX             = 3,
   };
 public:
   ObStorageMetaValue();
@@ -83,8 +80,6 @@ public:
   int get_sstable(const blocksstable::ObSSTable *&sstable) const;
   int get_sstable(blocksstable::ObSSTable *&sstable) const;
   int get_table_store(const ObTabletTableStore *&store) const;
-  int get_autoinc_seq(const share::ObTabletAutoincSeq *&seq) const;
-  int get_aux_tablet_info(const ObTabletBindingMdsUserData *&aux_tablet_info) const;
   bool is_valid() const;
   void reset()
   {
@@ -112,18 +107,6 @@ public:
       const char *buf,
       const int64_t size,
       const ObTablet *tablet);
-  static int process_autoinc_seq(
-      ObStorageMetaValueHandle &handle,
-      const ObStorageMetaKey &key,
-      const char *buf,
-      const int64_t size,
-      const ObTablet *tablet);
-  static int process_aux_tablet_info(
-      ObStorageMetaValueHandle &handle,
-      const ObStorageMetaKey &key,
-      const char *buf,
-      const int64_t size,
-      const ObTablet *tablet);
   TO_STRING_KV(K_(type), KP_(obj));
 public:
   typedef int (*StorageMetaProcessor)(
@@ -143,12 +126,6 @@ public:
 private:
   template <typename T>
   static int bypass_process_storage_meta(
-      const MetaType type,
-      common::ObSafeArenaAllocator &allocator,
-      ObStorageMetaValueHandle &handle,
-      const char *buf,
-      const int64_t size);
-  static int bypass_process_storage_meta_for_aux_tablet_info(
       const MetaType type,
       common::ObSafeArenaAllocator &allocator,
       ObStorageMetaValueHandle &handle,
@@ -215,7 +192,7 @@ private:
 private:
   friend class ObStorageMetaCache;
   ObMetaDiskAddr phy_addr_;
-  ObSharedBlockReadHandle io_handle_;
+  ObSharedObjectReadHandle io_handle_;
   ObStorageMetaValueHandle cache_handle_;
 };
 
@@ -245,7 +222,7 @@ public:
       common::ObSafeArenaAllocator &allocator,
       common::ObIArray<ObStorageMetaHandle> &meta_handles);
 private:
-  class ObStorageMetaIOCallback : public ObSharedBlockIOCallback
+  class ObStorageMetaIOCallback : public ObSharedObjectIOCallback
   {
   public:
     ObStorageMetaIOCallback(
@@ -258,9 +235,10 @@ private:
     virtual ~ObStorageMetaIOCallback();
     virtual int do_process(const char *data_buffer, const int64_t size) override;
     virtual int64_t size() const override;
+    const char *get_cb_name() const override { return "StorageMetaIOCB"; }
     bool is_valid() const;
 
-    INHERIT_TO_STRING_KV("ObSharedBlockIOCallback", ObSharedBlockIOCallback,
+    INHERIT_TO_STRING_KV("ObSharedObjectIOCallback", ObSharedObjectIOCallback,
         K_(key), KP_(tablet), KP_(arena_allocator));
 
   private:

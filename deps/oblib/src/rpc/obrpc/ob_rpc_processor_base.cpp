@@ -11,19 +11,9 @@
  */
 
 #define USING_LOG_PREFIX RPC_FRAME
-#include "io/easy_io.h"
-#include "lib/ob_define.h"
-#include "lib/allocator/ob_malloc.h"
-#include "lib/profile/ob_trace_id.h"
-#include "lib/oblog/ob_warning_buffer.h"
-#include "lib/compress/ob_compressor_pool.h"
-#include "lib/statistic_event/ob_stat_event.h"
-#include "lib/stat/ob_diagnose_info.h"
-#include "lib/trace/ob_trace_event.h"
 #include "lib/trace/ob_trace.h"
 #include "common/data_buffer.h"
 #include "common/ob_tenant_data_version_mgr.h"
-#include "rpc/obrpc/ob_rpc_req_context.h"
 #include "rpc/obrpc/ob_rpc_stream_cond.h"
 #include "rpc/obrpc/ob_rpc_result_code.h"
 #include "rpc/obrpc/ob_rpc_stat.h"
@@ -31,6 +21,8 @@
 #include "rpc/obrpc/ob_rpc_processor_base.h"
 #include "rpc/obrpc/ob_rpc_net_handler.h"
 #include "rpc/obrpc/ob_poc_rpc_server.h"
+#include "lib/ash/ob_active_session_guard.h"
+#include "lib/stat/ob_diagnostic_info_guard.h"
 
 using namespace oceanbase::common;
 
@@ -52,6 +44,13 @@ int64_t __attribute__((weak)) get_stream_rpc_max_wait_timeout(int64_t tenant_id)
   UNUSED(tenant_id);
   return ObRpcProcessorBase::DEFAULT_WAIT_NEXT_PACKET_TIMEOUT;
 }
+
+bool __attribute__((weak)) stream_rpc_update_timeout()
+{
+  //do nothing
+  return false;
+}
+
 void ObRpcProcessorBase::reuse()
 {
   rpc_pkt_ = NULL;
@@ -65,6 +64,7 @@ ObRpcProcessorBase::~ObRpcProcessorBase()
     sc_->~ObRpcStreamCond();
     sc_ = NULL;
   }
+  get_ob_runtime_context().extra_rpc_header_.reset();
 }
 
 int ObRpcProcessorBase::run()
@@ -139,6 +139,16 @@ int ObRpcProcessorBase::check_cluster_id()
       LOG_WARN("packet dst_cluster_id not match", K(ret), "self.dst_cluster_id", ObRpcNetHandler::CLUSTER_ID,
               "pkt.dst_cluster_id", rpc_pkt_->get_dst_cluster_id(), "pkt", *rpc_pkt_);
     }
+  } else if (OB_UNLIKELY(!is_arb
+            && INVALID_CLUSTER_ID == rpc_pkt_->get_dst_cluster_id() // the rpc is not for standby fetchlog
+            && INVALID_CLUSTER_ID != rpc_pkt_->get_src_cluster_id() // the rpc is from observer
+            && ObRpcNetHandler::CLUSTER_ID != rpc_pkt_->get_src_cluster_id())) { // the rpc is from another cluster
+      ret = OB_PACKET_CLUSTER_ID_NOT_MATCH;
+      if (REACH_TIME_INTERVAL(500 * 1000)) {
+        LOG_WARN("packet dst_cluster_id not match", "self.dst_cluster_id", ObRpcNetHandler::CLUSTER_ID,
+                "pkt.dst_cluster_id", rpc_pkt_->get_dst_cluster_id(), "pkt.src_cluster_id", rpc_pkt_->get_src_cluster_id(), "pkt", *rpc_pkt_,
+                "peer", get_peer());
+      }
   }
   return ret;
 }
@@ -155,7 +165,7 @@ int ObRpcProcessorBase::update_data_version()
     uint64_t data_version = rpc_pkt_->get_data_version();
     if (ObRpcNetHandler::is_self_cluster(src_cluster_id) && data_version > 0) {
       if (OB_FAIL(ODV_MGR.set(tenant_id_, data_version))) {
-        LOG_WARN("fail to update data_version", K(ret), KP(tenant_id_), K(data_version));
+        LOG_WARN("fail to update data_version", K(ret), KP(tenant_id_), KDV(data_version));
       }
     }
   }
@@ -166,6 +176,7 @@ int ObRpcProcessorBase::update_data_version()
 int ObRpcProcessorBase::deserialize()
 {
   int ret = OB_SUCCESS;
+  ACTIVE_SESSION_FLAG_SETTER_GUARD(in_rpc_decode);
   if (OB_ISNULL(rpc_pkt_)) {
     ret = OB_ERR_UNEXPECTED;
     RPC_OBRPC_LOG(ERROR, "rpc_pkt_ should not be NULL", K(ret));
@@ -340,6 +351,7 @@ int ObRpcProcessorBase::do_response(const Response &rsp)
         packet->set_pop_process_start_diff(req_->get_pop_process_start_diff());
         packet->set_process_start_end_diff(req_->get_process_start_end_diff());
         packet->set_process_end_response_diff(req_->get_process_end_response_diff());
+        packet->set_timeout(timeout_);
         if (rsp.is_stream_) {
           if (!rsp.is_stream_last_) {
             packet->set_stream_next();
@@ -496,6 +508,7 @@ int ObRpcProcessorBase::part_response(const int retcode, bool is_last)
 
     // serialize
     if (OB_SUCC(ret)) {
+      ACTIVE_SESSION_FLAG_SETTER_GUARD(in_rpc_encode);
       if (OB_ISNULL(using_buffer_)) {
         ret = OB_ERR_UNEXPECTED;
         RPC_OBRPC_LOG(ERROR, "using_buffer_ is NULL", K(ret));
@@ -578,8 +591,8 @@ int ObRpcProcessorBase::flush(int64_t wait_timeout, const ObAddr *src_addr)
   rpc::ObRequest *req = NULL;
   UNIS_VERSION_GUARD(unis_version_);
 
-  const int64_t stream_rpc_max_wait_timeout = get_stream_rpc_max_wait_timeout(tenant_id_);
   if (0 == wait_timeout) {
+    const int64_t stream_rpc_max_wait_timeout = get_stream_rpc_max_wait_timeout(tenant_id_);
     wait_timeout = stream_rpc_max_wait_timeout;
   }
 
@@ -600,7 +613,7 @@ int ObRpcProcessorBase::flush(int64_t wait_timeout, const ObAddr *src_addr)
   } else if (rpc_pkt_ && rpc_pkt_->is_stream_last()) {
     ret = OB_ITER_END;
     RPC_OBRPC_LOG(WARN, "stream is end", K(ret), K(*rpc_pkt_));
-  } else if (OB_FAIL(sc_->prepare(src_addr, rpc_pkt_))) {
+  } else if (OB_FAIL(sc_->prepare(&get_rpc_src_addr(), rpc_pkt_))) {
     RPC_OBRPC_LOG(WARN, "prepare stream session fail", K(ret));
   } else if (OB_FAIL(part_response(common::OB_SUCCESS, false))) {
     RPC_OBRPC_LOG(WARN, "response part result to peer fail", K(ret));
@@ -636,7 +649,9 @@ int ObRpcProcessorBase::flush(int64_t wait_timeout, const ObAddr *src_addr)
     } else if (rpc_pkt_->is_stream_last()) {
       ret = OB_ITER_END;
     } else {
-      //do nothing
+      if (stream_rpc_update_timeout()) { // not to reset timeout_is if rpc is from the old version observer
+        THIS_WORKER.set_timeout_ts(rpc_pkt_->get_timestamp() + rpc_pkt_->get_timeout());
+      }
     }
   }
 

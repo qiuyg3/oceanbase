@@ -44,7 +44,9 @@ public:
                K_(heartbeat_timeout),
                K_(force_create),
                K_(is_async),
-               K_(load_method));
+               K_(load_method),
+               K_(column_names),
+               K_(part_names));
 public:
   ObString table_name_;
   int64_t parallel_;
@@ -55,6 +57,8 @@ public:
   bool force_create_; // unused
   bool is_async_;
   ObString load_method_;
+  common::ObSArray<ObString> column_names_;
+  common::ObSArray<ObString> part_names_;
 };
 
 struct ObTableDirectLoadBeginRes

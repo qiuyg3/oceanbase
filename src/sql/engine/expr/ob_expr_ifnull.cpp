@@ -14,7 +14,6 @@
 
 #include "sql/engine/expr/ob_expr_ifnull.h"
 
-#include "share/object/ob_obj_cast.h"
 
 #include "sql/engine/expr/ob_expr_promotion_util.h"
 #include "sql/session/ob_sql_session_info.h"
@@ -47,16 +46,17 @@ int ObExprIfNull::calc_result_type2(ObExprResType &type,
   } else if (OB_FAIL(ObExprPromotionUtil::get_nvl_type(type, type1, type2))) {
     LOG_WARN("failed to get nvl type", K(ret));
   } else if (ob_is_string_type(type.get_type()) || ob_is_json_tc(type.get_type())) {
-    ObCollationLevel res_cs_level = CS_LEVEL_INVALID;
-    ObCollationType res_cs_type = CS_TYPE_INVALID;
-    if (OB_FAIL(ObCharset::aggregate_collation(type1.get_collation_level(), type1.get_collation_type(),
-                                          type2.get_collation_level(), type2.get_collation_type(),
-                                          res_cs_level, res_cs_type))) {
-      LOG_WARN("failed to calc collation", K(ret));
-    } else {
-      type.set_collation_level(res_cs_level);
-      type.set_collation_type(res_cs_type);
+    ObExprResTypes res_types;
+    if (OB_FAIL(res_types.push_back(type1))) {
+      LOG_WARN("fail to push back res type", K(ret));
+    } else if (OB_FAIL(res_types.push_back(type2))) {
+      LOG_WARN("fail to push back res type", K(ret));
+    } else if (OB_FAIL(aggregate_charsets_for_string_result(type, &res_types.at(0), 2, type_ctx))) {
+      LOG_WARN("failed to aggregate_charsets_for_comparison", K(ret));
     }
+  } else if (ob_is_roaringbitmap_tc(type.get_type())) {
+    type.set_collation_level(CS_LEVEL_IMPLICIT);
+    type.set_collation_type(CS_TYPE_BINARY);
   }
 
   if (OB_SUCC(ret)) {
@@ -65,11 +65,23 @@ int ObExprIfNull::calc_result_type2(ObExprResType &type,
     } else {
       type.set_accuracy(type2.get_accuracy());
     }
-    //对于 int 和uint64的混合类型，需要提升类型至decimal
-    if ((ObUInt64Type == type1.get_type() || ObUInt64Type == type2.get_type())
-        && ObIntType == type.get_type()) {
-      type.set_type(ObNumberType);
-      type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObIntType].get_accuracy());
+    if (ob_is_integer_type(type1.get_type()) && ob_is_integer_type(type2.get_type())) {
+      if (type1.get_type_class() == type2.get_type_class()) {
+        type.set_type(MAX(type1.get_type(), type2.get_type()));
+      } else { // unsigned and signed
+        ObObjType signed_type = (type1.get_type_class() == ObIntTC) ? type1.get_type() : type2.get_type();
+        ObObjType unsigned_type = (type1.get_type_class() == ObIntTC) ? type2.get_type() : type1.get_type();
+        int signed_type_diff = static_cast<int>(signed_type) - static_cast<int>(ObTinyIntType);
+        int unsigned_type_diff = static_cast<int>(unsigned_type) - static_cast<int>(ObUTinyIntType);
+        int res_type_diff = (unsigned_type_diff >= signed_type_diff) ? (unsigned_type_diff + 1) : signed_type_diff;
+        //对于 int 和uint64的混合类型，需要提升类型至decimal
+        if (res_type_diff > (static_cast<int>(ObIntType) - static_cast<int>(ObTinyIntType))) {
+          type.set_type(ObNumberType);
+          type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObIntType].get_accuracy());
+        } else {
+          type.set_type(static_cast<ObObjType>(res_type_diff + ObTinyIntType));
+        }
+      }
     }
 
     //set scale

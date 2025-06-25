@@ -429,7 +429,8 @@ int WriteTaskExecutor::execute()
            obj_size_);
     write_buf_[obj_size_] = '\0';
 
-    if (OB_FAIL(adapter.write_single_file(base_uri_, storage_info_, write_buf_, obj_size_))) {
+    if (OB_FAIL(adapter.write_single_file(base_uri_, storage_info_, write_buf_, obj_size_,
+                                          ObStorageIdMod::get_default_id_mod()))) {
       OB_LOG(WARN, "fail to write file",
           K(ret), K_(base_uri), KPC_(storage_info), K_(obj_size), K(object_id));
     } else {
@@ -497,11 +498,12 @@ int AppendWriteTaskExecutor::execute()
     ObBackupIoAdapter adapter;
     ObIOFd fd;
     ObIODevice *device_handle = nullptr;
-    ObStorageAccessType access_type = OB_STORAGE_ACCESS_RANDOMWRITER;
+    ObStorageAccessType access_type = OB_STORAGE_ACCESS_APPENDER;
 
     const int64_t open_start_time_us = ObTimeUtility::current_time();
     if (OB_FAIL(adapter.open_with_access_type(
-        device_handle, fd, storage_info_, base_uri_, access_type))) {
+        device_handle, fd, storage_info_, base_uri_, access_type,
+        ObStorageIdMod::get_default_id_mod()))) {
       OB_LOG(WARN, "failed to open device with access type",
           K(ret), K_(base_uri), KPC_(storage_info), K(access_type));
     } else if (OB_ISNULL(device_handle)) {
@@ -608,7 +610,8 @@ int MultipartWriteTaskExecutor::execute()
 
     const int64_t open_start_time_us = ObTimeUtility::current_time();
     if (OB_FAIL(adapter.open_with_access_type(
-        device_handle, fd, storage_info_, base_uri_, access_type))) {
+        device_handle, fd, storage_info_, base_uri_, access_type,
+        ObStorageIdMod::get_default_id_mod()))) {
       OB_LOG(WARN, "failed to open device with access type",
           K(ret), K_(base_uri), KPC_(storage_info), K(access_type));
     } else if (OB_ISNULL(device_handle)) {
@@ -719,11 +722,13 @@ int ReadTaskExecutor::execute()
     int64_t read_size = -1;
 
     if (is_adaptive_ && OB_FAIL(adapter.adaptively_read_part_file(base_uri_,
-        storage_info_, read_buf_, expected_read_size_, offset, read_size))) {
+        storage_info_, read_buf_, expected_read_size_, offset, read_size,
+        ObStorageIdMod::get_default_id_mod()))) {
       OB_LOG(WARN, "fail to read adaptive file", K(ret), K_(base_uri),
           KPC_(storage_info), K_(expected_read_size), K_(obj_size), K(offset), K(object_id));
     } else if (!is_adaptive_ && OB_FAIL(adapter.read_part_file(base_uri_,
-        storage_info_, read_buf_, expected_read_size_, offset, read_size))) {
+        storage_info_, read_buf_, expected_read_size_, offset, read_size,
+        ObStorageIdMod::get_default_id_mod()))) {
       OB_LOG(WARN, "fail to read file", K(ret), K_(base_uri),
           KPC_(storage_info), K_(expected_read_size), K_(obj_size), K(offset), K(object_id));
     } else {
@@ -768,6 +773,13 @@ int DelTaskExecutor::execute()
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     OB_LOG(WARN, "DelTaskExecutor not init", K(ret), K_(base_uri));
+  } else if (OB_ISNULL(storage_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    OB_LOG(WARN, "storage_info_ is null", K(ret), KP(storage_info_));
+  } else if (OB_UNLIKELY(storage_info_->is_enable_worm()
+                && ObStorageDeleteMode::STORAGE_DELETE_MODE == storage_info_->get_delete_mode())) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(ERROR, "worm bucket can not do deleting opeartion", K(ret), KPC(storage_info_));
   } else if (OB_FAIL(prepare_(object_id))) {
     OB_LOG(WARN, "fail to prepare", K(ret), K_(base_uri), K(object_id));
   } else {

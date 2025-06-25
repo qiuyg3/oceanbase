@@ -13,7 +13,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/join/ob_join_vec_op.h"
-#include "share/vector/ob_uniform_format.h"
 
 namespace oceanbase
 {
@@ -23,6 +22,16 @@ namespace sql
 
 OB_SERIALIZE_MEMBER((ObJoinVecSpec, ObOpSpec),
                     join_type_, other_join_conds_);
+
+#define VEC_FORMAT_SWITCH_CASE(VEC_FORMAT, vec_ptr, brs)          \
+  case VEC_FORMAT: {                                              \
+    for (int64_t i = 0; i < brs.size_; ++i) {                     \
+        if (vec_ptr->is_null(i) || !vec_ptr->get_bool(i)) {       \
+          brs.set_skip(i);                                        \
+        }                                                         \
+      }                                                           \
+    break;                                                        \
+  }
 
 int ObJoinVecOp::inner_rescan()
 {
@@ -39,6 +48,8 @@ int ObJoinVecOp::blank_row_batch(const ExprFixedArray &exprs, int64_t batch_size
       ObIVector *vec = exprs.at(col_idx)->get_vector(eval_ctx_);
       if (OB_UNLIKELY(VEC_UNIFORM_CONST == exprs.at(col_idx)->get_format(eval_ctx_))) {
         reinterpret_cast<ObUniformFormat<true> *>(vec)->set_null(0);
+      } else if (VEC_UNIFORM == exprs.at(col_idx)->get_format(eval_ctx_)) {
+        reinterpret_cast<ObUniformFormat<false> *>(vec)->set_all_null(batch_size);
       } else {
         reinterpret_cast<ObBitmapNullVectorBase *>(vec)->get_nulls()->set_all(batch_size);
         reinterpret_cast<ObBitmapNullVectorBase *>(vec)->set_has_null();
@@ -66,21 +77,49 @@ void ObJoinVecOp::blank_row_batch_one(const ExprFixedArray &exprs)
   }
 }
 
-int ObJoinVecOp::calc_other_conds(bool &is_match)
+int ObJoinVecOp::calc_other_conds(const ObBitVector &skip, bool &is_match)
 {
   int ret = OB_SUCCESS;
   is_match = true;
   const ObIArray<ObExpr *> &conds = get_spec().other_join_conds_;
-  ObDatum *cmp_res = NULL;
+  const int64_t batch_idx = eval_ctx_.get_batch_idx();
+  EvalBound eval_bound(eval_ctx_.get_batch_size(), batch_idx, batch_idx + 1, false);
+  ObIVector *res_vec = nullptr;
   ARRAY_FOREACH(conds, i) {
-    if (OB_FAIL(conds.at(i)->eval(eval_ctx_, cmp_res))) {
+    if (OB_FAIL(conds.at(i)->eval_vector(eval_ctx_, skip, eval_bound))) {
       LOG_WARN("fail to calc other join condition", K(ret), K(*conds.at(i)));
-    } else if (cmp_res->is_null() || 0 == cmp_res->get_int()) {
+    } else if (OB_ISNULL(res_vec = conds.at(i)->get_vector(eval_ctx_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to get source vector", K(ret), K(res_vec));
+    } else if (res_vec->is_null(batch_idx) || 0 == res_vec->get_int(batch_idx)) {
       is_match = false;
       break;
     }
   }
+  return ret;
+}
 
+int ObJoinVecOp::batch_calc_other_conds(ObBatchRows &brs)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ObExpr *> &conds = get_spec().other_join_conds_;
+  ARRAY_FOREACH(conds, i) {
+    if (OB_FAIL(conds.at(i)->eval_vector(eval_ctx_, brs))) {
+      LOG_WARN("fail to calc other join condition", K(ret), K(*conds.at(i)));
+    } else {
+      VectorHeader &vec_header = conds.at(i)->get_vector_header(eval_ctx_);
+      common::ObIVector *vec = conds.at(i)->get_vector(eval_ctx_);
+      switch(vec_header.format_) {
+        VEC_FORMAT_SWITCH_CASE(VEC_FIXED, static_cast<ObFixedLengthBase *>(vec), brs);
+        VEC_FORMAT_SWITCH_CASE(VEC_UNIFORM, static_cast<ObUniformFormat<false> *>(vec), brs);
+        VEC_FORMAT_SWITCH_CASE(VEC_UNIFORM_CONST, static_cast<ObUniformFormat<true> *>(vec), brs);
+      default: {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected vector format", K(ret), K(vec_header.format_));
+      }
+      }
+    }
+  }
   return ret;
 }
 

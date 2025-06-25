@@ -20,6 +20,9 @@
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/ls/ob_ls_info.h"
 #include "share/ls/ob_ls_status_operator.h"
+#include "share/ob_zone_table_operation.h"
+#include "share/ob_unit_table_operator.h"
+
 namespace oceanbase
 {
 
@@ -139,11 +142,9 @@ class DRLSInfo
 {
 public:
   DRLSInfo(const uint64_t resource_tenant_id,
-           ObZoneManager *zone_mgr,
            share::schema::ObMultiVersionSchemaService *schema_service)
     : resource_tenant_id_(resource_tenant_id),
       sys_schema_guard_(),
-      zone_mgr_(zone_mgr),
       schema_service_(schema_service),
       unit_stat_info_map_("DRUnitStatMap"),
       server_stat_info_map_("DRSerStatMap"),
@@ -183,6 +184,8 @@ public:
   int64_t get_paxos_replica_number() const { return paxos_replica_number_; }
   bool has_leader() const { return has_leader_; }
   bool is_duplicate_ls() const { return ls_status_info_.is_duplicate_ls(); }
+  uint64_t get_tenant_id() const { return ls_status_info_.tenant_id_; }
+  const share::ObLSID &get_ls_id() const { return ls_status_info_.ls_id_; }
   int get_tenant_id(
       uint64_t &tenant_id) const;
   int get_ls_id(
@@ -204,7 +207,7 @@ public:
   int get_leader_and_member_list(
       common::ObAddr &leader_addr,
       common::ObMemberList &member_list,
-      GlobalLearnerList &learner_list);
+      GlobalLearnerList &learner_list) const;
 
   // get data_source from leader replcia
   // @param [out] data_source, leader replica
@@ -212,6 +215,20 @@ public:
   int get_default_data_source(
       ObReplicaMember &data_source,
       int64_t &data_size) const;
+
+  // get member by server address in leader's learner list and member list
+  // @param [in] server_addr, which server the member in
+  // @param [out] member, target member
+  int get_member_by_server(
+      const common::ObAddr& server_addr,
+      ObMember &member) const;
+
+  // check and get if there is a replica on the target server
+  // @param [in] server_addr, which server the replica in
+  // @param [out] ls_replica, target replic
+  int check_replica_exist_and_get_ls_replica(
+      const common::ObAddr& server_addr,
+      share::ObLSReplica& ls_replica) const;
 private:
   int construct_filtered_ls_info_to_use_(
       const share::ObLSInfo &input_ls_info,
@@ -247,7 +264,6 @@ private:
   uint64_t resource_tenant_id_;
   share::schema::ObSchemaGetterGuard sys_schema_guard_;
   share::ObUnitTableOperator unit_operator_;
-  ObZoneManager *zone_mgr_;
   share::schema::ObMultiVersionSchemaService *schema_service_;
   UnitStatInfoMap unit_stat_info_map_;
   ServerStatInfoMap server_stat_info_map_;

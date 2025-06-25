@@ -12,11 +12,8 @@
 
 #define USING_LOG_PREFIX SQL_OPT
 
-#include "share/stat/ob_opt_column_stat.h"
-#include "share/stat/ob_stat_define.h"
-#include "share/stat/ob_stat_item.h"
+#include "ob_opt_column_stat.h"
 #include "sql/engine/aggregate/ob_aggregate_processor.h"
-#include "sql/engine/expr/ob_expr_sys_op_opnsize.h"
 namespace oceanbase {
 namespace common {
 using namespace sql;
@@ -119,12 +116,12 @@ int ObHistogram::deep_copy(ObIAllocator &allocator, const ObHistogram &src)
     LOG_WARN("failed to alloc memory", K(src.buckets_.count()));
   } else {
     ObHistBucket *new_buckets = new (ptr) ObHistBucket[src.buckets_.count()];
-    buckets_ = ObArrayWrap<ObHistBucket>(new_buckets, src.buckets_.count());
-    for (int64_t i = 0; OB_SUCC(ret) && i < buckets_.count(); ++i) {
-      if (OB_FAIL(buckets_.at(i).deep_copy(allocator, src.buckets_.at(i)))) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < src.buckets_.count(); ++i) {
+      if (OB_FAIL(new_buckets[i].deep_copy(allocator, src.buckets_.at(i)))) {
         LOG_WARN("deep copy bucket failed");
       }
     }
+    buckets_ = ObArrayWrap<ObHistBucket>(new_buckets, src.buckets_.count());
   }
   return ret;
 }
@@ -198,7 +195,7 @@ ObOptColumnStat::ObOptColumnStat()
       allocator_(inner_allocator_),
       cg_macro_blk_cnt_(0),
       cg_micro_blk_cnt_(0),
-      cg_skip_rate_(1.0)
+      cg_skip_rate_(0.0)
 {
   min_value_.set_null();
   max_value_.set_null();
@@ -226,7 +223,7 @@ ObOptColumnStat::ObOptColumnStat(ObIAllocator &allocator)
       allocator_(allocator),
       cg_macro_blk_cnt_(0),
       cg_micro_blk_cnt_(0),
-      cg_skip_rate_(1.0)
+      cg_skip_rate_(0.0)
 {
   min_value_.set_null();
   max_value_.set_null();
@@ -257,7 +254,7 @@ void ObOptColumnStat::reset()
   histogram_.reset();
   cg_macro_blk_cnt_ = 0;
   cg_micro_blk_cnt_ = 0;
-  cg_skip_rate_ = 1.0;
+  cg_skip_rate_ = 0.0;
 }
 
 int64_t ObOptColumnStat::size() const
@@ -316,11 +313,13 @@ int ObOptColumnStat::deep_copy(const ObOptColumnStat &src)
   } else if (OB_FAIL(histogram_.deep_copy(allocator_, src.histogram_))) {
     LOG_WARN("failed to deep copy histogram", K(ret));
   } else if (src.llc_bitmap_size_ != 0 && src.llc_bitmap_ != NULL) {
-    if (OB_ISNULL(llc_bitmap_ = static_cast<char*>(allocator_.alloc(src.llc_bitmap_size_)))) {
+    char* ptr = static_cast<char*>(allocator_.alloc(src.llc_bitmap_size_));
+    if (OB_ISNULL(ptr)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate memory for llc_bitmap_");
     } else {
-      MEMCPY(llc_bitmap_, src.llc_bitmap_, src.llc_bitmap_size_);
+      MEMCPY(ptr, src.llc_bitmap_, src.llc_bitmap_size_);
+      llc_bitmap_ = ptr;
     }
   }
   return ret;

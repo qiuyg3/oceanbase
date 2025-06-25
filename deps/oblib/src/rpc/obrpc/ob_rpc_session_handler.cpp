@@ -14,10 +14,6 @@
 
 #include "rpc/obrpc/ob_rpc_session_handler.h"
 
-#include "lib/atomic/ob_atomic.h"
-#include "lib/thread_local/ob_tsi_utils.h"
-#include "rpc/ob_request.h"
-#include "rpc/obrpc/ob_rpc_packet.h"
 #include "rpc/obrpc/ob_poc_rpc_server.h"
 #include "rpc/obrpc/ob_rpc_reverse_keepalive_struct.h"
 
@@ -241,11 +237,20 @@ int ObRpcSessionHandler::wait_for_next_request(int64_t sessid,
             // when waiting for OB_REMOTE_EXECUTE/OB_REMOTE_SYNC_EXECUTE/OB_INNER_SQL_SYNC_TRANSMIT request more than 30s,
             // try to send reverse keepalive request.
             if (current_time_us >= keepalive_timeout_us && reverse_keepalive_arg.is_valid()) {
-              get_next_cond_(wait_object.thid_).unlock();
-              ret = stream_rpc_reverse_probe(reverse_keepalive_arg);
-              get_next_cond_(wait_object.thid_).lock();
-              if (OB_FAIL(ret)) {
+              get_next_cond_(thid).unlock();
+              int tmp_ret = stream_rpc_reverse_probe(reverse_keepalive_arg);
+              get_next_cond_(thid).lock();
+              if (OB_SUCCESS != tmp_ret) {
                 LOG_WARN("stream rpc sender has been aborted, unneed to wait", K(sessid), K(timeout), K(reverse_keepalive_arg));
+                if (OB_FAIL(next_wait_map_.get_refactored(sessid, wait_object))) {
+                  LOG_ERROR("wait object has been released", K(sessid), K(ret));
+                } else if (OB_ISNULL(wait_object.req_)) {
+                  // keepalive faild and the req is null, set the error and break
+                  ret = tmp_ret;
+                } else {
+                  req = wait_object.req_;
+                  LOG_INFO("got the next request though keepalive failed, break and return success", K(sessid), K(tmp_ret), K(ret));
+                }
                 break;
               }
             }
@@ -272,11 +277,12 @@ int ObRpcSessionHandler::wait_for_next_request(int64_t sessid,
       int overwrite = 1;
       hash_ret = next_wait_map_.set_refactored(sessid, wait_object, overwrite);
       if (OB_SUCCESS != hash_ret) {
+        ret = hash_ret;
         LOG_WARN("rewrite clear session req error",
                   K(hash_ret), K(sessid), K(req));
       }
 
-      get_next_cond_(wait_object.thid_).unlock();
+      get_next_cond_(thid).unlock();
       ATOMIC_DEC(&waiting_thread_count_);
     } else {
       //do nothing

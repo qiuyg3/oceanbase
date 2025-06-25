@@ -82,6 +82,8 @@ private:
     PROXY_USER_NAME,
     SERVICE_NAME,
     TOTAL_CPU_TIME,
+    TOP_INFO,
+    MEMORY_USAGE
   };
   class FillScanner
   {

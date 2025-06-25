@@ -19,6 +19,7 @@
 extern bool get_dblink_reuse_connection_cfg();
 extern bool get_enable_dblink_cfg();
 extern uint64_t get_current_tenant_id_for_dblink();
+extern uint64_t get_max_dblink_conn_per_observer();
 
 namespace oceanbase
 {
@@ -69,6 +70,27 @@ public:
     CleanDblinkArrayFunc() {}
     virtual ~CleanDblinkArrayFunc() = default;
     int operator()(common::hash::HashMapPair<uint32_t, int64_t> &kv);
+  };
+  class GetDblinkConnCall
+  {
+  public:
+    GetDblinkConnCall(uint64_t dblink_id)
+      : dblink_id_(dblink_id), dblink_conn_(nullptr) {}
+    ~GetDblinkConnCall() = default;
+    void operator() (common::hash::HashMapPair<uint32_t, int64_t> &entry);
+  public:
+    uint64_t dblink_id_;
+    common::sqlclient::ObISQLConnection *dblink_conn_;
+  };
+  class AppendDblinkConnCall
+  {
+  public:
+    AppendDblinkConnCall(common::sqlclient::ObISQLConnection &dblink_conn)
+      : dblink_conn_(dblink_conn) {}
+    ~AppendDblinkConnCall() = default;
+    int operator() (common::hash::HashMapPair<uint32_t, int64_t> &entry);
+  public:
+    common::sqlclient::ObISQLConnection &dblink_conn_;
   };
 public:
   static int mtl_new(ObTenantDblinkKeeper *&dblink_keeper);

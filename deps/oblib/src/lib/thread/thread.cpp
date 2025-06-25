@@ -13,20 +13,13 @@
 #define USING_LOG_PREFIX LIB
 
 #include "thread.h"
-#include "threads.h"
-#include <pthread.h>
-#include <sys/syscall.h>
-#include "lib/ob_errno.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/ob_running_mode.h"
-#include "lib/allocator/ob_page_manager.h"
 #include "lib/rc/context.h"
-#include "lib/thread_local/ob_tsi_factory.h"
 #include "lib/thread/protected_stack_allocator.h"
-#include "lib/utility/ob_defer.h"
 #include "lib/utility/ob_hang_fatal_error.h"
-#include "lib/utility/ob_tracepoint.h"
 #include "lib/signal/ob_signal_struct.h"
+#include "lib/ash/ob_active_session_guard.h"
+#include "lib/stat/ob_session_stat.h"
+#include "lib/resource/ob_affinity_ctrl.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
@@ -47,7 +40,7 @@ Thread &Thread::current()
   return *current_thread_;
 }
 
-Thread::Thread(Threads *threads, int64_t idx, int64_t stack_size)
+Thread::Thread(Threads *threads, int64_t idx, int64_t stack_size, int32_t numa_node)
     : pth_(0),
       threads_(threads),
       idx_(idx),
@@ -62,7 +55,8 @@ Thread::Thread(Threads *threads, int64_t idx, int64_t stack_size)
       tid_(0),
       thread_list_node_(this),
       cpu_time_(0),
-      create_ret_(OB_NOT_RUNNING)
+      create_ret_(OB_NOT_RUNNING),
+      numa_node_(numa_node)
 {}
 
 Thread::~Thread()
@@ -74,6 +68,7 @@ int Thread::start()
 {
   int ret = OB_SUCCESS;
   const int64_t count = ATOMIC_FAA(&total_thread_count_, 1);
+  ObNumaNodeGuard numa_guard(numa_node_);
   if (count >= get_max_thread_num() - OB_RESERVED_THREAD_NUM) {
     ATOMIC_FAA(&total_thread_count_, -1);
     ret = OB_SIZE_OVERFLOW;
@@ -168,11 +163,20 @@ uint64_t Thread::get_tenant_id() const
 
 void Thread::run()
 {
+  if (OB_NUMA_SHARED_INDEX != numa_node_) {
+    AFFINITY_CTRL.thread_bind_to_node(numa_node_);
+  }
   IRunWrapper *run_wrapper_ = threads_->get_run_wrapper();
   if (OB_NOT_NULL(run_wrapper_)) {
-    run_wrapper_->pre_run();
+    {
+      ObDisableDiagnoseGuard disable_guard;
+      run_wrapper_->pre_run();
+    }
     threads_->run(idx_);
-    run_wrapper_->end_run();
+    {
+      ObDisableDiagnoseGuard disable_guard;
+      run_wrapper_->end_run();
+    }
   } else {
     threads_->run(idx_);
   }
@@ -238,7 +242,7 @@ int Thread::try_wait()
     int pret = 0;
     if (0 != (pret = pthread_tryjoin_np(pth_, nullptr))) {
       ret = OB_EAGAIN;
-      LOG_WARN("pthread_tryjoin_np failed", K(pret), K(errno), K(ret));
+      LOG_WARN("pthread_tryjoin_np failed", K(pret), K(errno), K(ret), K(oceanbase::lib::Thread::tid_));
     } else {
       destroy_stack();
     }
@@ -276,6 +280,7 @@ void* Thread::__th_start(void *arg)
   ob_set_thread_tenant_id(th->get_tenant_id());
   current_thread_ = th;
   th->tid_ = gettid();
+
 #ifndef OB_USE_ASAN
   ObStackHeader *stack_header = ProtectedStackAllocator::stack_header(th->stack_addr_);
   abort_unless(stack_header->check_magic());
@@ -318,7 +323,7 @@ void* Thread::__th_start(void *arg)
       ObPageManager::set_thread_local_instance(pm);
       MemoryContext *mem_context = GET_TSI0(MemoryContext);
       if (OB_ISNULL(mem_context)) {
-        ret = OB_ERR_UNEXPECTED;
+        ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_ERROR("null ptr", K(ret));
       } else if (OB_FAIL(ROOT_CONTEXT->CREATE_CONTEXT(*mem_context,
                          ContextParam().set_properties(RETURN_MALLOC_DEFAULT)

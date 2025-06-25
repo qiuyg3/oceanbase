@@ -13,8 +13,8 @@
 #define USING_LOG_PREFIX STORAGE_COMPACTION
 
 #include "storage/compaction/ob_partition_rows_merger.h"
-#include "storage/column_store/ob_column_oriented_sstable.h"
 #include "storage/compaction/ob_tablet_merge_ctx.h"
+#include "storage/compaction/ob_mview_compaction_util.h"
 
 namespace oceanbase
 {
@@ -580,8 +580,10 @@ int ObPartitionMergeHelper::init_merge_iters(const ObMergeParameter &merge_param
     ObITable *table = nullptr;
     ObSSTable *sstable = nullptr;
     ObPartitionMergeIter *merge_iter = nullptr;
-    bool is_small_sstable = false;
 
+    if (merge_param.is_mv_merge() && OB_FAIL(init_mv_merge_iters(merge_param))) {
+      STORAGE_LOG(WARN, "Failed to init mv merge iters", K(ret), K(merge_param));
+    }
     for (int64_t i = table_cnt - 1; OB_SUCC(ret) && i >= 0; i--) {
       if (OB_ISNULL(table = tables_handle.get_table(i))) {
         ret = OB_ERR_UNEXPECTED;
@@ -595,16 +597,16 @@ int ObPartitionMergeHelper::init_merge_iters(const ObMergeParameter &merge_param
         //TODO(COLUMN_STORE) tmp code, use specific cg sstable according to the ctx of sub merge task
       } else if (table->is_sstable() && sstable->get_data_macro_block_count() <= 0) {
         // do nothing. don't need to construct iter for empty sstable
-        FLOG_INFO("table is empty, need not create iter", K(i), KPC(sstable));
+        FLOG_INFO("table is empty, need not create iter", K(i), "sstable_key", sstable->get_key());
         continue;
-      } else if (OB_ISNULL(merge_iter = alloc_merge_iter(merge_param, 0 == i, table->is_sstable() && sstable->is_small_sstable(), table))) {
+      } else if (OB_ISNULL(merge_iter = alloc_merge_iter(merge_param, table))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         STORAGE_LOG(WARN, "Failed to alloc memory for merge iter", K(ret));
       } else if (OB_FAIL(merge_iter->init(merge_param, i, &read_info_))) {
         if (OB_UNLIKELY(OB_BEYOND_THE_RANGE != ret)) {
           STORAGE_LOG(WARN, "Failed to init merge iter", K(ret));
         } else {
-          FLOG_INFO("Ignore sstable beyond the range", K(i), K(merge_param.merge_range_), KPC(table));
+          FLOG_INFO("Ignore sstable beyond the range", K(i), K(merge_param.merge_range_), "sstable_key", sstable->get_key());
           ret = OB_SUCCESS;
         }
       } else if (OB_FAIL(merge_iters_.push_back(merge_iter))) {
@@ -621,6 +623,35 @@ int ObPartitionMergeHelper::init_merge_iters(const ObMergeParameter &merge_param
     }
 
     return ret;
+}
+
+int ObPartitionMergeHelper::init_mv_merge_iters(const ObMergeParameter &merge_param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(0 != merge_iters_.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(WARN, "Unexpected iters count in mv merge", K(ret));
+  } else {
+    ObPartitionMergeIter *merge_iter = nullptr;
+    for (int64_t i = merge_param.mview_merge_param_->refresh_sql_count_ - 1; OB_SUCC(ret) && i >= 0 ; i--) {
+      if (OB_ISNULL(merge_iter = alloc_helper<ObPartitionMVRowMergeIter>(allocator_, allocator_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        STORAGE_LOG(WARN, "Failed to alloc memory for mv merge iter", K(ret));
+      } else if (OB_FAIL(merge_iter->init(merge_param, i, &read_info_))) {
+        STORAGE_LOG(WARN, "Failed to init mv merge iter", K(ret), K(i));
+      } else if (OB_FAIL(merge_iters_.push_back(merge_iter))) {
+        STORAGE_LOG(WARN, "Failed to push back mv merge iter", K(ret), KPC(merge_iter));
+      } else {
+        STORAGE_LOG(INFO, "Succ to init mv merge iter", K(ret), K(i), KPC(merge_iter));
+        merge_iter = nullptr;
+      }
+      if (OB_FAIL(ret) && nullptr != merge_iter) {
+        merge_iter->~ObPartitionMergeIter();
+        allocator_.free(merge_iter);
+      }
+    }
+  }
+  return ret;
 }
 
 int ObPartitionMergeHelper::prepare_rows_merger()
@@ -752,7 +783,7 @@ int ObPartitionMergeHelper::find_rowkey_minimum_iters(MERGE_ITER_ARRAY &minimum_
   } else if (OB_UNLIKELY(merge_iters_.empty())) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "unexpected null merge iters", K(ret), K(merge_iters_));
-  } else if (rows_merger_->empty()) {
+  } else if (OB_UNLIKELY(rows_merger_->empty())) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "rows_merger_ is empty", K(ret), KPC(rows_merger_));
   } else {
@@ -817,7 +848,9 @@ int ObPartitionMergeHelper::build_rows_merger()
         item.iter_ = iter;
         item.iter_idx_ = i;
         if (OB_FAIL(rows_merger_->push(item))) {
-          STORAGE_LOG(WARN, "failed to push item", K(ret), K(i), KPC(rows_merger_));
+          if (OB_BLOCK_SWITCHED != ret) {
+            STORAGE_LOG(WARN, "failed to push item", K(ret), K(i), KPC(rows_merger_));
+          }
         }
       }
     } // end for
@@ -893,7 +926,9 @@ void ObPartitionMergeHelper::reset()
     if (OB_NOT_NULL(iter = merge_iters_.at(i))) {
       if (OB_NOT_NULL(table = iter->get_table())) {
         FLOG_INFO("partition merge iter row count", K(i), "row_count", iter->get_iter_row_count(),
-            "ghost_row_count", iter->get_ghost_row_count(), "pkey", table->get_key(), KPC(table), KPC(iter));
+            "ghost_row_count", iter->get_ghost_row_count(), "table_key", table->get_key());
+      } else {
+        FLOG_INFO("partition merge iter row count", K(i), "row_count", iter->get_iter_row_count(), KPC(iter));
       }
       iter->~ObPartitionMergeIter();
       iter = nullptr;
@@ -917,20 +952,24 @@ void ObPartitionMergeHelper::reset()
  * ---------------------------------------------------------ObPartitionMajorMergeHelper--------------------------------------------------------------
  */
 
-ObPartitionMergeIter *ObPartitionMajorMergeHelper::alloc_merge_iter(const ObMergeParameter &merge_param,
-                                                                    const bool is_base_iter,
-                                                                    const bool is_small_sstable,
-                                                                    const ObITable *table)
+ObPartitionMergeIter *ObPartitionMajorMergeHelper::alloc_merge_iter(const ObMergeParameter &merge_param, const ObITable *table)
 {
   ObPartitionMergeIter *merge_iter = nullptr;
-  if (is_base_iter && !merge_param.is_full_merge() && !is_small_sstable) {
-    if (MICRO_BLOCK_MERGE_LEVEL == merge_param.static_param_.merge_level_) {
+  if (OB_UNLIKELY(nullptr == table || !table->is_sstable())) {
+    // do nothing
+  } else if (!table->is_major_sstable() || merge_param.is_full_merge()) {
+    merge_iter = alloc_helper<ObPartitionRowMergeIter>(allocator_, allocator_);
+  } else if (static_cast<const ObSSTable *>(table)->is_small_sstable()) {
+    const uint64_t compat_version = merge_param.static_param_.data_version_;
+    if (compat_version >= DATA_VERSION_4_3_5_1 && MICRO_BLOCK_MERGE_LEVEL == merge_param.static_param_.merge_level_) {
       merge_iter = alloc_helper<ObPartitionMicroMergeIter>(allocator_, allocator_);
     } else {
-      merge_iter = alloc_helper<ObPartitionMacroMergeIter>(allocator_, allocator_);
+      merge_iter = alloc_helper<ObPartitionRowMergeIter>(allocator_, allocator_);
     }
+  } else if (MICRO_BLOCK_MERGE_LEVEL == merge_param.static_param_.merge_level_) {
+    merge_iter = alloc_helper<ObPartitionMicroMergeIter>(allocator_, allocator_);
   } else {
-    merge_iter = alloc_helper<ObPartitionRowMergeIter>(allocator_, allocator_);
+    merge_iter = alloc_helper<ObPartitionMacroMergeIter>(allocator_, allocator_);
   }
 
   return merge_iter;
@@ -965,36 +1004,35 @@ int ObPartitionMinorMergeHelper::collect_tnode_dml_stat(
   return ret;
 }
 
-ObPartitionMergeIter *ObPartitionMinorMergeHelper::alloc_merge_iter(const ObMergeParameter &merge_param,
-                                                                    const bool is_base_iter,
-                                                                    const bool is_small_sstable,
-                                                                    const ObITable *table)
+ObPartitionMergeIter *ObPartitionMinorMergeHelper::alloc_merge_iter(const ObMergeParameter &merge_param, const ObITable *table)
 {
   int ret = OB_SUCCESS;
-  UNUSEDx(is_base_iter);
   const ObStaticMergeParam &static_param = merge_param.static_param_;
   ObPartitionMergeIter *merge_iter = nullptr;
-  if (compaction::is_backfill_tx_merge(static_param.get_merge_type())) {
-    merge_iter = alloc_helper<ObPartitionMinorRowMergeIter> (allocator_, allocator_);
-  } else if (!is_small_sstable
+  if (OB_ISNULL(table)) {
+    // do nothing
+  } else if (!(table->is_sstable() && static_cast<const ObSSTable*>(table)->is_small_sstable())
       && !is_mini_merge(static_param.get_merge_type())
       && !static_param.is_full_merge_
       && static_param.sstable_logic_seq_ < ObMacroDataSeq::MAX_SSTABLE_SEQ) {
     ObSSTableMetaHandle meta_handle;
     bool reuse_uncommit_row = false;
-    if (!transaction::ObTransID(static_param.tx_id_).is_valid() || !static_cast<const ObSSTable *>(table)->contain_uncommitted_row()) {
-      reuse_uncommit_row = false;
-    }else if (OB_FAIL(static_cast<const ObSSTable *>(table)->get_meta(meta_handle))) {
-      STORAGE_LOG(ERROR, "fail to get meta", K(ret), KPC(table));
-    } else if (meta_handle.get_sstable_meta().get_tx_id_count() > 0) {
-      const int64_t tx_id = meta_handle.get_sstable_meta().get_tx_ids(0);
-      if (OB_UNLIKELY(meta_handle.get_sstable_meta().get_tx_id_count() != 1)) {
-        ret = OB_ERR_UNEXPECTED;
-        STORAGE_LOG(ERROR, "unexpected tx id count", K(ret), KPC(table), KPC(meta_handle.meta_));
-      } else {
-        reuse_uncommit_row = tx_id == static_param.tx_id_;
-      }
-    }
+    //we only have the tx_id on sstable meta, without seq_no, the tuples in the macro block could still be abort
+    //open this flag when we support open empty macro block during reuse/rewrite processing
+
+    //if (!transaction::ObTransID(static_param.tx_id_).is_valid() || !static_cast<const ObSSTable *>(table)->contain_uncommitted_row()) {
+      //reuse_uncommit_row = false;
+    //} else if (OB_FAIL(static_cast<const ObSSTable *>(table)->get_meta(meta_handle))) {
+      //STORAGE_LOG(ERROR, "fail to get meta", K(ret), KPC(table));
+    //} else if (meta_handle.get_sstable_meta().get_tx_id_count() > 0) {
+      //const int64_t tx_id = meta_handle.get_sstable_meta().get_tx_ids(0);
+      //if (OB_UNLIKELY(meta_handle.get_sstable_meta().get_tx_id_count() != 1)) {
+        //ret = OB_ERR_UNEXPECTED;
+        //STORAGE_LOG(ERROR, "unexpected tx id count", K(ret), KPC(table), KPC(meta_handle.meta_));
+      //} else {
+        //reuse_uncommit_row = tx_id == static_param.tx_id_;
+      //}
+    //}
     merge_iter = alloc_helper<ObPartitionMinorMacroMergeIter>(allocator_, allocator_, reuse_uncommit_row);
   } else {
     merge_iter = alloc_helper<ObPartitionMinorRowMergeIter>(allocator_, allocator_);

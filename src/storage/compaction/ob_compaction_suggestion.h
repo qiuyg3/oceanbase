@@ -18,14 +18,13 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/utility/ob_print_utils.h"
 #include "lib/container/ob_iarray.h"
-#include "storage/ob_sstable_struct.h"
 
 namespace oceanbase
 {
 namespace compaction
 {
 class ObPartitionMergeProgress;
-
+struct ObSSTableMergeHistory;
 // 32 B
 struct ObCompactionHistogramBucket final
 {
@@ -234,7 +233,7 @@ public:
   void clear_compaction_dag_status();
 
   int analyze_merge_info(
-    const ObSSTableMergeInfo &merge_info,
+    const ObSSTableMergeHistory &merge_history,
     const share::ObDagType::ObDagTypeEnum type,
     const int64_t cost_time);
 
@@ -247,6 +246,7 @@ public:
   static const int64_t TOO_MANY_FAILED_COUNT = 20;
   static const int64_t SCAN_AVERAGE_RAITO = 4; // 2 * 2
   static const int64_t INC_ROW_CNT_PARAM = 5 * 1000 * 1000; // 5 Million
+  static const int64_t ROW_COUNT_TO_CHECK_PARALLEL_EVEN = 1 * 1000 * 1000; // 1 Million
   static const int64_t SINGLE_PARTITION_MACRO_CNT_PARAM = 256 * 1024; // single partition size 500G
   static const int64_t MACRO_CNT_PARAM = 5 * 1000; // 5 k
 

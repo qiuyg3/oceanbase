@@ -13,7 +13,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "ob_subplan_scan_op.h"
-#include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/ob_exec_context.h"
 
 namespace oceanbase
@@ -179,8 +178,8 @@ int ObSubPlanScanOp::next_vector(const int64_t max_row_cnt)
             MEMCPY(dst, src, brs_.size_ * sizeof(ObDatum));
           }
           OZ(to->init_vector(eval_ctx_, VEC_UNIFORM, brs_.size_));
-        } else {
-          to_vec_header = from_vec_header;
+        } else if (OB_FAIL(to_vec_header.assign(from_vec_header))) {
+          LOG_WARN("assign vector header failed", K(ret));
         }
         // init eval info
         if (OB_SUCC(ret)) {

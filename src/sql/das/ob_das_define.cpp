@@ -11,16 +11,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
-#include "sql/das/ob_das_define.h"
-#include "sql/das/ob_das_context.h"
-#include "sql/das/ob_das_utils.h"
-#include "sql/engine/ob_exec_context.h"
+#include "ob_das_define.h"
 #include "pl/ob_pl.h"
-#include "sql/optimizer/ob_phy_table_location_info.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/schema/ob_multi_version_schema_service.h"
-#include "share/location_cache/ob_location_service.h"
-#include "observer/ob_server_struct.h"
 
 namespace oceanbase
 {
@@ -36,6 +28,7 @@ void ObDASTableLocMeta::light_assign(const ObDASTableLocMeta &other)
   table_loc_id_ = other.table_loc_id_;
   ref_table_id_ = other.ref_table_id_;
   flags_ = other.flags_;
+  route_policy_ = other.route_policy_;
 }
 
 int ObDASTableLocMeta::assign(const ObDASTableLocMeta &other)
@@ -66,7 +59,8 @@ OB_SERIALIZE_MEMBER(ObDASTableLocMeta,
                     table_loc_id_,
                     ref_table_id_,
                     related_table_ids_,
-                    flags_);
+                    flags_,
+                    route_policy_);
 
 OB_SERIALIZE_MEMBER(ObDASTabletLoc,
                     tablet_id_,

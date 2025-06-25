@@ -11,11 +11,7 @@
  */
 
 #include "observer/virtual_table/ob_all_virtual_table_mgr.h"
-#include "storage/memtable/ob_memtable.h"
-#include "observer/ob_server.h"
 #include "storage/tx_storage/ob_ls_service.h"
-#include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
-#include "storage/column_store/ob_column_oriented_sstable.h"
 
 using namespace oceanbase;
 using namespace common;
@@ -306,7 +302,7 @@ int ObAllVirtualTableMgr::process_curr_tenant(common::ObNewRow *&row)
           int64_t data_checksum = 0;
           if (table->is_memtable()) {
             // memtable has no data checksum, do nothing
-          } else if (table->is_co_sstable()) {
+          } else if (table->is_co_sstable() && !static_cast<const ObCOSSTableV2 *>(table)->is_cgs_empty_co_table()) {
             data_checksum = static_cast<storage::ObCOSSTableV2 *>(table)->get_cs_meta().data_checksum_;
           } else if (table->is_sstable()) {
             data_checksum = static_cast<blocksstable::ObSSTable *>(table)->get_data_checksum();
@@ -314,10 +310,30 @@ int ObAllVirtualTableMgr::process_curr_tenant(common::ObNewRow *&row)
           cur_row_.cells_[i].set_int(data_checksum);
           break;
         }
-        case TABLE_FLAG:
-          // TODO(yanfeng): only for place holder purpose, need change when auto_split branch merge
-          cur_row_.cells_[i].set_int(0);
+        case TABLE_FLAG: {
+          int32_t flag = 0;
+          if (table->is_sstable()) {
+            blocksstable::ObSSTableMetaHandle sst_meta_hdl;
+            if (OB_FAIL(static_cast<blocksstable::ObSSTable *>(table)->get_meta(sst_meta_hdl))) {
+              SERVER_LOG(WARN, "fail to get sstable meta handle", K(ret));
+            } else {
+               flag = sst_meta_hdl.get_sstable_meta().get_table_shared_flag().get_flag();
+            }
+          }
+          cur_row_.cells_[i].set_int(flag);
           break;
+        }
+        case REC_SCN: {
+          uint64_t v = table->get_rec_scn().get_val_for_inner_table_field();
+          cur_row_.cells_[i].set_int(v);
+          break;
+        }
+        // FIXME: the value of SS_TABLET_VERSION is invalid
+        case SS_TABLET_VERSION: {
+          uint64_t v = share::SCN::min_scn().get_val_for_inner_table_field();
+          cur_row_.cells_[i].set_uint64(v);
+          break;
+        }
         default:
           ret = OB_ERR_UNEXPECTED;
           SERVER_LOG(WARN, "invalid col_id", K(ret), K(col_id));

@@ -53,7 +53,7 @@ public:
                                  const ObDASWriteBuffer::DmlRow &dml_row,
                                  const IntFixedArray &row_projector,
                                  common::ObIAllocator &allocator,
-                                 common::ObNewRow &storage_row);
+                                 blocksstable::ObDatumRow &storage_row);
   static int reshape_storage_value(const common::ObObjMeta &col_type,
                                    const common::ObAccuracy &col_accuracy,
                                    common::ObIAllocator &allocator,
@@ -63,6 +63,11 @@ public:
                                  const bool enable_oracle_empty_char_reshape_to_null,
                                  ObIAllocator &allocator,
                                  blocksstable::ObStorageDatum &datum_value);
+  static int reshape_vector_value(const ObObjMeta &col_type,
+                                  const ObAccuracy &col_accuracy,
+                                  ObIAllocator &allocator,
+                                  common::ObIVector *&vector,
+                                  const int64_t size);
   static int padding_fixed_string_value(int64_t max_len, ObIAllocator &alloc, ObObj &value);
   static int wait_das_retry(int64_t retry_cnt);
   static int find_child_das_def(const ObDASBaseCtDef *root_ctdef,
@@ -91,9 +96,30 @@ public:
     }
     return ret;
   }
-  static int generate_mlog_row(const common::ObTabletID &tablet_id,
+  static int find_child_das_ctdef(const ObDASBaseCtDef *root_ctdef,
+                                ObDASOpType op_type,
+                                const ObDASBaseCtDef *&target_ctdef);
+  template <typename CtDefType>
+  static int find_target_ctdef(const ObDASBaseCtDef *root_ctdef,
+                                 ObDASOpType op_type,
+                                 const CtDefType *&target_ctdef)
+  {
+    int ret = common::OB_SUCCESS;
+    const ObDASBaseCtDef *base_ctdef = nullptr;
+    if (OB_FAIL(find_child_das_ctdef(root_ctdef, op_type, base_ctdef))) {
+      SQL_DAS_LOG(WARN, "find chld das def failed", K(ret));
+    } else if (OB_ISNULL(base_ctdef)) {
+      ret = common::OB_ERR_UNEXPECTED;
+      SQL_DAS_LOG(WARN, "can not find the target op def", K(ret), K(op_type), KP(base_ctdef));
+    } else {
+      target_ctdef = static_cast<const CtDefType*>(base_ctdef);
+    }
+    return ret;
+  }
+  static int generate_mlog_row(const share::ObLSID &ls_id,
+                               const common::ObTabletID &tablet_id,
                                const storage::ObDMLBaseParam &dml_param,
-                               common::ObNewRow &row,
+                               blocksstable::ObDatumRow &row,
                                ObDASOpType op_type,
                                bool is_old_row);
 };

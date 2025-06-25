@@ -10,7 +10,6 @@
  * See the Mulan PubL v2 for more details.
  */
 #define USING_LOG_PREFIX STORAGE
-#include "lib/stat/ob_diagnose_info.h"
 #include "ob_cg_sstable_row_getter.h"
 
 namespace oceanbase
@@ -416,7 +415,7 @@ int ObCGSSTableRowGetter::fetch_row(ObSSTableReadHandle &read_handle, const ObNo
     if (OB_SUCC(ret) && iter_param_->need_scn_) {
       if (OB_FAIL(fetch_rowkey_row(read_handle, store_row))) {
         LOG_WARN("Fail to fetch row", K(ret));
-      } else if (OB_FAIL(set_row_scn(*iter_param_, store_row))) {
+      } else if (OB_FAIL(set_row_scn(access_ctx_->use_fuse_row_cache_, *iter_param_, store_row))) {
         LOG_WARN("failed to set row scn", K(ret));
       } else {
         int64_t trans_idx = iter_param_->get_read_info()->get_trans_col_index();

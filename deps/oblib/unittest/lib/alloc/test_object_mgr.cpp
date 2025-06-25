@@ -11,12 +11,8 @@
  */
 
 #define private public
-#include "lib/resource/achunk_mgr.h"
-#include "lib/resource/ob_resource_mgr.h"
-#include "lib/alloc/object_mgr.h"
 #undef private
 #include "lib/allocator/ob_malloc.h"
-#include "lib/utility/ob_test_util.h"
 #include "lib/coro/testing.h"
 #include <gtest/gtest.h>
 
@@ -262,7 +258,7 @@ TEST_F(TestObjectMgr, TestSubObjectMgr)
       AObject *obj = it->second;
       ABlock *block = obj->block();
       abort_unless(block->is_valid());
-      ObjectSet *set = block->obj_set_;
+      ObjectSet *set = (ObjectSet *)block->obj_set_;
       set->free_object(obj);
       allocs.erase(it->first);
     }

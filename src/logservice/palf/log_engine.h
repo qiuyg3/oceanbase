@@ -20,6 +20,7 @@
 #include "log_net_service.h"                           // LogNetService
 #include "log_meta.h"                                  // LogMeta
 #include "log_define.h"
+#include "log_shared_queue_thread.h"
 
 namespace oceanbase
 {
@@ -110,7 +111,8 @@ public:
            LogPlugins *plugins,
            const int64_t palf_epoch,
            const int64_t log_storage_block_size,
-           const int64_t log_meta_storage_block_size);
+           const int64_t log_meta_storage_block_size,
+           LogIOAdapter *io_adapter);
   void destroy();
 
   int load(const int64_t palf_id,
@@ -124,9 +126,10 @@ public:
            LogPlugins *plugins,
            LogGroupEntryHeader &entry_header,
            const int64_t palf_epoch,
-           bool &is_integrity,
            const int64_t log_storage_size,
-           const int64_t log_meta_storage_size);
+           const int64_t log_meta_storage_size,
+           LogIOAdapter *io_adapter,
+           bool &is_integrity);
 
   // ==================== Submit async task start ================
   //
@@ -160,6 +163,7 @@ public:
   int submit_purge_throttling_task(const PurgeThrottlingType purge_type);
   int submit_fill_cache_task(const LSN &lsn, const int64_t size);
 
+  virtual int check_config_meta_size(const LogConfigMeta &config_meta) const;
   // ==================== Submit aysnc task end ==================
 
   // ====================== LogStorage start =====================
@@ -184,7 +188,8 @@ public:
                const int64_t in_read_size,
                const bool need_read_block_header,
                ReadBuf &read_buf,
-               int64_t &out_read_size);
+               int64_t &out_read_size,
+               LogIOContext &io_ctx);
   //
   // ====================== LogStorage end =======================
 
@@ -193,7 +198,8 @@ public:
   int update_base_lsn_used_for_gc(const LSN &lsn);
   int update_manifest(const block_id_t block_id);
   int append_meta(const char *buf, const int64_t buf_len);
-  int update_log_snapshot_meta_for_flashback(const LogInfo &prev_log_inf);
+  int update_log_snapshot_meta_for_flashback(const LogInfo &prev_log_inf,
+                                             const LSN &prev_log_tail_lsn);
   //
   // ===================== MetaStorage end =======================
 
@@ -498,6 +504,7 @@ private:
   int integrity_verify_(const LSN &last_meta_entry_start_lsn,
                         const LSN &last_group_entry_header_lsn,
                         bool &is_integrity);
+  void set_enable_fill_cache_functor(const EnableFillCacheFunctor &functor);
 private:
   DISALLOW_COPY_AND_ASSIGN(LogEngine);
 
@@ -540,6 +547,7 @@ private:
   int64_t palf_epoch_;
   //used to control frequency of purging throttling
   int64_t last_purge_throttling_ts_;
+  EnableFillCacheFunctor enable_fill_cache_functor_;
   bool is_inited_;
 };
 } // end namespace palf

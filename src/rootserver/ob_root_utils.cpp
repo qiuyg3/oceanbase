@@ -13,30 +13,8 @@
 #define USING_LOG_PREFIX RS
 
 #include "ob_root_utils.h"
-#include "ob_balance_info.h"
-#include "ob_unit_manager.h"
-#include "lib/json/ob_json.h"
-#include "lib/string/ob_sql_string.h"
-#include "lib/hash/ob_hashset.h"
-#include "lib/mysqlclient/ob_mysql_result.h"
-#include "share/ob_rpc_struct.h"
-#include "share/ob_share_util.h"
-#include "share/ob_common_rpc_proxy.h"
-#include "share/schema/ob_table_schema.h"
-#include "share/schema/ob_schema_struct.h"
-#include "share/schema/ob_multi_version_schema_service.h" // ObMultiVersionSchemaService
-#include "share/schema/ob_schema_getter_guard.h" // ObSchemaGetterGuard
-#include "share/inner_table/ob_inner_table_schema_constants.h"
-#include "storage/tx/ob_ts_mgr.h"
-#include "rootserver/ob_unit_manager.h"
-#include "rootserver/ob_root_service.h"
-#include "rootserver/ob_ddl_service.h"
-#include "observer/ob_server_struct.h"
-#include "logservice/palf_handle_guard.h"
 #include "logservice/ob_log_service.h"
-#include "share/system_variable/ob_system_variable_alias.h"
 #include "share/ob_primary_zone_util.h"           // ObPrimaryZoneUtil
-#include "share/ob_server_table_operator.h"
 #include "share/ob_zone_table_operation.h"
 #include "rootserver/ob_tenant_balance_service.h"    // for ObTenantBalanceService
 
@@ -569,188 +547,6 @@ int ObTenantGroupParser::jump_to_next_ttg(
   return ret;
 }
 
-int ObLocalityTaskHelp::filter_logonly_task(const common::ObIArray<share::ObResourcePoolName> &pools,
-                                            ObUnitManager &unit_mgr,
-                                            ObIArray<share::ObZoneReplicaNumSet> &zone_locality)
-{
-  int ret = OB_SUCCESS;
-  ObArray<ObUnitInfo> logonly_unit_infos;
-  ObArray<ObUnitInfo> unit_infos;
-  if (pools.count() <= 0) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(pools));
-  } else if (OB_FAIL(unit_mgr.get_unit_infos(pools, unit_infos))) {
-    LOG_WARN("fail to get unit infos", K(ret), K(pools));
-  } else {
-    for (int64_t i = 0; i < unit_infos.count() && OB_SUCC(ret); ++i) {
-      if (REPLICA_TYPE_LOGONLY != unit_infos.at(i).unit_.replica_type_) {
-        // only L unit is counted
-      } else if (OB_FAIL(logonly_unit_infos.push_back(unit_infos.at(i)))) {
-        LOG_WARN("fail to push back", K(ret), K(i), K(unit_infos));
-      }
-    }
-    for (int64_t i = 0; i < zone_locality.count() && OB_SUCC(ret); ++i) {
-      share::ObZoneReplicaAttrSet &zone_replica_attr_set = zone_locality.at(i);
-      if (zone_replica_attr_set.get_logonly_replica_num()
-          + zone_replica_attr_set.get_encryption_logonly_replica_num() <= 0) {
-        // no L replica : nothing todo
-      } else if (zone_replica_attr_set.zone_set_.count() <= 0) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("zone set unexpected", K(ret), K(zone_replica_attr_set));
-      } else {
-        for (int64_t j = 0; j < logonly_unit_infos.count(); j++) {
-          const ObUnitInfo &unit_info = logonly_unit_infos.at(j);
-          if (!has_exist_in_array(zone_replica_attr_set.zone_set_, unit_info.unit_.zone_)) {
-            // bypass
-          } else if (zone_replica_attr_set.get_logonly_replica_num()
-                     + zone_replica_attr_set.get_encryption_logonly_replica_num() <= 0) {
-            // bypass
-          } else if (zone_replica_attr_set.get_logonly_replica_num() > 0) {
-            ret = zone_replica_attr_set.sub_logonly_replica_num(ReplicaAttr(1, 100));
-          } else {
-            ret = zone_replica_attr_set.sub_encryption_logonly_replica_num(ReplicaAttr(1, 100));
-          }
-        }
-      }
-    }
-  }
-  return ret;
-}
-
-int ObLocalityTaskHelp::get_logonly_task_with_logonly_unit(const uint64_t tenant_id,
-                                                           ObUnitManager &unit_mgr,
-                                                           share::schema::ObSchemaGetterGuard &schema_guard,
-                                                           ObIArray<share::ObZoneReplicaNumSet> &zone_locality)
-{
-  int ret = OB_SUCCESS;
-  ObArray<ObUnitInfo> logonly_unit_infos;
-  const ObTenantSchema *tenant_schema = NULL;
-  zone_locality.reset();
-  common::ObArray<share::ObZoneReplicaAttrSet> tenant_zone_locality;
-  if (OB_INVALID_ID == tenant_id) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(tenant_id));
-  } else if (OB_FAIL(schema_guard.get_tenant_info(tenant_id, tenant_schema))) {
-    LOG_WARN("fail to get tenant info", K(ret), K(tenant_id));
-  } else if (OB_ISNULL(tenant_schema)) {
-    ret = OB_TENANT_NOT_EXIST;
-    LOG_WARN("get invalid tenant schema", K(ret), K(tenant_schema));
-  } else if (OB_FAIL(unit_mgr.get_logonly_unit_by_tenant(tenant_id, logonly_unit_infos))) {
-    LOG_WARN("fail to get logonly unit infos", K(ret), K(tenant_id));
-  } else if (OB_FAIL(tenant_schema->get_zone_replica_attr_array(tenant_zone_locality))) {
-    LOG_WARN("fail to get zone replica attr array", K(ret));
-  } else {
-    share::ObZoneReplicaNumSet logonly_set;
-    for (int64_t i = 0; i < logonly_unit_infos.count() && OB_SUCC(ret); i++) {
-      const ObUnitInfo &unit = logonly_unit_infos.at(i);
-      for (int64_t j = 0; j < tenant_zone_locality.count(); j++) {
-        logonly_set.reset();
-        const ObZoneReplicaNumSet &zone_set = tenant_zone_locality.at(j);
-        if (zone_set.zone_ == unit.unit_.zone_
-            && zone_set.get_logonly_replica_num() == 1) {
-          logonly_set.zone_ = zone_set.zone_;
-          if (OB_FAIL(logonly_set.replica_attr_set_.add_logonly_replica_num(ReplicaAttr(1, 100)))) {
-            LOG_WARN("fail to add logonly replica num", K(ret));
-          } else if (OB_FAIL(zone_locality.push_back(logonly_set))) {
-            LOG_WARN("fail to push back", K(ret));
-          }
-        } else if (zone_set.zone_ == unit.unit_.zone_
-            && zone_set.get_encryption_logonly_replica_num() == 1) {
-          logonly_set.zone_ = zone_set.zone_;
-          if (OB_FAIL(logonly_set.replica_attr_set_.add_encryption_logonly_replica_num(ReplicaAttr(1, 100)))) {
-            LOG_WARN("fail to add logonly replica num", K(ret));
-          } else if (OB_FAIL(zone_locality.push_back(logonly_set))) {
-            LOG_WARN("fail to push back", K(ret));
-          }
-        }
-      }
-    }
-  }
-  return ret;
-}
-
-int ObLocalityTaskHelp::filter_logonly_task(const uint64_t tenant_id,
-                                            ObUnitManager &unit_mgr,
-                                            share::schema::ObSchemaGetterGuard &schema_guard,
-                                            ObIArray<share::ObZoneReplicaAttrSet> &zone_locality)
-{
-  int ret = OB_SUCCESS;
-  ObArray<ObUnitInfo> logonly_unit_infos;
-  if (OB_FAIL(unit_mgr.get_logonly_unit_by_tenant(schema_guard, tenant_id, logonly_unit_infos))) {
-    LOG_WARN("fail to get loggonly unit by tenant", K(ret), K(tenant_id));
-  } else {
-    LOG_DEBUG("get all logonly unit", K(tenant_id), K(logonly_unit_infos), K(zone_locality));
-    for (int64_t i = 0; i < zone_locality.count() && OB_SUCC(ret); ++i) {
-      share::ObZoneReplicaAttrSet &zone_replica_attr_set = zone_locality.at(i);
-      if (zone_replica_attr_set.get_logonly_replica_num()
-          + zone_replica_attr_set.get_encryption_logonly_replica_num() <= 0) {
-        // no L replica : nothing todo
-      } else if (zone_replica_attr_set.zone_set_.count() <= 0) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("zone set unexpected", K(ret), K(zone_replica_attr_set));
-      } else {
-        for (int64_t j = 0; j < logonly_unit_infos.count(); j++) {
-          const ObUnitInfo &unit_info = logonly_unit_infos.at(j);
-          if (!has_exist_in_array(zone_replica_attr_set.zone_set_, unit_info.unit_.zone_)) {
-            // bypass
-          } else if (zone_replica_attr_set.get_logonly_replica_num()
-             + zone_replica_attr_set.get_encryption_logonly_replica_num() <= 0) {
-            // bypass
-          } else if (zone_replica_attr_set.get_logonly_replica_num() > 0) {
-            ret = zone_replica_attr_set.sub_logonly_replica_num(ReplicaAttr(1, 100));
-          } else {
-            ret = zone_replica_attr_set.sub_encryption_logonly_replica_num(ReplicaAttr(1, 100));
-          }
-        }
-      }
-    }
-  }
-  return ret;
-}
-
-int ObLocalityTaskHelp::alloc_logonly_replica(ObUnitManager &unit_mgr,
-                                              const ObIArray<share::ObResourcePoolName> &pools,
-                                              const common::ObIArray<ObZoneReplicaNumSet> &zone_locality,
-                                              ObPartitionAddr &partition_addr)
-{
-  int ret = OB_SUCCESS;
-  ObArray<ObUnitInfo> logonly_units;
-  ObArray<ObUnitInfo> unit_infos;
-  if (OB_FAIL(unit_mgr.get_unit_infos(pools, unit_infos))) {
-    LOG_WARN("fail to get unit infos", K(ret), K(pools));
-  } else {
-    for (int64_t i = 0; i < unit_infos.count() && OB_SUCC(ret); i++) {
-      if (REPLICA_TYPE_LOGONLY != unit_infos.at(i).unit_.replica_type_) {
-        //nothing todo
-      } else if (OB_FAIL(logonly_units.push_back(unit_infos.at(i)))) {
-        LOG_WARN("fail to push back", K(ret), K(i), K(unit_infos));
-      }
-    }
-  }
-  ObReplicaAddr raddr;
-  for (int64_t i = 0; i < logonly_units.count() && OB_SUCC(ret); i++) {
-    for (int64_t j = 0; j < zone_locality.count() && OB_SUCC(ret); j++) {
-      if (zone_locality.at(j).zone_ == logonly_units.at(i).unit_.zone_
-          && (zone_locality.at(j).get_logonly_replica_num() == 1
-              || zone_locality.at(j).get_encryption_logonly_replica_num() == 1)) {
-        raddr.reset();
-        raddr.unit_id_ = logonly_units.at(i).unit_.unit_id_;
-        raddr.addr_ = logonly_units.at(i).unit_.server_;
-        raddr.zone_ = logonly_units.at(i).unit_.zone_;
-        raddr.replica_type_ = zone_locality.at(j).get_logonly_replica_num() == 1
-                              ? REPLICA_TYPE_LOGONLY
-                              : REPLICA_TYPE_ENCRYPTION_LOGONLY;
-        if (OB_FAIL(partition_addr.push_back(raddr))) {
-          LOG_WARN("fail to push back", K(ret), K(raddr));
-        } else {
-          LOG_INFO("alloc partition for logonly replica", K(raddr));
-        }
-      }
-    }
-  }
-  return ret;
-}
-
 int ObLocalityCheckHelp::calc_paxos_replica_num(
     const common::ObIArray<share::ObZoneReplicaNumSet> &zone_locality,
     int64_t &paxos_num)
@@ -795,6 +591,7 @@ int ObLocalityCheckHelp::check_alter_locality(
   pre_paxos_num = 0;
   cur_paxos_num = 0;
   alter_paxos_tasks.reset();
+  bool replace_locality = false;
   if (OB_UNLIKELY(pre_zone_locality.count() <= 0 || cur_zone_locality.count() <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret),
@@ -807,8 +604,12 @@ int ObLocalityCheckHelp::check_alter_locality(
     LOG_WARN("fail to calc paxos replica num", K(ret));
   } else if (OB_FAIL(calc_paxos_replica_num(cur_zone_locality, cur_paxos_num))) {
     LOG_WARN("fail to calc paxos replica num", K(ret));
-  } else if (OB_FAIL(check_alter_locality_valid(alter_paxos_tasks,
-                                                pre_paxos_num, cur_paxos_num, arb_service_status))) {
+  } else if (OB_FAIL(check_replace_locality_valid(pre_zone_locality, cur_zone_locality, replace_locality))) {
+    LOG_WARN("fail to check single locality replace valid", KR(ret), K(pre_zone_locality), K(cur_zone_locality));
+  } else if (replace_locality) {
+    FLOG_INFO("replace locality is valid", K(pre_zone_locality), K(cur_zone_locality));
+  } else if (OB_FAIL(check_alter_locality_valid(alter_paxos_tasks, pre_paxos_num, cur_paxos_num,
+                                                arb_service_status))) {
     LOG_WARN("check alter locality valid failed", K(ret), K(alter_paxos_tasks),
              K(pre_paxos_num), K(cur_paxos_num), K(non_paxos_locality_modified), K(arb_service_status));
   }
@@ -1447,6 +1248,98 @@ int ObLocalityCheckHelp::get_alter_paxos_replica_number_replica_task(
   return ret;
 }
 
+int ObLocalityCheckHelp::check_zone_same_region(
+    const common::ObZone &z1,
+    const common::ObZone &z2,
+    bool &same_region)
+{
+  int ret = OB_SUCCESS;
+  same_region = false;
+  hash::ObHashMap<ObZone, ObRegion> zone_info_map;
+  ObMemAttr attr(OB_SYS_TENANT_ID, "ZONE_REGION_MAP");
+  ObRegion region1;
+  ObRegion region2;
+  if (OB_UNLIKELY(z1.is_empty() || z2.is_empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(z1), K(z2));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql_proxy_ is null", KR(ret), KP(GCTX.sql_proxy_));
+  } else if (OB_FAIL(zone_info_map.create(7, attr, attr))) {
+    LOG_WARN("create zone region map failed", KR(ret));
+  } else if (OB_FAIL(ObZoneTableOperation::get_zone_region_list(*GCTX.sql_proxy_, zone_info_map))) {
+    LOG_WARN("fail to get zone region list", KR(ret));
+  } else if (OB_FAIL(zone_info_map.get_refactored(z1, region1))) {
+    LOG_WARN("fail to get map", KR(ret), K(z1));
+  } else if (OB_FAIL(zone_info_map.get_refactored(z2, region2))) {
+    LOG_WARN("fail to get map", KR(ret), K(z2));
+  } else if (region1 == region2) {
+    same_region = true;
+  }
+  return ret;
+}
+
+/*
+1. check current locality and pre locality is single zone replace:
+  a. only support F@zone_x -> F@zone_y.
+2. check if single replace is valid:
+  a. in shared storage and log service deployment mode.
+  b. all server in pre_zone are inactive (not only tenant server).
+  c. zone_x and zone_y are the same region.
+*/
+int ObLocalityCheckHelp::check_replace_locality_valid(
+    const ObIArray<share::ObZoneReplicaNumSet> &pre_zone_locality,
+    const ObIArray<share::ObZoneReplicaNumSet> &cur_zone_locality,
+    bool &single_replace_valid)
+{
+  int ret = OB_SUCCESS;
+  single_replace_valid = false;
+  bool same_region = false;
+  common::ObZone pre_zone;
+  common::ObZone cur_zone;
+  common::ObArray<ObServerInfoInTable> all_active_servers;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql_proxy_ is null", KR(ret), KP(GCTX.sql_proxy_));
+  } else if (1 != pre_zone_locality.count() || 1 != cur_zone_locality.count()) {
+    // skip, not a single zone change
+    LOG_INFO("not single locality replace", K(pre_zone_locality.count()), K(cur_zone_locality.count()));
+  } else if (OB_FAIL(pre_zone.assign(pre_zone_locality.at(0).zone_))) {
+    LOG_WARN("pre_zone assign failed", KR(ret), K(pre_zone_locality.at(0).zone_));
+  } else if (OB_FAIL(cur_zone.assign(cur_zone_locality.at(0).zone_))) {
+    LOG_WARN("cur_zone assign failed", KR(ret), K(cur_zone_locality.at(0).zone_));
+  } else if (pre_zone == cur_zone) {
+    // skip, same zone
+    LOG_INFO("the zones are not different", K(pre_zone), K(cur_zone));
+  } else if (!ObRootUtils::if_deployment_mode_match()) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "Not in shared storage and log service mode, single zone locality replacement is");
+    FLOG_WARN("not in logservice or ss mode", KR(ret));
+  } else if (OB_FAIL(check_zone_same_region(pre_zone, cur_zone, same_region))) {
+    LOG_WARN("failed to check same region", KR(ret), K(pre_zone), K(cur_zone));
+  } else if (!same_region) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "Single zone locality replacement requires two zones in the same region and the current operation is");
+    FLOG_WARN("the region of the zones is different", KR(ret), K(pre_zone), K(cur_zone));
+  } else if (OB_FAIL(ObServerTableOperator::get_servers_info_of_zone(*GCTX.sql_proxy_,
+                                                                     pre_zone,
+                                                                     true/*only_active_servers*/,
+                                                                     all_active_servers))) {
+    LOG_WARN("failed to check all server inactive", KR(ret), K(pre_zone));
+  } else if (0 != all_active_servers.count()) {
+    ret = OB_OP_NOT_ALLOW;
+    char err_msg[OB_MAX_ERROR_MSG_LEN] = {0};
+    snprintf(err_msg, sizeof(err_msg),  "All servers in zone '%s' should be INACTIVE and the current operation is", pre_zone.ptr());
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, err_msg);
+    FLOG_WARN("not all tenant server is inactive", KR(ret), K(all_active_servers), K(pre_zone));
+  } else {
+    // all conditions met
+    single_replace_valid = true;
+    FLOG_INFO("replace locality valid", K(pre_zone_locality), K(cur_zone_locality));
+  }
+  return ret;
+}
+
 int ObLocalityCheckHelp::check_alter_locality_valid(
     ObIArray<AlterPaxosLocalityTask> &alter_paxos_tasks,
     int64_t pre_paxos_num,
@@ -1562,6 +1455,7 @@ int ObLocalityCheckHelp::check_alter_single_zone_locality_valid(
   int ret = OB_SUCCESS;
   bool is_legal = true;
   // 1. check whether non_paxos member change
+  // check R-replica
   if (!non_paxos_locality_modified) {
     const ObIArray<ReplicaAttr> &pre_readonly_replica = orig_locality.replica_attr_set_.get_readonly_replica_attr_array();
     const ObIArray<ReplicaAttr> &cur_readonly_replica = new_locality.replica_attr_set_.get_readonly_replica_attr_array();
@@ -1577,8 +1471,19 @@ int ObLocalityCheckHelp::check_alter_single_zone_locality_valid(
       }
     }
   }
+  // check C-replica
+  if (new_locality.get_columnstore_replica_num() != orig_locality.get_columnstore_replica_num()) {
+    if (new_locality.get_full_replica_num() != orig_locality.get_full_replica_num()
+        || new_locality.get_readonly_replica_num() != orig_locality.get_readonly_replica_num()) {
+      // transform between R/F and C is illegal
+      is_legal = false;
+    } else {
+      non_paxos_locality_modified = true;
+    }
+  }
   // 2. check whether alter locality is legal.
-  if (new_locality.get_logonly_replica_num() < orig_locality.get_logonly_replica_num()) {
+  if (!is_legal) {
+  } else if (new_locality.get_logonly_replica_num() < orig_locality.get_logonly_replica_num()) {
     // L-replica must not transfrom to other replica type.
     if (new_locality.get_full_replica_num() > orig_locality.get_full_replica_num()) {
       is_legal = false; // maybe L->F
@@ -1621,10 +1526,23 @@ int ObLocalityCheckHelp::check_alter_single_zone_locality_valid(
   return ret;
 }
 
+ERRSIM_POINT_DEF(ERRSIM_SKIP_CHECK_SHARED_STORAGE_AND_LOG_SERVICE_MODE);
+bool ObRootUtils::if_deployment_mode_match()
+{
+  bool deployment_mode_match = true;
+  if (OB_UNLIKELY(ERRSIM_SKIP_CHECK_SHARED_STORAGE_AND_LOG_SERVICE_MODE)) {
+    LOG_INFO("errsim not check log service and ss mode");
+  } else if (!GCONF.enable_logservice || !GCTX.is_shared_storage_mode()) {
+    deployment_mode_match = false;
+    LOG_TRACE("skip try single replace dr task", K(GCONF.enable_logservice), K(GCTX.is_shared_storage_mode()));
+  }
+  return deployment_mode_match;
+}
+
 int ObRootUtils::get_rs_default_timeout_ctx(ObTimeoutCtx &ctx)
 {
   int ret = OB_SUCCESS;
-  const int64_t DEFAULT_TIMEOUT_US = 2 * 1000 * 1000; // 2s
+  const int64_t DEFAULT_TIMEOUT_US = GCONF.rpc_timeout; // default is 2s
   if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(ctx, DEFAULT_TIMEOUT_US))) {
     LOG_WARN("fail to set default_timeout_ctx", KR(ret));
   }
@@ -2396,6 +2314,7 @@ const char *oceanbase::rootserver::resource_type_to_str(const ObResourceType &t)
   if (RES_CPU == t) { str = "CPU"; }
   else if (RES_MEM == t) { str = "MEMORY"; }
   else if (RES_LOG_DISK == t) { str = "LOG_DISK"; }
+  else if (RES_DATA_DISK == t) { str = "DATA_DISK"; }
   else { str = "NONE"; }
   return str;
 }

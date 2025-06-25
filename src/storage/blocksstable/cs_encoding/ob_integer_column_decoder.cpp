@@ -12,11 +12,8 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_integer_column_decoder.h"
-#include "ob_integer_stream_decoder.h"
 #include "ob_integer_stream_vector_decoder.h"
-#include "ob_cs_decoding_util.h"
-#include "storage/access/ob_pushdown_aggregate.h"
-#include "storage/blocksstable/encoding/ob_raw_decoder.h"
+#include "storage/access/ob_aggregate_base.h"
 
 namespace oceanbase
 {
@@ -242,21 +239,23 @@ int ObIntegerColumnDecoder::comparison_operator(
     } else {
       ObDatumCmpFuncType type_cmp_func = filter.cmp_func_;
       ObGetFilterCmpRetFunc get_cmp_ret = get_filter_cmp_ret_func(op_type);
-      ObFunction<int(const ObDatum &cur_datum, const int64_t idx)> eval =
-      [&] (const ObDatum &cur_datum, const int64_t idx)
-      {
-	      int tmp_ret = OB_SUCCESS;
-        int cmp_ret = 0;
-        if (OB_TMP_FAIL(type_cmp_func(cur_datum, filter.get_datums().at(0), cmp_ret))) {
-          LOG_WARN("fail to compare datums", K(tmp_ret), K(cur_datum), K(filter.get_datums()));
-        } else if (get_cmp_ret(cmp_ret)) {
-          if (OB_TMP_FAIL(result_bitmap.set(idx))) {
-            LOG_WARN("fail to set result bitmap", KR(ret), K(idx));
+      ObFunction<int(const ObDatum &cur_datum, const int64_t idx)> eval;
+      if (OB_FAIL(eval.assign(
+        [&] (const ObDatum &cur_datum, const int64_t idx)
+        {
+          int tmp_ret = OB_SUCCESS;
+          int cmp_ret = 0;
+          if (OB_TMP_FAIL(type_cmp_func(cur_datum, filter.get_datums().at(0), cmp_ret))) {
+            LOG_WARN("fail to compare datums", K(tmp_ret), K(cur_datum), K(filter.get_datums()));
+          } else if (get_cmp_ret(cmp_ret)) {
+            if (OB_TMP_FAIL(result_bitmap.set(idx))) {
+              LOG_WARN("fail to set result bitmap", KR(ret), K(idx));
+            }
           }
-        }
-        return tmp_ret;
-      };
-      if (OB_FAIL(tranverse_datum_all_op(ctx, pd_filter_info, result_bitmap, eval))) {
+          return tmp_ret;
+        }))) {
+        LOG_WARN("assign function failed", K(ret));
+      } else if (OB_FAIL(tranverse_datum_all_op(ctx, pd_filter_info, result_bitmap, eval))) {
         LOG_WARN("fail to traverse_datum in cmp_op", KR(ret), K(ctx));
       }
     }
@@ -391,26 +390,28 @@ int ObIntegerColumnDecoder::between_operator(
       ObDatumCmpFuncType type_cmp_func = filter.cmp_func_;
       ObGetFilterCmpRetFunc get_le_cmp_ret = get_filter_cmp_ret_func(sql::WHITE_OP_LE);
       ObGetFilterCmpRetFunc get_ge_cmp_ret = get_filter_cmp_ret_func(sql::WHITE_OP_GE);
-      ObFunction<int(const ObDatum &cur_datum, const int64_t idx)> eval =
-      [&] (const ObDatum &cur_datum, const int64_t idx)
-      {
-	      int tmp_ret = OB_SUCCESS;
-        int ge_ret = 0;
-        int le_ret = 0;
-        if (OB_TMP_FAIL(type_cmp_func(cur_datum, filter.get_datums().at(0), ge_ret))) {
-          LOG_WARN("fail to compare datums", K(tmp_ret), K(cur_datum), K(filter.get_datums()));
-        } else if (!get_ge_cmp_ret(ge_ret)) {
-          // skip
-        } else if (OB_TMP_FAIL(type_cmp_func(cur_datum, filter.get_datums().at(1), le_ret))) {
-          LOG_WARN("fail to compare datums", K(tmp_ret), K(cur_datum), K(filter.get_datums()));
-        } else if (!get_le_cmp_ret(le_ret)) {
-          // skip
-        } else if (OB_TMP_FAIL(result_bitmap.set(idx))) {
-          LOG_WARN("fail to set result bitmap", KR(tmp_ret), K(idx));
-        }
-        return tmp_ret;
-      };
-      if (OB_FAIL(tranverse_datum_all_op(ctx, pd_filter_info, result_bitmap, eval))) {
+      ObFunction<int(const ObDatum &cur_datum, const int64_t idx)> eval;
+      if (OB_FAIL(eval.assign(
+        [&] (const ObDatum &cur_datum, const int64_t idx)
+        {
+          int tmp_ret = OB_SUCCESS;
+          int ge_ret = 0;
+          int le_ret = 0;
+          if (OB_TMP_FAIL(type_cmp_func(cur_datum, filter.get_datums().at(0), ge_ret))) {
+            LOG_WARN("fail to compare datums", K(tmp_ret), K(cur_datum), K(filter.get_datums()));
+          } else if (!get_ge_cmp_ret(ge_ret)) {
+            // skip
+          } else if (OB_TMP_FAIL(type_cmp_func(cur_datum, filter.get_datums().at(1), le_ret))) {
+            LOG_WARN("fail to compare datums", K(tmp_ret), K(cur_datum), K(filter.get_datums()));
+          } else if (!get_le_cmp_ret(le_ret)) {
+            // skip
+          } else if (OB_TMP_FAIL(result_bitmap.set(idx))) {
+            LOG_WARN("fail to set result bitmap", KR(tmp_ret), K(idx));
+          }
+          return tmp_ret;
+        }))) {
+        LOG_WARN("assign function failed", K(ret));
+      } else if (OB_FAIL(tranverse_datum_all_op(ctx, pd_filter_info, result_bitmap, eval))) {
         LOG_WARN("fail to tranverse datum in bt_op", KR(ret), K(ctx));
       }
     }
@@ -523,36 +524,42 @@ int ObIntegerColumnDecoder::in_operator(
         }
       }
     } else {
-      ObFilterInCmpType cmp_type = get_filter_in_cmp_type(pd_filter_info.count_, filter.get_datums().count(), false);
+      storage::ObFilterInCmpType cmp_type = storage::get_filter_in_cmp_type(pd_filter_info.count_, filter.get_datums().count(), false);
       ObFunction<int(const ObDatum &cur_datum, const int64_t idx)> eval;
-      if (cmp_type == ObFilterInCmpType::BINARY_SEARCH) {
-        eval = [&] (const ObDatum &cur_datum, const int64_t idx)
-        {
-          int tmp_ret = OB_SUCCESS;
-          bool is_exist = false;
-          if (OB_TMP_FAIL(filter.exist_in_datum_array(cur_datum, is_exist))) {
-            LOG_WARN("fail to check datum in array", KR(tmp_ret), K(cur_datum));
-          } else if (is_exist) {
-            if (OB_TMP_FAIL(result_bitmap.set(idx))) {
-              LOG_WARN("fail to set result bitmap", KR(tmp_ret), K(idx));
+      if (cmp_type == storage::ObFilterInCmpType::BINARY_SEARCH) {
+        if (OB_FAIL(eval.assign(
+          [&] (const ObDatum &cur_datum, const int64_t idx)
+          {
+            int tmp_ret = OB_SUCCESS;
+            bool is_exist = false;
+            if (OB_TMP_FAIL(filter.exist_in_datum_array(cur_datum, is_exist))) {
+              LOG_WARN("fail to check datum in array", KR(tmp_ret), K(cur_datum));
+            } else if (is_exist) {
+              if (OB_TMP_FAIL(result_bitmap.set(idx))) {
+                LOG_WARN("fail to set result bitmap", KR(tmp_ret), K(idx));
+              }
             }
-          }
-          return tmp_ret;
-        };
-      } else if (cmp_type == ObFilterInCmpType::HASH_SEARCH) {
-        eval = [&] (const ObDatum &cur_datum, const int64_t idx)
-        {
-          int tmp_ret = OB_SUCCESS;
-          bool is_exist = false;
-          if (OB_TMP_FAIL(filter.exist_in_datum_set(cur_datum, is_exist))) {
-            LOG_WARN("fail to check datum in hashset", KR(tmp_ret), K(cur_datum));
-          } else if (is_exist) {
-            if (OB_TMP_FAIL(result_bitmap.set(idx))) {
-              LOG_WARN("fail to set result bitmap", KR(tmp_ret), K(idx));
+            return tmp_ret;
+          }))) {
+          LOG_WARN("assign function failed", K(ret));
+        }
+      } else if (cmp_type == storage::ObFilterInCmpType::HASH_SEARCH) {
+        if (OB_FAIL(eval.assign(
+          [&] (const ObDatum &cur_datum, const int64_t idx)
+          {
+            int tmp_ret = OB_SUCCESS;
+            bool is_exist = false;
+            if (OB_TMP_FAIL(filter.exist_in_set(cur_datum, is_exist))) {
+              LOG_WARN("fail to check datum in hashset", KR(tmp_ret), K(cur_datum));
+            } else if (is_exist) {
+              if (OB_TMP_FAIL(result_bitmap.set(idx))) {
+                LOG_WARN("fail to set result bitmap", KR(tmp_ret), K(idx));
+              }
             }
-          }
-          return tmp_ret;
-        };
+            return tmp_ret;
+          }))) {
+          LOG_WARN("assign function failed", K(ret));
+        }
       } else {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("Unexpected filter in compare type", KR(ret), K(cmp_type));
@@ -617,13 +624,13 @@ int ObIntegerColumnDecoder::tranverse_integer_in_op(
 
     if (use_null_replace_val) {
       if (OB_FAIL(ObCSFilterFunctionFactory::instance().integer_in_tranverse_with_null(ctx.data_, store_width_size,
-          null_replaced_val, filter_vals_valid, filter_vals, datum_cnt, row_start, row_cnt, base_value, parent, result_bitmap))) {
+          null_replaced_val, filter_vals_valid, filter_vals, datum_cnt, row_start, row_cnt, base_value, parent, result_bitmap, &filter))) {
         LOG_WARN("fail to handle integer in tranverse with null", KR(ret), K(store_width_size));
       }
     } else {
       const bool exist_null_bitmap = ctx.has_null_bitmap();
       if (OB_FAIL(ObCSFilterFunctionFactory::instance().integer_in_tranverse(ctx.data_, store_width_size,
-          filter_vals_valid, filter_vals, datum_cnt, row_start, row_cnt, base_value, exist_null_bitmap, parent, result_bitmap))) {
+          filter_vals_valid, filter_vals, datum_cnt, row_start, row_cnt, base_value, exist_null_bitmap, parent, result_bitmap, &filter))) {
         LOG_WARN("fail to handle integer in tranverse", KR(ret), K(exist_null_bitmap), K(store_width_size));
       }
     }
@@ -706,38 +713,43 @@ int ObIntegerColumnDecoder::tranverse_datum_all_op(
 
 int ObIntegerColumnDecoder::get_aggregate_result(
     const ObColumnCSDecoderCtx &ctx,
-    const int32_t *row_ids,
-    const int64_t row_cap,
-    storage::ObAggCell &agg_cell) const
+    const ObPushdownRowIdCtx &pd_row_id_ctx,
+    storage::ObAggCellBase &agg_cell) const
 {
   int ret = OB_SUCCESS;
   const ObIntegerColumnDecoderCtx &integer_ctx = ctx.integer_ctx_;
   bool is_col_signed = false;
   const ObObjType store_col_type = integer_ctx.col_header_->get_store_obj_type();
   const bool can_convert = ObCSDecodingUtil::can_convert_to_integer(store_col_type, is_col_signed);
-  if (OB_UNLIKELY(nullptr == row_ids || row_cap <= 0)) {
+  if (OB_UNLIKELY(!pd_row_id_ctx.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("Invalid arguments to get aggregate result", KR(ret), KP(row_ids), K(row_cap));
+    LOG_WARN("Invalid arguments to get aggregate result", KR(ret), K(pd_row_id_ctx));
   } else {
-    const bool is_reverse = row_cap > 1 && row_ids[1] < row_ids[0];
-    int64_t row_id_start = is_reverse ? row_ids[row_cap - 1] : row_ids[0];
-    if (integer_ctx.has_null_bitmap()) {
-      if (OB_FAIL(agg_cell.reserve_bitmap(row_cap))) {
-        LOG_WARN("Failed to reserve memory for null bitmap", KR(ret));
-      } else {
-        ObBitmap &null_bitmap = agg_cell.get_bitmap();
-        for (int64_t i = 0; OB_SUCC(ret) && i < row_cap; ++i) {
-          const int64_t row_id = is_reverse ? row_ids[row_cap - 1 - i] : row_ids[i];
-          if (ObCSDecodingUtil::test_bit(integer_ctx.null_bitmap_, row_id) &&
-              OB_FAIL(null_bitmap.set(i))) {
-            LOG_WARN("Fail to set null bitmap", KR(ret), K(i), K(row_id));
+    int64_t base_idx = 0;
+    const int64_t row_count = pd_row_id_ctx.get_row_count();
+    while (OB_SUCC(ret) && base_idx < row_count) {
+      int64_t row_id_start = pd_row_id_ctx.get_row_id(base_idx);
+      int64_t batch_size = MIN(AGGREGATE_STORE_BATCH_SIZE, row_count - base_idx);
+      if (integer_ctx.has_null_bitmap()) {
+        if (OB_FAIL(agg_cell.reserve_bitmap(batch_size))) {
+          LOG_WARN("Failed to reserve memory for null bitmap", KR(ret));
+        } else {
+          ObBitmap &null_bitmap = agg_cell.get_bitmap();
+          for (int64_t i = 0; OB_SUCC(ret) && i < batch_size; ++i) {
+            const int64_t row_id = pd_row_id_ctx.get_row_id(base_idx + i);
+            if (ObCSDecodingUtil::test_bit(integer_ctx.null_bitmap_, row_id) &&
+                OB_FAIL(null_bitmap.set(i))) {
+              LOG_WARN("Fail to set null bitmap", KR(ret), K(i), K(base_idx), K(row_id));
+            }
           }
         }
       }
-    }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(traverse_integer_in_agg(integer_ctx, is_col_signed, row_id_start, row_cap, agg_cell))){
-      LOG_WARN("Failed to traverse integer to aggregate", KR(ret), K(integer_ctx), K(is_col_signed));
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(traverse_integer_in_agg(integer_ctx, is_col_signed, row_id_start, batch_size, agg_cell))){
+        LOG_WARN("Failed to traverse integer to aggregate", KR(ret), K(integer_ctx), K(is_col_signed));
+      } else {
+        base_idx += batch_size;
+      }
     }
   }
   return ret;
@@ -776,7 +788,7 @@ int ObIntegerColumnDecoder::traverse_integer_in_agg(
     const bool is_col_signed,
     const int64_t row_start,
     const int64_t row_count,
-    storage::ObAggCell &agg_cell)
+    storage::ObAggCellBase &agg_cell)
 {
   int ret = OB_SUCCESS;
   const bool use_null_replace_val = ctx.is_null_replaced();
@@ -806,7 +818,7 @@ int ObIntegerColumnDecoder::traverse_integer_in_agg(
     // if agg_val less than base, no need to update min
     // if agg_val larger than RANGE_MAX_VALUE, no need to update max
   } else {
-    uint64_t result = 0;
+    uint64_t result = agg_cell.is_min_agg() ? UINT64_MAX : 0;
     bool result_is_null = false;
     if (use_null_replace_val) {
       const uint64_t null_replaced_val_base_diff = ctx.null_replaced_value_ - base_value;

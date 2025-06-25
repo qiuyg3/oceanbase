@@ -12,7 +12,7 @@ target_link_libraries(oblogsvr_test PUBLIC oceanbase)
 
 function(ob_unittest_clog case)
   ob_unittest(${ARGV})
-  target_link_libraries(${case} PRIVATE gtest gmock oblogsvr_test oceanbase)
+  target_link_libraries(${case} PRIVATE -static-libstdc++ gtest gmock oblogsvr_test oceanbase)
   set_tests_properties(${case} PROPERTIES TIMEOUT 600)
 endfunction()
 
@@ -39,5 +39,8 @@ ob_unittest_clog(test_ob_simple_log_arb_mock_ele test_ob_simple_log_arb_mock_ele
 ob_unittest_clog(test_ob_simple_log_flashback_arb test_ob_simple_log_flashback_arb.cpp)
 ob_unittest_clog(test_ob_simple_log_restart test_ob_simple_log_restart.cpp)
 ob_unittest_clog(test_ob_simple_log_disk_mgr test_ob_simple_log_disk_mgr.cpp)
+ob_unittest_clog(test_ob_simple_log_shared_storage test_ob_simple_log_shared_storage.cpp)
+#ob_unittest_clog(test_ob_simple_shared_log_garbage_collector test_ob_simple_shared_log_garbage_collector.cpp)
+#ob_unittest_clog(test_ob_simple_log_iterator_performance test_ob_simple_log_iterator_performance.cpp)
 ob_unittest_clog(test_ob_simple_log_cache test_ob_simple_log_cache.cpp)
 add_subdirectory(archiveservice)

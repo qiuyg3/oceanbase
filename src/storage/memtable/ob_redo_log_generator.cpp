@@ -11,14 +11,7 @@
  */
 
 #include "ob_redo_log_generator.h"
-#include "lib/utility/ob_tracepoint.h"
-#include "ob_memtable_key.h"
-#include "ob_memtable.h"
-#include "ob_memtable_data.h"
-#include "ob_memtable_context.h"
-#include "mvcc/ob_tx_callback_functor.h"
 #include "storage/tx/ob_trans_part_ctx.h"
-#include "storage/tablelock/ob_table_lock_callback.h"
 
 namespace oceanbase
 {
@@ -112,9 +105,6 @@ public:
     } else if (iter->is_logging_blocked()) {
       ret = OB_BLOCK_FROZEN;
       ctx_.last_log_blocked_memtable_ = static_cast<memtable::ObMemtable *>(iter->get_memtable());
-    } else if (OB_UNLIKELY(iter->get_freeze_clock() >= ctx_.freeze_clock_)) {
-      // when flush redo for frozen memtable, if memtable is active, should stop
-      ret = OB_BLOCK_FROZEN;
     } else {
       bool fake_fill = false;
       if (MutatorType::MUTATOR_ROW == iter->get_mutator_type()) {

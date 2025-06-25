@@ -15,6 +15,7 @@
 
 #include "storage/ob_i_store.h"
 #include "storage/blocksstable/ob_datum_range.h"
+#include "ob_sstable_index_filter.h"
 #include "common/ob_tablet_id.h"
 #include "share/ob_i_tablet_scan.h"
 #include "share/schema/ob_table_param.h"
@@ -46,11 +47,17 @@ public:
   ObTableIterParam();
   virtual ~ObTableIterParam();
   void reset();
-  bool is_valid() const;
+  OB_INLINE bool is_valid() const
+  {
+    return (OB_INVALID_ID != table_id_ || tablet_id_.is_valid()) // TODO: use tablet id replace table id
+        && OB_NOT_NULL(read_info_) && read_info_->is_valid()
+        && (nullptr == rowkey_read_info_ || rowkey_read_info_->is_valid());
+  }
   int refresh_lob_column_out_status();
-  bool enable_fuse_row_cache(const ObQueryFlag &query_flag) const;
+  bool enable_fuse_row_cache(const ObQueryFlag &query_flag, const StorageScanType scan_type) const;
   //temp solution
   int get_cg_column_param(const share::schema::ObColumnParam *&column_param) const;
+  int build_index_filter_for_row_store(common::ObIAllocator *allocator);
   const ObITableReadInfo *get_read_info(const bool is_get = false) const
   {
 	  return is_get ? rowkey_read_info_ : read_info_;
@@ -97,10 +104,6 @@ public:
   {
     return (read_info_ != nullptr) ? &read_info_->get_columns_desc() : nullptr;
   }
-  OB_INLINE const ObColDescIArray *get_rowkey_col_descs() const
-  {
-    return (rowkey_read_info_ != nullptr) ? &rowkey_read_info_->get_columns_desc() : nullptr;
-  }
   OB_INLINE bool read_with_same_schema() const
   {
     return is_same_schema_column_;
@@ -109,13 +112,22 @@ public:
   {
     return (read_info_ != nullptr && read_info_ != rowkey_read_info_) ? read_info_->get_group_idx_col_index() : common::OB_INVALID_INDEX;
   }
+  OB_INLINE int64_t get_mview_old_new_col_index() const
+  {
+    return (read_info_ != nullptr && read_info_ != rowkey_read_info_) ? read_info_->get_mview_old_new_col_index() : common::OB_INVALID_INDEX;
+  }
+  OB_INLINE bool need_truncate_filter() const
+  {
+    return (read_info_ != nullptr && read_info_ != rowkey_read_info_) ? read_info_->need_truncate_filter() : false;
+  }
   bool can_be_reused(const uint32_t cg_idx, const common::ObIArray<sql::ObExpr*> &exprs, const bool is_aggregate)
   {
+    const sql::ObExprPtrIArray *inner_exprs = is_aggregate ? aggregate_exprs_ : output_exprs_;
     bool can_reuse = cg_idx == cg_idx_ && enable_pd_aggregate() == is_aggregate
-                      && nullptr != output_exprs_ && output_exprs_->count() == exprs.count() ;
+                      && nullptr != inner_exprs && inner_exprs->count() == exprs.count() ;
     if (can_reuse) {
       for (int64_t i = 0; i < exprs.count(); ++i) {
-        if (output_exprs_->at(i) != exprs.at(i)) {
+        if (inner_exprs->at(i) != exprs.at(i)) {
           can_reuse = false;
           break;
         }
@@ -127,12 +139,22 @@ public:
   { return get_group_idx_col_index() != common::OB_INVALID_INDEX; }
   OB_INLINE int64_t get_ss_rowkey_prefix_cnt() const
   { return ss_rowkey_prefix_cnt_; }
+  OB_INLINE bool is_skip_scan() const
+  { return ss_rowkey_prefix_cnt_ > 0; }
   OB_INLINE void disable_blockscan()
-  { pd_storage_flag_.set_blockscan_pushdown(false); }
+  {
+    pd_storage_flag_.set_blockscan_pushdown(false);
+    is_delete_insert_ = false;
+  }
   OB_INLINE bool enable_pd_blockscan() const
   { return pd_storage_flag_.is_blockscan_pushdown(); }
   OB_INLINE bool enable_pd_filter() const
   { return pd_storage_flag_.is_filter_pushdown(); }
+  OB_INLINE void disable_pd_filter()
+  {
+    pd_storage_flag_.set_filter_pushdown(false);
+    is_delete_insert_ = false;
+  }
   OB_INLINE void disable_pd_aggregate()
   { pd_storage_flag_.set_aggregate_pushdown(false); }
   OB_INLINE bool enable_pd_aggregate() const // just indicate scalar agg
@@ -149,6 +171,8 @@ public:
   { pd_storage_flag_.set_use_stmt_iter_pool(true);}
   OB_INLINE bool has_lob_column_out() const
   { return has_lob_column_out_; }
+  OB_INLINE bool is_tablet_spliting() const
+  { return is_tablet_spliting_; }
   bool need_trans_info() const;
   OB_INLINE bool is_use_column_store() const
   { return !(get_read_info()->has_all_column_group()) || pd_storage_flag_.is_use_column_store(); }
@@ -164,17 +188,8 @@ public:
   { pd_storage_flag_.set_use_global_iter_pool(false); }
   OB_INLINE void set_tablet_handle(const ObTabletHandle *tablet_handle)
   { tablet_handle_ = tablet_handle; }
-  OB_INLINE bool use_uniform_format() const
-  {
-    return op_->enable_rich_format_ &&
-        (pd_storage_flag_.is_group_by_pushdown() || pd_storage_flag_.is_aggregate_pushdown());
-  }
   OB_INLINE bool use_new_format() const
-  {
-    return op_->enable_rich_format_ &&
-        !pd_storage_flag_.is_group_by_pushdown() &&
-        !pd_storage_flag_.is_aggregate_pushdown();
-  }
+  { return op_->enable_rich_format_; }
   OB_INLINE int64_t get_io_read_batch_size() const
   { return table_scan_opt_.io_read_batch_size_; }
   OB_INLINE int64_t get_io_read_gap_size() const
@@ -185,6 +200,7 @@ public:
 public:
   uint64_t table_id_;
   common::ObTabletID tablet_id_;
+  share::ObLSID ls_id_;
   uint32_t cg_idx_;
   const ObITableReadInfo *read_info_;
   const ObITableReadInfo *rowkey_read_info_;
@@ -215,10 +231,18 @@ public:
   bool has_lob_column_out_;
   bool is_for_foreign_check_;
   bool limit_prefetch_;
+  bool is_mds_query_;
   bool is_non_unique_local_index_;
   int64_t ss_rowkey_prefix_cnt_;
   sql::ObStoragePushdownFlag pd_storage_flag_;
   ObTableScanOption table_scan_opt_;
+  uint64_t auto_split_filter_type_;
+  const sql::ObExpr *auto_split_filter_;
+  sql::ExprFixedArray *auto_split_params_;
+  bool is_tablet_spliting_;
+  bool is_column_replica_table_;
+  bool is_delete_insert_;
+  const bool *need_update_tablet_param_;
 };
 
 struct ObTableAccessParam
@@ -229,18 +253,21 @@ public:
   void reset();
   OB_INLINE bool is_valid() const { return is_inited_ && iter_param_.is_valid(); }
   // used for query
-  int init(const ObTableScanParam &scan_param, const ObTabletHandle &tablet_handle);
-    // used for merge
+  int init(
+      const ObTableScanParam &scan_param,
+      const ObTabletHandle *tablet_handle,
+      const ObITableReadInfo *rowkey_read_info = nullptr);
+  // used for merge
   int init_merge_param(const uint64_t table_id,
                        const common::ObTabletID &tablet_id,
                        const ObITableReadInfo &read_info,
-                       const bool is_multi_version_merge = false);
+                       const bool is_multi_version_merge = false,
+                       const bool is_delete_insert = false);
   // used for get unique index conflict row
   int init_dml_access_param(const ObRelativeTable &table,
                             const ObITableReadInfo &rowkey_read_info,
                             const share::schema::ObTableSchemaParam &schema_param,
                             const common::ObIArray<int32_t> *out_cols_project);
-  int get_prefix_cnt_for_skip_scan(const ObTableScanParam &scan_param, ObTableIterParam &iter_param);
   // used for index back when query
   OB_INLINE int64_t get_out_col_cnt() const
   {
@@ -256,6 +283,9 @@ public:
   OB_INLINE void set_use_global_iter_pool() { iter_param_.set_use_global_iter_pool(); }
   OB_INLINE void diable_use_global_iter_pool() { iter_param_.diable_use_global_iter_pool(); }
   OB_INLINE bool is_use_global_iter_pool() const { return iter_param_.is_use_global_iter_pool(); }
+private:
+  int check_valid_before_query_init(const ObTableParam &table_param, const ObTabletHandle &tablet_handle);
+  int get_prefix_cnt_for_skip_scan(const ObTableScanParam &scan_param, ObTableIterParam &iter_param);
 public:
   DECLARE_TO_STRING;
 public:
@@ -277,6 +307,7 @@ public:
 
 //TODO @hanhui remove this func
 int set_row_scn(
+    const bool use_fuse_row_cache,
     const ObTableIterParam &iter_param,
     const blocksstable::ObDatumRow *store_row);
 

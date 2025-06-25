@@ -18,6 +18,7 @@
 #include "sql/engine/expr/ob_expr_operator.h"
 #include "sql/engine/expr/ob_i_expr_extra_info.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
+#include "sql/engine/expr/ob_expr_result_type_util.h"
 
 namespace oceanbase
 {
@@ -40,7 +41,7 @@ public:
   ObExprUDFInfo(common::ObIAllocator &alloc, ObExprOperatorType type)
       : ObIExprExtraInfo(alloc, type),
       subprogram_path_(alloc), params_type_(alloc), params_desc_(alloc), nocopy_params_(alloc),
-      dblink_id_(OB_INVALID_ID)
+      dblink_id_(OB_INVALID_ID), is_result_cache_(false), is_deterministic_(false)
   {
   }
 
@@ -63,6 +64,8 @@ public:
   bool is_udt_cons_;
   bool is_called_in_sql_;
   uint64_t dblink_id_;
+  bool is_result_cache_;
+  bool is_deterministic_;
 };
 class ObSqlCtx;
 class ObUDFParamDesc;
@@ -125,9 +128,9 @@ public:
     return subprogram_path_.assign(path);
   }
   inline void set_result_type(const ObExprResType &result_type) { result_type_ = result_type; }
-  inline int set_params_type(common::ObIArray<ObExprResType> &params_type)
+  inline int set_params_type(common::ObIArray<ObRawExprResType> &params_type)
   {
-    return params_type_.assign(params_type);
+    return ObExprResultTypeUtil::assign_type_array(params_type, params_type_);
   }
   inline int set_params_desc(common::ObIArray<ObUDFParamDesc> &params_desc)
   {
@@ -161,7 +164,7 @@ public:
                                 const common::ObIArray<ObUDFParamDesc> &params_desc,
                                 const common::ObIArray<ObExprResType> &params_type);
 
-  static int is_child_of(ObObj &parent, ObObj &child, bool &is_child);
+  static int is_child_of(const ObObj &parent, const ObObj &child, bool &is_child);
   static int process_singal_out_param(int64_t i,
                                       ObIArray<bool> &dones,
                                       const ObObj *objs_stack,
@@ -188,12 +191,13 @@ public:
                                 ObExecContext &exec_ctx);
   static int after_calc_result(share::schema::ObSchemaGetterGuard &schema_guard,
                                ObSqlCtx &sql_ctx, ObExecContext &exec_ctx);
-  static bool need_deep_copy_in_parameter(
-                        const common::ObObj *objs_stack,
-                        int64_t param_num,
-                        const common::ObIArray<ObUDFParamDesc> &params_desc,
-                        const common::ObIArray<ObExprResType> &params_type,
-                        const common::ObObj &element);
+  static int need_deep_copy_in_parameter(const ObObj *objs_stack,
+                                          int64_t param_num,
+                                          const ObIArray<ObUDFParamDesc> &params_desc,
+                                          const ObIArray<ObExprResType> &params_type,
+                                          const ObObj &element,
+                                          bool &need_deep_copy);
+  static int extract_allocator_and_restore_obj(const ObObj &obj, ObObj &new_obj, ObIAllocator *&composite_alloc);
   int64_t get_udf_id() const { return udf_id_;}
   int64_t get_udf_package_id() const { return udf_package_id_;}
   const common::ObIArray<int64_t> &get_subprogram_path() const { return subprogram_path_;}

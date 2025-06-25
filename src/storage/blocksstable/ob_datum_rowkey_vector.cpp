@@ -12,6 +12,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_datum_rowkey_vector.h"
+#include "ob_imicro_block_reader.h"
 
 namespace oceanbase
 {
@@ -131,7 +132,6 @@ int ObColumnVector::inner_locate_key<ObStorageDatum>(
       end = begin;
     }
   }
-  LOG_TRACE("inner locate key", K(ret), K(need_upper_bound), K(begin), K(end), K(key), K(is_oracle_mode), KPC(this));
   return ret;
 }
 
@@ -161,7 +161,6 @@ int ObColumnVector::inner_locate_key<int64_t>(
     LOG_WARN("Failed to locate integer key", K(ret), K(need_upper_bound),
              K(begin), K(end), K(key));
   }
-  LOG_TRACE("inner locate key", K(ret), K(need_upper_bound), K(begin), K(end), K(key), K(is_oracle_mode), KPC(this));
   return ret;
 }
 
@@ -189,7 +188,6 @@ int ObColumnVector::inner_locate_key<uint64_t>(
   } else if (OB_FAIL(locate_integer_key(need_upper_bound, begin, end, unsigned_ints_, key.get_uint()))) {
     LOG_WARN("Failed to locate integer key", K(ret), K(need_upper_bound), K(begin), K(end), K(key));
   }
-  LOG_TRACE("inner locate key", K(ret), K(need_upper_bound), K(begin), K(end), K(key), K(is_oracle_mode), KPC(this));
   return ret;
 }
 
@@ -554,10 +552,6 @@ int ObRowkeyVector::locate_range(
     LOG_WARN("Failed to locate start key", K(ret));
   } else if (row_cnt_ == end_idx) {
     end_idx--;
-  }
-  if (OB_SUCC(ret)) {
-    LOG_TRACE("Locate range in index block by rowkey vector", K(ret), K(range),
-              K(begin_idx), K(end_idx), K(is_left_border), K(is_right_border), KPC(this));
   }
   return ret;
 }
@@ -1002,19 +996,19 @@ int ObRowkeyVector::deep_copy(
 int ObRowkeyVector::get_occupied_size(
     const int64_t row_cnt,
     const int64_t col_cnt,
-    const ObIArray<share::schema::ObColDesc> *col_descs,
+    const storage::ObITableReadInfo *table_read_info,
     int64_t &size)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(nullptr != col_descs &&
-      col_cnt > col_descs->count())) {
+  if (OB_UNLIKELY(nullptr != table_read_info &&
+      col_cnt > table_read_info->get_rowkey_count())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("Unexpected rowkey count", K(ret), K(col_cnt), K(col_descs->count()));
+    LOG_WARN("Unexpected rowkey count", K(ret), K(col_cnt), K(table_read_info->get_rowkey_count()));
   } else {
     size = 0;
     size += sizeof(ObRowkeyVector);
     size += col_cnt * sizeof(ObColumnVector);
-    if (is_all_integer_cols(col_cnt, col_descs)) {
+    if (is_all_integer_cols(col_cnt, table_read_info)) {
       size += col_cnt * row_cnt * (sizeof(int64_t) + sizeof(bool));
     } else {
       size += col_cnt * row_cnt * sizeof(ObStorageDatum);
@@ -1029,7 +1023,7 @@ int ObRowkeyVector::get_occupied_size(
 int ObRowkeyVector::construct_rowkey_vector(
     const int64_t row_cnt,
     const int64_t col_cnt,
-    const ObIArray<share::schema::ObColDesc> *col_descs,
+    const storage::ObITableReadInfo *table_read_info,
     char *buf,
     int64_t &pos,
     const int64_t buf_size,
@@ -1042,17 +1036,25 @@ int ObRowkeyVector::construct_rowkey_vector(
     LOG_WARN("Invalid buf", K(ret), KP(buf), K(buf_size), K(pos), K(sizeof(ObRowkeyVector)),
              K(sizeof(ObColumnVector)), K(col_cnt));
   } else {
+    ObObjMeta multi_version_col_meta_type;
+    multi_version_col_meta_type.set_int();
     ObRowkeyVector * tmp_rowkey_vector = new (buf + pos) ObRowkeyVector();
     tmp_rowkey_vector->col_cnt_ = col_cnt;
     tmp_rowkey_vector->row_cnt_ = row_cnt;
     pos += sizeof(ObRowkeyVector);
     tmp_rowkey_vector->columns_ = new (buf + pos) ObColumnVector[col_cnt];
     pos += sizeof(ObColumnVector) * col_cnt;
-    const bool all_cols_is_integer = is_all_integer_cols(col_cnt, col_descs);
+    const bool all_cols_is_integer = is_all_integer_cols(col_cnt, table_read_info);
     const ObObjMeta *obj_meta = nullptr;
     for (int64_t col_idx = 0; OB_SUCC(ret) && col_idx < col_cnt; ++col_idx) {
       ObColumnVector &vector = tmp_rowkey_vector->columns_[col_idx];
-      obj_meta = all_cols_is_integer ? &col_descs->at(col_idx).col_type_ : nullptr;
+      if (nullptr == table_read_info || !all_cols_is_integer) {
+        obj_meta = nullptr;
+      } else if (col_idx < table_read_info->get_schema_rowkey_count()) {
+        obj_meta = &table_read_info->get_columns_desc().at(col_idx).col_type_;
+      } else {
+        obj_meta = &multi_version_col_meta_type;
+      }
       if (OB_FAIL(ObColumnVector::construct_column_vector(buf, pos, buf_size, row_cnt, obj_meta, vector))) {
         LOG_WARN("Failed to construct column vector", K(ret), K(col_idx), KPC(obj_meta));
       }
@@ -1101,13 +1103,13 @@ int ObRowkeyVector::prepare_rowkeys_buffer(
   return ret;
 }
 
-bool ObRowkeyVector::is_all_integer_cols(const int64_t col_cnt, const ObIArray<share::schema::ObColDesc> *col_descs)
+bool ObRowkeyVector::is_all_integer_cols(const int64_t col_cnt, const storage::ObITableReadInfo *table_read_info)
 {
   bool is_all_integer_cols = false;
-  if (nullptr != col_descs) {
+  if (nullptr != table_read_info) {
     is_all_integer_cols = true;
-    for (int64_t col_idx = 0; is_all_integer_cols && col_idx < col_cnt; ++col_idx) {
-      is_all_integer_cols = col_descs->at(col_idx).col_type_.is_integer_type();
+    for (int64_t col_idx = 0; is_all_integer_cols && col_idx < table_read_info->get_schema_rowkey_count(); ++col_idx) {
+      is_all_integer_cols = table_read_info->get_columns_desc().at(col_idx).col_type_.is_integer_type();
     }
   }
   return is_all_integer_cols;

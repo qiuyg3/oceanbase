@@ -42,6 +42,7 @@
 #include "share/schema/ob_directory_sql_service.h"
 #include "share/schema/ob_context_sql_service.h"
 #include "share/schema/ob_rls_sql_service.h"
+#include "share/schema/ob_catalog_sql_service.h"
 #ifdef OB_BUILD_TDE_SECURITY
 #include "share/ob_master_key_getter.h"
 #endif
@@ -132,15 +133,23 @@ public:
   GET_DDL_SQL_SERVICE_FUNC(Directory, directory)
   GET_DDL_SQL_SERVICE_FUNC(Context, context)
   GET_DDL_SQL_SERVICE_FUNC(Rls, rls)
+  GET_DDL_SQL_SERVICE_FUNC(Catalog, catalog)
 
   /* sequence_id related */
-  virtual int init_sequence_id(const int64_t rootservice_epoch);
+  virtual int init_sequence_id_by_rs_epoch(const int64_t rootservice_epoch); // for compatible use
+  virtual int init_sequence_id_by_sys_leader_epoch(const int64_t sys_leader_epoch);
   virtual int inc_sequence_id();
-  virtual uint64_t get_sequence_id() { SpinRLockGuard guard(rw_lock_); return sequence_id_;}
+
+  virtual ObDDLSequenceID get_sequence_id() const { SpinRLockGuard guard(rw_lock_); return sequence_id_; }
 
   virtual int get_refresh_schema_info(ObRefreshSchemaInfo &schema_info);
   //enable refresh schema info
   virtual int set_refresh_schema_info(const ObRefreshSchemaInfo &schema_info);
+
+#ifdef OB_BUILD_SHARED_STORAGE
+  // get schema of __all_sslog_table
+  virtual int get_sslog_table_schema(ObTableSchema &table_schema);
+#endif
 
   // get schema of __all_core_table
   virtual int get_all_core_table_schema(ObTableSchema &table_schema);
@@ -203,6 +212,7 @@ public:
   GET_ALL_SCHEMA_FUNC_DECLARE(database, ObSimpleDatabaseSchema);
   GET_ALL_SCHEMA_WITH_ALLOCATOR_FUNC_DECLARE(table, ObSimpleTableSchemaV2);
   GET_ALL_SCHEMA_FUNC_DECLARE(tablegroup, ObSimpleTablegroupSchema);
+  GET_ALL_SCHEMA_FUNC_DECLARE(catalog_priv, ObCatalogPriv);
   GET_ALL_SCHEMA_FUNC_DECLARE(db_priv, ObDBPriv);
   GET_ALL_SCHEMA_FUNC_DECLARE(table_priv, ObTablePriv);
   GET_ALL_SCHEMA_FUNC_DECLARE(routine_priv, ObRoutinePriv);
@@ -232,6 +242,7 @@ public:
   GET_ALL_SCHEMA_FUNC_DECLARE(rls_policy, ObRlsPolicySchema);
   GET_ALL_SCHEMA_FUNC_DECLARE(rls_group, ObRlsGroupSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE(rls_context, ObRlsContextSchema);
+  GET_ALL_SCHEMA_FUNC_DECLARE(catalog, ObCatalogSchema);
 
   //get tenant increment schema operation between (base_version, new_schema_version]
   virtual int get_increment_schema_operations(const ObRefreshSchemaStatus &schema_status,
@@ -315,6 +326,7 @@ public:
   virtual int fetch_new_rls_group_id(const uint64_t tenant_id, uint64_t &new_rls_group_id);
   virtual int fetch_new_rls_context_id(const uint64_t tenant_id, uint64_t &new_rls_context_id);
   virtual int fetch_new_priv_id(const uint64_t tenant_id, uint64_t &new_priv_id);
+  virtual int fetch_new_catalog_id(const uint64_t tenant_id, uint64_t &new_catalog_id);
 //  virtual int insert_sys_param(const ObSysParam &sys_param,
 //                               common::ObISQLClient *sql_client);
 
@@ -347,6 +359,7 @@ public:
   GET_BATCH_SCHEMAS_FUNC_DECLARE(database, ObSimpleDatabaseSchema);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(tablegroup, ObSimpleTablegroupSchema);
   GET_BATCH_SCHEMAS_WITH_ALLOCATOR_FUNC_DECLARE(table, ObSimpleTableSchemaV2);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE(catalog_priv, ObCatalogPriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(db_priv, ObDBPriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(table_priv, ObTablePriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(routine_priv, ObRoutinePriv);
@@ -379,6 +392,7 @@ public:
   GET_BATCH_SCHEMAS_FUNC_DECLARE(rls_policy, ObRlsPolicySchema);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(rls_group, ObRlsGroupSchema);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(rls_context, ObRlsContextSchema);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE(catalog, ObCatalogSchema);
 
   //batch will split big query into batch query, each time MAX_IN_QUERY_PER_TIME
   //get_batch_xxx_schema will call fetch_all_xxx_schema
@@ -439,6 +453,7 @@ public:
   FETCH_SCHEMAS_FUNC_DECLARE(database, ObSimpleDatabaseSchema);
   FETCH_SCHEMAS_WITH_ALLOCATOR_FUNC_DECLARE(table, ObSimpleTableSchemaV2);
   FETCH_SCHEMAS_FUNC_DECLARE(tablegroup, ObSimpleTablegroupSchema);
+  FETCH_SCHEMAS_FUNC_DECLARE(catalog_priv, ObCatalogPriv);
   FETCH_SCHEMAS_FUNC_DECLARE(db_priv, ObDBPriv);
   FETCH_SCHEMAS_FUNC_DECLARE(table_priv, ObTablePriv);
   FETCH_SCHEMAS_FUNC_DECLARE(routine_priv, ObRoutinePriv);
@@ -469,6 +484,7 @@ public:
   FETCH_SCHEMAS_FUNC_DECLARE(rls_policy, ObRlsPolicySchema);
   FETCH_SCHEMAS_FUNC_DECLARE(rls_group, ObRlsGroupSchema);
   FETCH_SCHEMAS_FUNC_DECLARE(rls_context, ObRlsContextSchema);
+  FETCH_SCHEMAS_FUNC_DECLARE(catalog, ObCatalogSchema);
 
   int fetch_mock_fk_parent_table_column_info(
       const ObRefreshSchemaStatus &schema_status,
@@ -822,6 +838,19 @@ public:
               const uint64_t owner_id,
               common::ObIArray<ObSAuditSchema> &audit_schemas) override;
 
+  virtual int get_table_index_infos(
+              common::ObIAllocator &allocator,
+              common::ObISQLClient &sql_client,
+              const uint64_t tenant_id,
+              const uint64_t database_id,
+              const uint64_t data_table_id,
+              common::ObIArray<ObIndexSchemaInfo> &index_infos) override;
+
+  virtual bool schema_name_is_equal(
+               const ObString &src,
+               const ObString &dst,
+               const bool case_compare,
+               const bool compare_with_collation) override;
   /*----------- interfaces for latest schema end -------------*/
 
 private:
@@ -1075,13 +1104,13 @@ private:
                                                       common::ObArray<ObSimpleTableSchemaV2 *> &table_schema_array,
                                                       const uint64_t *table_ids,
                                                       const int64_t table_ids_size);
-
+  template <typename T>
   int fetch_trigger_list(const ObRefreshSchemaStatus &schema_status,
                          const uint64_t tenant_id,
                          const uint64_t table_id,
                          const int64_t schema_version,
                          common::ObISQLClient &sql_client,
-                         ObTableSchema &table_schema);
+                         T &schema);
 
   int fetch_rls_object_list(const ObRefreshSchemaStatus &schema_status,
                             const uint64_t tenant_id,
@@ -1238,11 +1267,6 @@ private:
       const bool compare_with_collation,
       uint64_t &schema_id);
 
-  bool schema_name_is_equal_(
-       const ObString &src,
-       const ObString &dst,
-       const bool case_compare,
-       const bool compare_with_collation);
 
   int fetch_table_latest_schema_versions_(
       common::ObISQLClient &sql_client,
@@ -1306,7 +1330,6 @@ private:
 
   common::SpinRWLock rw_lock_;
   uint64_t last_operation_tenant_id_;
-  uint64_t sequence_id_;
   ObRefreshSchemaInfo schema_info_;
 
   ObSysVariableSqlService sys_variable_service_;
@@ -1314,6 +1337,7 @@ private:
   ObDirectorySqlService directory_service_;
   ObContextSqlService context_service_;
   ObRlsSqlService rls_service_;
+  ObCatalogSqlService catalog_service_;
 
   ObClusterSchemaStatus cluster_schema_status_;
   common::hash::ObHashMap<uint64_t, int64_t, common::hash::NoPthreadDefendMode> gen_schema_version_map_;
@@ -1322,6 +1346,8 @@ private:
   lib::ObMutex object_ids_mutex_;
   lib::ObMutex normal_tablet_ids_mutex_;
   lib::ObMutex extended_tablet_ids_mutex_;
+
+  ObDDLSequenceID sequence_id_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSchemaServiceSQLImpl);
 };

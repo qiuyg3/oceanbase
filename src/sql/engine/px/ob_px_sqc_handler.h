@@ -65,7 +65,8 @@ public:
     end_ret_(OB_SUCCESS), reference_count_(1), notifier_(nullptr), exec_ctx_(nullptr),
     des_phy_plan_(nullptr), sqc_init_args_(nullptr), sub_coord_(nullptr), rpc_level_(INT32_MAX),
     node_sequence_id_(0), has_interrupted_(false),
-    part_ranges_spin_lock_(common::ObLatchIds::PX_TENANT_TARGET_LOCK) {
+    part_ranges_spin_lock_(common::ObLatchIds::PX_TENANT_TARGET_LOCK),
+    is_session_query_locked_(false) {
   }
   ~ObPxSqcHandler() = default;
   static constexpr const char *OP_LABEL = ObModIds::ObModIds::OB_SQL_SQC_HANDLER;
@@ -100,7 +101,7 @@ public:
   ObPxSubCoord &get_sub_coord() { return *sub_coord_; }
   ObPxSQCProxy &get_sqc_proxy() { return sub_coord_->get_sqc_proxy(); }
   ObSqcCtx &get_sqc_ctx() { return sub_coord_->get_sqc_ctx(); }
-  int64_t get_ddl_context_id() const { return sub_coord_->get_ddl_context_id(); }
+  const ObDDLCtrl &get_ddl_control() { return sub_coord_->get_ddl_control(); }
   trace::FltTransCtx &get_flt_ctx() { return flt_ctx_; }
   ObPxWorkNotifier &get_notifier() { return *notifier_; }
   int worker_end_hook();
@@ -164,6 +165,7 @@ private:
   bool has_interrupted_;
   Ob2DArray<ObPxTabletRange> part_ranges_;
   SpinRWLock part_ranges_spin_lock_;
+  bool is_session_query_locked_;
 };
 
 }

@@ -32,10 +32,17 @@ public:
   void reset();
 
   // append_callback will append your callback into the callback list
+  int append_callback(ObITransCallback *head,
+                      ObITransCallback *tail,
+                      const int64_t length,
+                      const bool for_replay,
+                      const bool parallel_replay = false,
+                      const bool serial_final = false);
   int append_callback(ObITransCallback *callback,
                       const bool for_replay,
                       const bool parallel_replay = false,
                       const bool serial_final = false);
+
 
   // concat_callbacks will append all callbacks in other into itself and reset
   // other. And it will return the concat number during concat_callbacks.
@@ -104,6 +111,9 @@ public:
   // lock after proposing the commit log and even before the commit log
   // successfully synced for single ls txn.
   int tx_elr_preparing();
+
+  // tx_elr_revoke will clear elr flag on TransNode
+  int tx_elr_revoke();
 
   // tx_print_callback will simply print all calbacks.
   int tx_print_callback();
@@ -189,6 +199,10 @@ public:
   share::SCN get_checksum_scn() const { return checksum_scn_; }
   void get_checksum_and_scn(uint64_t &checksum, share::SCN &checksum_scn);
   void update_checksum(const uint64_t checksum, const share::SCN checksum_scn);
+  void inc_update_checksum_scn(const share::SCN checksum_scn)
+  {
+    checksum_scn_.inc_update(checksum_scn);
+  }
   void inc_update_sync_scn(const share::SCN scn);
   transaction::ObPartTransCtx *get_trans_ctx() const;
   bool pending_log_too_large(const int64_t limit) const
@@ -207,10 +221,13 @@ public:
   }
   DECLARE_TO_STRING;
 private:
+  void set_log_cursor_(ObITransCallback *log_cursor);
+private:
   const int16_t id_;
   // callback list sentinel
   ObITransCallback head_;
   ObITransCallback *log_cursor_;
+  int64_t log_epoch_;
   ObITransCallback *parallel_start_pos_;
   int64_t length_;
   // stats

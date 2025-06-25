@@ -75,6 +75,7 @@ public:
   share::schema::ObSchemaGetterGuard *get_schema_guard() { return schema_mgr_; }
   // need satifing each priv in stmt_need_privs
   int check_priv(const share::schema::ObSessionPrivInfo &session_priv,
+                 const common::ObIArray<uint64_t> &enable_role_id_array,
                  const share::schema::ObStmtNeedPrivs &stmt_need_privs) const;
 
   int check_ora_priv(const uint64_t tenant_id,
@@ -83,12 +84,20 @@ public:
                      const ObIArray<uint64_t> &role_id_array) const;
   // need satifing one of stmt_need_privs
   int check_priv_or(const share::schema::ObSessionPrivInfo &session_priv,
+                    const common::ObIArray<uint64_t> &enable_role_id_array,
                     const share::schema::ObStmtNeedPrivs &stmt_need_privs);
 
   int check_db_access(share::schema::ObSessionPrivInfo &s_priv,
+                      const common::ObIArray<uint64_t> &enable_role_id_array,
+                      const common::ObString &database_name) const;
+  int check_db_access(share::schema::ObSessionPrivInfo &s_priv,
+                      const common::ObIArray<uint64_t> &enable_role_id_array,
+                      const uint64_t catalog_id,
                       const common::ObString &database_name) const;
 
   int check_table_show(const share::schema::ObSessionPrivInfo &s_priv,
+                       const common::ObIArray<uint64_t> &enable_role_id_array,
+                       const uint64_t catalog_id,
                        const common:: ObString &db,
                        const common::ObString &table,
                        bool &allow_show) const;
@@ -97,21 +106,25 @@ public:
                          const common::ObString &routine,
                          bool &allow_show) const;
   int check_trigger_show(const share::schema::ObSessionPrivInfo &s_priv,
+                         const common::ObIArray<uint64_t> &enable_role_id_array,
                          const common::ObString &db,
                          const common::ObString &trigger,
-                         bool &allow_show) const;
+                         bool &allow_show,
+                         const ObString &table) const;
   int check_column_exists(const uint64_t tenant_id, const uint64_t table_id,
                           const common::ObString &column_name,
                           bool &is_exist,
                           bool is_link = false);
   int check_column_exists(const uint64_t tenant_id, uint64_t table_id, uint64_t column_id, bool &is_exist, bool is_link = false);
   int check_table_or_index_exists(const uint64_t tenant_id,
+                                  const uint64_t catalog_id,
                                   const uint64_t database_id,
                                   const common::ObString &table_name,
                                   const bool with_hidden_flag,
                                   const bool is_built_in_index,
                                   bool &is_exist);
   int check_table_exists(const uint64_t tenant_id,
+                         const uint64_t catalog_id,
                          const uint64_t database_id,
                          const common::ObString &table_name,
                          const bool is_index,
@@ -120,12 +133,13 @@ public:
                          const bool is_built_in_index = false);
   //int check_table_exists(uint64_t table_id, bool &is_exist) const;
   int check_table_exists(const uint64_t tenant_id,
-                        const common::ObString &database_name,
-                        const common::ObString &table_name,
-                        const bool is_index_table,
-                        const bool with_hidden_flag,
-                        bool &is_exist,
-                        const bool is_built_in_index = false);
+                         const common::ObString &database_name,
+                         const common::ObString &table_name,
+                         const bool is_index_table,
+                         const bool with_hidden_flag,
+                         bool &is_exist,
+                         const bool is_built_in_index = false,
+                         const uint64_t catalog_id = OB_INTERNAL_CATALOG_ID); // to many place used this function, assign default catalog_id
 
   // mock_fk_parent_table begin
   int get_mock_fk_parent_table_with_name(
@@ -143,9 +157,17 @@ public:
   //int get_database_name(const uint64_t tenant_id,
   //                      const uint64_t database_id,
   //                      common::ObString &database_name) const;
+
+  int get_database_id(const uint64_t tenant_id, const common::ObString &database_name, uint64_t &database_id) const;
   int get_database_id(const uint64_t tenant_id,
+                      const uint64_t catalog_id,
                       const common::ObString &database_name,
                       uint64_t &database_id) const;
+  int get_catalog_id_name(const uint64_t tenant_id,
+                          common::ObString &catalog_name,
+                          uint64_t &catalog_id,
+                          ObIAllocator *allocator = NULL,
+                          bool allow_not_exist = false) const;
   //int get_local_table_id(const uint64_t tenant_id,
   //                       const uint64_t database_id,
   //                       const common::ObString &table_name,
@@ -184,7 +206,18 @@ public:
                        const common::ObString &database_name,
                        const common::ObString &table_name,
                        const bool is_index_table,
-                       const share::schema::ObTableSchema *&table_schema);
+                       const share::schema::ObTableSchema *&table_schema,
+                       const bool with_hidden_flag = false,
+                       const bool is_built_in_index = false);
+  int get_table_schema(const uint64_t tenant_id,
+                       const uint64_t catalog_id,
+                       const uint64_t database_id,
+                       const common::ObString &table_name,
+                       const bool is_index_table,
+                       const bool cte_table_fisrt,
+                       const bool with_hidden_flag,
+                       const share::schema::ObTableSchema *&table_schema,
+                       const bool is_built_in_index = false);
   int get_table_schema(const uint64_t tenant_id,
                        const uint64_t database_id,
                        const common::ObString &table_name,
@@ -425,6 +458,10 @@ public:
   int get_profile_id(const uint64_t tenant_id,
                      const common::ObString &profile_name,
                      uint64_t &profile_id);
+  int get_object_id_by_name(const uint64_t tenant_id,
+                            uint64_t database_id,
+                            const common::ObString &object_name,
+                            uint64_t &object_id);
   int check_exist_same_name_object_with_synonym(const uint64_t tenant_id,
                                                 uint64_t database_id,
                                                 const common::ObString &object_name,
@@ -439,7 +476,8 @@ public:
                       bool is_directory,
                       bool explicit_db,
                       const common::ObString &prev_table_name,
-                      ObSynonymChecker &synonym_checker);
+                      ObSynonymChecker &synonym_checker,
+                      bool is_catalog = false);
   int get_object_type_with_view_info(common::ObIAllocator* allocator,
                                      void* param,
                                      const uint64_t tenant_id,
@@ -452,7 +490,8 @@ public:
                                      common::ObString &object_db_name,
                                      bool explicit_db,
                                      const common::ObString &prev_table_name,
-                                     ObSynonymChecker &synonym_checker);
+                                     ObSynonymChecker &synonym_checker,
+                                     bool is_catalog = false);
   int check_access_to_obj(const uint64_t tenant_id,
                           const uint64_t user_id,
                           const uint64_t obj_id,
@@ -536,7 +575,8 @@ int flatten_udt_attributes(const uint64_t tenant_id,
                            ObString &qualified_name,
                            int64_t &schema_version,
                            ObIArray<ObString> &udt_qualified_names);
-  int get_udt_attribute_id(const uint64_t udt_id, const ObString &attr_name, uint64_t &attr_id, uint64_t &attr_pos);
+  int get_udt_attribute_id(const uint64_t udt_id, const ObString &attr_name, uint64_t &attr_id,
+                           uint64_t &attr_pos, int64_t &schema_version);
 
 
   int remove_tmp_cte_schemas(const ObString& cte_table_name);

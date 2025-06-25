@@ -12,7 +12,6 @@
 
 #define USING_LOG_PREFIX SHARE
 #include "share/ob_tablet_autoincrement_param.h"
-#include "share/schema/ob_table_param.h"
 
 namespace oceanbase
 {
@@ -200,7 +199,7 @@ bool ObTabletAutoincSeq::is_valid() const
   return 0 != intervals_count_ && nullptr != intervals_;
 }
 
-int ObTabletAutoincSeq::get_autoinc_seq_value(uint64_t &autoinc_seq)
+int ObTabletAutoincSeq::get_autoinc_seq_value(uint64_t &autoinc_seq) const
 {
   int ret = OB_SUCCESS;
   if (0 == intervals_count_) {

@@ -50,7 +50,6 @@ public:
   ~ObBitVectorImpl() = default;
   inline static int64_t word_count(const int64_t size);
   inline static int64_t memory_size(const int64_t size);
-  inline static int64_t byte_count(const int64_t size);
   // The unit of "size" is bit.
   void init(const int64_t size) { MEMSET(data_, 0, memory_size(size)); }
   void reset(const int64_t size) { init(size); }
@@ -63,7 +62,12 @@ public:
     MEMCPY(data_, src.data_, byte_count(size));
   }
   inline void set(const int64_t idx);
+  OB_INLINE void atomic_set(const int64_t idx);
   inline void unset(const int64_t idx);
+  OB_INLINE WordType *align_at(const int64_t idx)
+  {
+    return &data_[idx / WORD_BITS];
+  }
     // at(i) |= v;
   inline void bit_or_assign(const int64_t idx, const bool v);
 
@@ -137,6 +141,7 @@ public:
   inline void deep_copy(const ObBitVectorImpl<WordType> &src, const int64_t start_idx, const int64_t end_idx);
 
   inline void bit_or(const ObBitVectorImpl<WordType> &src, const int64_t start_idx, const int64_t end_idx);
+  inline void bit_or(const ObBitVectorImpl<WordType> &src, const EvalBound &bound);
 
 
   // You should known how ObBitVectorImpl<WordType> implemented, when reinterpret data.
@@ -175,6 +180,7 @@ private:
   template <typename OP>
   static OB_INLINE int inner_foreach_one_word(const WordType &s_word, const int64_t step_size,
                                               int64_t &step, OP op);
+  inline static int64_t byte_count(const int64_t size);
 
 public:
   WordType data_[0];
@@ -232,6 +238,18 @@ inline void ObBitVectorImpl<WordType>::set(const int64_t idx)
 {
   OB_ASSERT(idx >= 0);
   data_[idx / WORD_BITS] |= 1LU << (idx % WORD_BITS);
+}
+
+template<typename WordType>
+OB_INLINE void ObBitVectorImpl<WordType>::atomic_set(const int64_t idx)
+{
+  OB_ASSERT(idx >= 0);
+  WordType val = data_[idx / WORD_BITS];
+  WordType new_val = val | (1LU << (idx % WORD_BITS));
+  while (!ATOMIC_BCAS(&data_[idx / WORD_BITS], val, new_val)) {
+    val = ATOMIC_LOAD(&data_[idx / WORD_BITS]);
+    new_val = val | (1LU << (idx % WORD_BITS));
+  }
 }
 
 template<typename WordType>
@@ -300,14 +318,15 @@ OB_INLINE bool ObBitVectorImpl<WordType>::bit_op_zero(const ObBitVectorImpl<Word
 
   if (start_cnt == end_cnt) {
     WordType only_mask = start_mask & end_mask;
-    passed = 0 == (op(l.data_[start_cnt], r.data_[start_cnt]) & only_mask);
+    passed = 0 == (op(l.data_[start_cnt] & only_mask, r.data_[start_cnt] & only_mask) & only_mask);
   } else {
-    passed = 0 == (op(l.data_[start_cnt], r.data_[start_cnt]) & start_mask);
+    passed =
+      0 == (op(l.data_[start_cnt] & start_mask, r.data_[start_cnt] & start_mask) & start_mask);
     for (int64_t i = start_cnt + 1; passed && i < end_cnt; i++) {
       passed = 0 == (op(l.data_[i], r.data_[i]));
     }
     if (passed && end_mask > 0) {
-      passed = 0 == (op(l.data_[end_cnt], r.data_[end_cnt]) & end_mask);
+      passed = 0 == (op(l.data_[end_cnt] & end_mask, r.data_[end_cnt] & end_mask) & end_mask);
     }
   }
   return passed;
@@ -641,6 +660,12 @@ inline void ObBitVectorImpl<WordType>::bit_or(const ObBitVectorImpl<WordType> &s
       data_[end_cnt] |= src_data[end_cnt] & end_mask;
     }
   }
+}
+
+template<typename WordType>
+inline void ObBitVectorImpl<WordType>::bit_or(const ObBitVectorImpl<WordType> &src, const EvalBound &bound)
+{
+  bit_or(src, bound.start(), bound.end());
 }
 
 template <typename WordType>

@@ -14,7 +14,6 @@
 
 #include "sql/engine/set/ob_hash_set_vec_op.h"
 #include "sql/engine/px/ob_px_util.h"
-#include "sql/engine/basic/ob_hp_infras_vec_op.h"
 
 namespace oceanbase
 {
@@ -152,7 +151,9 @@ int ObHashSetVecOp::build_hash_table_from_left_batch(bool from_child, const int6
       } else if (OB_FAIL(hp_infras_.calc_hash_value_for_batch(
                         static_cast<const ObHashSetVecSpec &>
                             (get_spec()).set_exprs_,
-                        *left_brs,
+                        *left_brs->skip_,
+                        left_brs->size_,
+                        false /* all_rows_active */,
                         hash_values_for_batch_))) {
         LOG_WARN("failed to calc hash value for batch", K(ret));
       } else if (OB_FAIL(hp_infras_.insert_row_for_batch(static_cast<const ObHashSetVecSpec &>
@@ -289,8 +290,8 @@ int ObHashSetVecOp::convert_vector(const common::ObIArray<ObExpr*> &src_exprs,
             MEMCPY(dst, src, child_brs->size_ * sizeof(ObDatum));
           }
           OZ(to->init_vector(eval_ctx_, VEC_UNIFORM, child_brs->size_));
-        } else {
-          to_vec_header = from_vec_header;
+        } else if (OB_FAIL(to_vec_header.assign(from_vec_header))) {
+          LOG_WARN("assign vector header failed", K(ret));
         }
         // init eval info
         if (OB_SUCC(ret)) {

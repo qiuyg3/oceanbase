@@ -28,6 +28,7 @@ public:
       is_inited_(false),
       is_reverse_scan_(false),
       is_new_range_(false),
+      is_padding_mode_(false),
       sstable_row_cnt_(OB_INVALID_CS_ROW_ID),
       current_(OB_INVALID_CS_ROW_ID),
       query_index_range_(),
@@ -66,18 +67,21 @@ public:
   }
   virtual ObCGIterType get_type() override
   { return OB_CG_SCANNER; }
+  OB_INLINE bool is_padding_mode() const
+  { return is_padding_mode_; }
   static bool can_skip_filter(const sql::ObPushdownFilterExecutor &parent,
                               const ObCGBitmap &parent_bitmap,
                               const ObCSRange &row_range);
   int get_next_valid_block(sql::ObPushdownFilterExecutor *parent,
+                           sql::PushdownFilterInfo &filter_info,
                            const ObCGBitmap *parent_bitmap,
                            ObCGBitmap &result_bitmap);
   int build_index_filter(sql::ObPushdownFilterExecutor &filter);
-  TO_STRING_KV(K_(is_inited), K_(is_reverse_scan), K_(is_new_range), K_(current),
+  virtual int get_current_row_id(ObCSRowId& current_row_id) const override final { current_row_id = current_; return OB_SUCCESS; }
+  TO_STRING_KV(K_(is_inited), K_(is_reverse_scan), K_(is_new_range), K_(is_padding_mode), K_(current),
                K_(query_index_range), K_(prefetcher), K_(sstable_row_cnt));
 
 protected:
-  bool start_of_scan() const;
   bool end_of_scan() const;
   int open_cur_data_block();
   int init_micro_scanner();
@@ -99,6 +103,7 @@ protected:
   bool is_inited_;
   bool is_reverse_scan_;
   bool is_new_range_;
+  bool is_padding_mode_;
   uint64_t sstable_row_cnt_;
   ObCSRowId current_;
   ObCSRange query_index_range_;
@@ -145,7 +150,7 @@ public:
 
 private:
   int fetch_rows(const int64_t batch_size, uint64_t &count, const int64_t datum_offset);
-  virtual int inner_fetch_rows(const int64_t row_cap, const int64_t datum_offset);
+  virtual int inner_fetch_rows(const int64_t batch_size, uint64_t &count, const int64_t datum_offset);
 
 protected:
   int32_t *row_ids_;
@@ -155,7 +160,6 @@ protected:
   const ObCGBitmap *filter_bitmap_;
   const ObITableReadInfo *read_info_;
   common::ObFixedArray<ObSqlDatumInfo, common::ObIAllocator> datum_infos_;
-  private:
   common::ObFixedArray<const share::schema::ObColumnParam*, common::ObIAllocator> col_params_;
 };
 

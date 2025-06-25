@@ -18,7 +18,9 @@
 #include <map>
 #include "share/ob_define.h"
 #include "share/parameter/ob_parameter_macro.h"
+#define CONFIG_LOCK_EXEMPTION
 #include "share/config/ob_common_config.h"    // ObInitConfigContainer
+#undef CONFIG_LOCK_EXEMPTION
 
 #include "ob_log_common.h"
 #include "ob_log_fake_common_config.h"        // ObLogFakeCommonConfig
@@ -149,7 +151,7 @@ public:
   // Log_level=INFO in the startup scenario, and then optimize the schema to WARN afterwards
   DEF_STR(init_log_level, OB_CLUSTER_PARAMETER, "ALL.*:INFO;PALF.*:WARN;SHARE.SCHEMA:INFO", "log level: DEBUG, TRACE, INFO, WARN, USER_ERR, ERROR");
   DEF_STR(log_level, OB_CLUSTER_PARAMETER, "ALL.*:INFO;PALF.*:WARN;SHARE.SCHEMA:WARN;CLOG.*:WARN;STORAGE.*:WARN;ARCHIVE.*:WARN", "log level: DEBUG, TRACE, INFO, WARN, USER_ERR, ERROR");
-  // root server info for oblog, seperated by `;` between multi rootserver, a root server info format as `ip:rpc_port:sql_port`
+  // root server info for oblog, separated by `;` between multi rootserver, a root server info format as `ip:rpc_port:sql_port`
   DEF_STR(rootserver_list, OB_CLUSTER_PARAMETER, "|", "OB RootServer list");
   DEF_STR(cluster_url, OB_CLUSTER_PARAMETER, "|", "OB configure url");
   DEF_STR(cluster_user, OB_CLUSTER_PARAMETER, "default", "OB login user");
@@ -339,11 +341,13 @@ public:
 
   T_DEF_INT_INFT(progress_limit_sec_for_ddl, OB_CLUSTER_PARAMETER, 60, 1, "ddl progress limit in seconds");
 
+  T_DEF_INT_INFT(progress_limit_sec_for_dict, OB_CLUSTER_PARAMETER, 7200, 1, "progress limit in seconds to fetch data_dict");
+
   // LS fetch progress update timeout in seconds
   // If the logs are not fetched after a certain period of time, the stream will be cut
   T_DEF_INT_INFT(ls_fetch_progress_update_timeout_sec, OB_CLUSTER_PARAMETER, 15, 1, "logstream fetch progress update timeout in seconds");
 
-  T_DEF_INT_INFT(log_router_background_refresh_interval_sec, OB_CLUSTER_PARAMETER, 10, 1,
+  T_DEF_INT_INFT(log_router_background_refresh_interval_sec, OB_CLUSTER_PARAMETER, 1200, 1,
                  "log_route_service background_refresh_time in seconds");
 	// cache update interval of sys table __all_server
   T_DEF_INT_INFT(all_server_cache_update_interval_sec, OB_CLUSTER_PARAMETER, 5, 1,
@@ -444,6 +448,8 @@ public:
   // ------------------------------------------------------------------------
   // Test mode, used only in obtest and other test tool scenarios
   T_DEF_BOOL(test_mode_on, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
+  // Test mode fail while init
+  T_DEF_BOOL(test_mode_init_fail, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
 
   // if force fetch archive is on, cdc service will seek archive for all rpc request unconditionally
   T_DEF_BOOL(test_mode_force_fetch_archive, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
@@ -613,6 +619,8 @@ public:
   T_DEF_BOOL(enable_direct_load_inc, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
   T_DEF_INT_INFT(direct_load_inc_thread_num, OB_CLUSTER_PARAMETER, 0, 0, "thread num of reading and parsing direct load inc log");
   T_DEF_INT_INFT(direct_load_inc_queue_backlog_lowest_tolerance, OB_CLUSTER_PARAMETER, 0, 0, "lowest threshold of queue_backlog that will touch parser flow control in direct load inc case");
+  T_DEF_INT_INFT(sorted_list_auto_treeify_threshold, OB_CLUSTER_PARAMETER, 32, 0, "treeify list auto-treeify mode treeify threshold");
+  T_DEF_INT_INFT(sorted_list_auto_untreeify_threshold, OB_CLUSTER_PARAMETER, 30, 0, "treeify list auto-treeify mode treeify threshold");
 
 #undef OB_CLUSTER_PARAMETER
 

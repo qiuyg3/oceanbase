@@ -14,11 +14,6 @@
 
 #include "ob_ls_id.h"
 
-#include "lib/oblog/ob_log_module.h"       // LOG_*
-#include "lib/oblog/ob_log.h"       // LOG_*
-#include "lib/utility/ob_unify_serialize.h"
-#include "lib/utility/serialization.h"
-#include "share/ob_errno.h"
 
 namespace oceanbase
 {
@@ -68,5 +63,11 @@ int64_t ObLSID::get_serialize_size() const
   size += serialization::encoded_length_i64(id_);
   return size;
 }
+
+bool is_tenant_sslog_ls(const uint64_t tenant_id, const share::ObLSID &ls_id)
+{
+  return is_meta_tenant(tenant_id) && ls_id.is_sslog_ls();
+}
+
 } // end namespace share
 } // end namespace oceanbase

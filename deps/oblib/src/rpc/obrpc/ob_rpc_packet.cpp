@@ -11,12 +11,8 @@
  */
 
 #define USING_LOG_PREFIX RPC_OBRPC
-#include "rpc/obrpc/ob_rpc_packet.h"
-#include "lib/utility/utility.h"
-#include "lib/ob_define.h"
-#include "lib/coro/co_var.h"
+#include "ob_rpc_packet.h"
 #include "common/storage/ob_sequence.h"
-#include "common/ob_tenant_data_version_mgr.h"
 #include "rpc/obrpc/ob_rpc_net_handler.h"
 #include "share/ob_cluster_version.h"
 
@@ -37,7 +33,8 @@ int ObRpcPacketHeader::serialize(char* buf, const int64_t buf_len, int64_t& pos)
   if (buf_len - pos >= get_encoded_size()) {
     seq_no_ = ObSequence::get_max_seq_no();
     data_version_ = 0;
-    if (ObRpcNetHandler::is_self_cluster(dst_cluster_id_) && ODV_MGR.is_enable_compatible_monotonic()) {
+    if (ObRpcNetHandler::is_self_cluster(dst_cluster_id_) &&
+        ODV_MGR.is_enable_compatible_monotonic() && tenant_id_ > 0) {
       int tmp_ret = OB_SUCCESS;
       if (OB_TMP_FAIL(ODV_MGR.get(tenant_id_, data_version_))) {
         data_version_ = LAST_BARRIER_DATA_VERSION;
@@ -202,9 +199,12 @@ int ObRpcPacketHeader::deserialize(const char* buf, const int64_t data_len, int6
     // disconnection, to avoid it, we delay setting to the RPC process phase.
     if (OB_SUCC(ret) &&
         flags_ & ObRpcPacketHeader::RESP_FLAG &&
-        ObRpcNetHandler::is_self_cluster(src_cluster_id_) && data_version_ > 0) {
+        ObRpcNetHandler::is_self_cluster(src_cluster_id_) &&
+        data_version_ > 0 &&
+        tenant_id_ > 0 &&
+        ODV_MGR.need_set_for_rpc(pcode_)) {
       if (OB_FAIL(ODV_MGR.set(tenant_id_, data_version_))) {
-        LOG_WARN("fail to update data_version", K(ret), KP(tenant_id_), K(data_version_));
+        LOG_WARN("fail to update data_version", K(ret), KP(tenant_id_), KDV(data_version_));
       }
       LOG_TRACE("rpc receive data version", K_(tenant_id), K_(data_version), K_(pcode),
                 K_(src_cluster_id), K(ObRpcNetHandler::CLUSTER_ID));

@@ -11,8 +11,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
-#include "common/ob_smart_call.h"
-#include "sql/resolver/expr/ob_raw_expr_copier.h"
+#include "ob_raw_expr_copier.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 using namespace oceanbase;
 using namespace oceanbase::sql;
@@ -132,6 +131,13 @@ int ObRawExprCopier::find_in_copy_context(const ObRawExpr *old_expr, ObRawExpr *
     LOG_WARN("get expr from hash map failed", K(ret));
   }
   return ret;
+}
+
+void ObRawExprCopier::reuse()
+{
+  new_exprs_.reuse();
+  copied_exprs_.reuse();
+  uncopy_expr_nodes_.reuse();
 }
 
 int ObRawExprCopier::copy_expr_node(const ObRawExpr *expr,
@@ -335,7 +341,11 @@ int ObRawExprCopier::add_skipped_expr(const ObRawExpr *target, bool include_chil
 {
   int ret = OB_SUCCESS;
   if (include_child) {
-    ret = add_expr(target, target);
+    if (is_existed(target)) {
+      // do nothing
+    } else {
+      ret = add_expr(target, target);
+    }
   } else {
     ret = uncopy_expr_nodes_.push_back(target);
   }

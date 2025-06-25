@@ -11,14 +11,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_OPT
-#include "sql/optimizer/ob_pwj_comparer.h"
-#include "share/schema/ob_table_schema.h"
-#include "share/schema/ob_schema_struct.h"
-#include "sql/optimizer/ob_optimizer_context.h"
+#include "ob_pwj_comparer.h"
 #include "sql/optimizer/ob_logical_operator.h"
-#include "sql/optimizer/ob_opt_est_utils.h"
-#include "sql/resolver/dml/ob_dml_stmt.h"
-#include "sql/resolver/expr/ob_raw_expr_util.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -109,6 +103,8 @@ int PwjTable::assign(const PwjTable &other)
   }
   return ret;
 }
+
+OB_SERIALIZE_MEMBER(GroupPWJTabletIdInfo, group_id_, tablet_id_array_);
 
 void ObPwjComparer::reset()
 {
@@ -222,7 +218,7 @@ int ObPwjComparer::is_partition_equal(const ObPartition *l_partition,
     if (OB_FAIL(is_row_equal(l_partition->get_high_bound_val(),
                              r_partition->get_high_bound_val(),
                              is_equal))) {
-      LOG_WARN("failed to check is row equal", K(ret));
+      LOG_WARN("failed to check is row equal", K(ret), K(*l_partition), K(*r_partition));
     }
   } else if (OB_FAIL(is_list_partition_equal(l_partition, r_partition, is_equal))) {
     LOG_WARN("failed to check is list partition equal", K(ret));
@@ -341,10 +337,8 @@ int ObPwjComparer::is_obj_equal(const common::ObObj &first_value,
     is_equal = (first_value.is_min_value() && second_value.is_min_value());
   } else if (first_value.is_max_value() || second_value.is_max_value()) {
     is_equal = (first_value.is_max_value() && second_value.is_max_value());
-  } else if (OB_UNLIKELY(first_value.get_meta() != second_value.get_meta())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("first value and second value meta not same", K(ret),
-        K(first_value.get_meta()), K(second_value.get_meta()));
+  } else if (first_value.get_meta() != second_value.get_meta()) {
+    is_equal = false;
   } else {
     is_equal = (first_value == second_value);
   }

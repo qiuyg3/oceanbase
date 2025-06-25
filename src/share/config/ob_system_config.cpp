@@ -10,12 +10,10 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "share/config/ob_system_config.h"
-#include "share/config/ob_config.h"
+#include "ob_system_config.h"
 #include "share/config/ob_server_config.h"
 #include "share/ob_task_define.h"
 #include "share/ob_cluster_version.h"
-#include "common/ob_tenant_data_version_mgr.h"
 
 namespace oceanbase
 {
@@ -364,7 +362,8 @@ int ObSystemConfig::read_config(
         } else if (value_updated && new_data_version <= old_data_version) {
           // do nothing
           SHARE_LOG(INFO, "[COMPATIBLE] [DATA_VERSION] no need to update", K(tenant_id),
-                    K(old_data_version), K(new_data_version));
+                    "old_data_version", DVP(old_data_version),
+                    "new_data_version", DVP(new_data_version));
         } else {
           if (!item.set_dump_value(pvalue->value())) {
             ret = OB_ERR_UNEXPECTED;
@@ -407,7 +406,7 @@ int ObSystemConfig::read_config(
         // 看到更新后的值 5M。
       } else {
         item.set_version(version);
-        if (!item.set_value(pvalue->value())) {
+        if (!item.set_value_unsafe(pvalue->value())) {
           // without set ret
           SHARE_LOG(WARN, "set config item value failed",
                     K(key.name()), K(pvalue->value()), K(version));

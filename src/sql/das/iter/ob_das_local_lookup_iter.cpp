@@ -12,9 +12,10 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/iter/ob_das_local_lookup_iter.h"
-#include "sql/das/iter/ob_das_scan_iter.h"
-#include "sql/das/ob_das_scan_op.h"
+#include "sql/das/iter/ob_das_functional_lookup_iter.h"
+#include "sql/das/iter/ob_das_domain_id_merge_iter.h"
 #include "sql/das/ob_das_ir_define.h"
+#include "sql/das/ob_das_vec_define.h"
 #include "storage/concurrency_control/ob_data_validation_service.h"
 
 namespace oceanbase
@@ -121,6 +122,8 @@ int ObDASLocalLookupIter::init_scan_param(ObTableScanParam &param, const ObDASSc
     param.output_exprs_ = &(ctdef->pd_expr_spec_.access_exprs_);
     param.aggregate_exprs_ = &(ctdef->pd_expr_spec_.pd_storage_aggregate_output_);
     param.ext_file_column_exprs_ = &(ctdef->pd_expr_spec_.ext_file_column_exprs_);
+    param.ext_mapping_column_exprs_ = &(ctdef->pd_expr_spec_.ext_mapping_column_exprs_);
+    param.ext_mapping_column_ids_ = &(ctdef->pd_expr_spec_.ext_mapping_column_ids_);
     param.ext_column_convert_exprs_ = &(ctdef->pd_expr_spec_.ext_column_convert_exprs_);
     param.calc_exprs_ = &(ctdef->pd_expr_spec_.calc_exprs_);
     param.table_param_ = &(ctdef->table_param_);
@@ -137,7 +140,9 @@ int ObDASLocalLookupIter::init_scan_param(ObTableScanParam &param, const ObDASSc
       param.trans_desc_ = trans_desc_;
     }
     if (OB_NOT_NULL(snapshot_)) {
-      param.snapshot_ = *snapshot_;
+      if (OB_FAIL(param.snapshot_.assign(*snapshot_))) {
+        LOG_WARN("assign snapshot fail", K(ret));
+      }
     } else {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null snapshot", K(ret), KPC(this));
@@ -151,7 +156,7 @@ int ObDASLocalLookupIter::init_scan_param(ObTableScanParam &param, const ObDASSc
       param.op_filters_ = &ctdef->pd_expr_spec_.pushdown_filters_;
     }
     param.pd_storage_filters_ = rtdef->p_pd_expr_op_->pd_storage_filters_;
-    if (OB_FAIL(param.column_ids_.assign(ctdef->access_column_ids_))) {
+    if (FAILEDx(param.column_ids_.assign(ctdef->access_column_ids_))) {
       LOG_WARN("failed to assign column ids", K(ret));
     }
     if (rtdef->sample_info_ != nullptr) {
@@ -172,8 +177,17 @@ void ObDASLocalLookupIter::reset_lookup_state()
 int ObDASLocalLookupIter::add_rowkey()
 {
   int ret = OB_SUCCESS;
-  OB_ASSERT(data_table_iter_->get_type() == DAS_ITER_SCAN);
-  ObDASScanIter *scan_iter = static_cast<ObDASScanIter *>(data_table_iter_);
+  OB_ASSERT(data_table_iter_->get_type() == DAS_ITER_SCAN ||
+            data_table_iter_->get_type() == DAS_ITER_FUNC_LOOKUP ||
+            data_table_iter_->get_type() == DAS_ITER_DOMAIN_ID_MERGE);
+  ObDASScanIter *scan_iter = nullptr;
+  if (data_table_iter_->get_type() == DAS_ITER_SCAN) {
+    scan_iter = static_cast<ObDASScanIter *>(data_table_iter_);
+  } else if (data_table_iter_->get_type() == DAS_ITER_FUNC_LOOKUP) {
+    scan_iter = static_cast<ObDASFuncLookupIter *>(data_table_iter_)->get_index_scan_iter();
+  } else if (data_table_iter_->get_type() == DAS_ITER_DOMAIN_ID_MERGE) {
+    scan_iter = static_cast<ObDASDomainIdMergeIter *>(data_table_iter_)->get_data_table_iter();
+  }
   storage::ObTableScanParam &scan_param = scan_iter->get_scan_param();
   ObNewRange lookup_range;
   int64 group_id = 0;
@@ -194,6 +208,8 @@ int ObDASLocalLookupIter::add_rowkey()
         LOG_WARN("failed to push back trans info array", K(ret), KPC(datum_ptr));
       }
     }
+  } else if (DAS_ITER_FUNC_LOOKUP == data_table_iter_->get_type()) {
+    group_id = static_cast<ObDASFuncLookupIter *>(data_table_iter_)->get_group_id();
   }
 
   int64_t group_idx = ObNewRange::get_group_idx(group_id);
@@ -243,7 +259,9 @@ int ObDASLocalLookupIter::add_rowkeys(int64_t count)
 int ObDASLocalLookupIter::do_index_lookup()
 {
   int ret = OB_SUCCESS;
-  OB_ASSERT(data_table_iter_->get_type() == DAS_ITER_SCAN);
+  OB_ASSERT(data_table_iter_->get_type() == DAS_ITER_SCAN ||
+            data_table_iter_->get_type() == DAS_ITER_FUNC_LOOKUP ||
+            data_table_iter_->get_type() == DAS_ITER_DOMAIN_ID_MERGE);
   if (is_first_lookup_) {
     is_first_lookup_ = false;
     if (OB_FAIL(init_scan_param(lookup_param_, lookup_ctdef_, lookup_rtdef_))) {
@@ -271,8 +289,17 @@ int ObDASLocalLookupIter::do_index_lookup()
 int ObDASLocalLookupIter::check_index_lookup()
 {
   int ret = OB_SUCCESS;
-  OB_ASSERT(data_table_iter_->get_type() == DAS_ITER_SCAN);
-  ObDASScanIter *scan_iter = static_cast<ObDASScanIter*>(data_table_iter_);
+  OB_ASSERT(data_table_iter_->get_type() == DAS_ITER_SCAN ||
+            data_table_iter_->get_type() == DAS_ITER_FUNC_LOOKUP ||
+            data_table_iter_->get_type() == DAS_ITER_DOMAIN_ID_MERGE);
+  ObDASScanIter *scan_iter = nullptr;
+  if (data_table_iter_->get_type() == DAS_ITER_SCAN) {
+    scan_iter = static_cast<ObDASScanIter*>(data_table_iter_);
+  } else if (data_table_iter_->get_type() == DAS_ITER_FUNC_LOOKUP) {
+    scan_iter = static_cast<ObDASFuncLookupIter *>(data_table_iter_)->get_index_scan_iter();
+  } else if (data_table_iter_->get_type() == DAS_ITER_DOMAIN_ID_MERGE) {
+    scan_iter = static_cast<ObDASDomainIdMergeIter *>(data_table_iter_)->get_data_table_iter();
+  }
   if (GCONF.enable_defensive_check() &&
       lookup_ctdef_->pd_expr_spec_.pushdown_filters_.empty()) {
     if (OB_UNLIKELY(lookup_rowkey_cnt_ != lookup_row_cnt_)) {
@@ -314,8 +341,10 @@ int ObDASLocalLookupIter::check_index_lookup()
 int ObDASLocalLookupIter::init_rowkey_exprs_for_compat()
 {
   int ret = OB_SUCCESS;
-  if (ObDASOpType::DAS_OP_TABLE_SCAN == index_ctdef_->op_type_
-      || ObDASOpType::DAS_OP_IR_AUX_LOOKUP == index_ctdef_->op_type_) {
+  if (ObDASOpType::DAS_OP_IR_AUX_LOOKUP == index_ctdef_->op_type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected ir aux lookup iter", K(ret));
+  } else if (ObDASOpType::DAS_OP_TABLE_SCAN == index_ctdef_->op_type_) {
     const ObDASScanCtDef *scan_ctdef = static_cast<const ObDASScanCtDef*>(index_ctdef_);
     int64_t rowkey_cnt = scan_ctdef->result_output_.count();
     if (nullptr != scan_ctdef->group_id_expr_) {
@@ -337,23 +366,37 @@ int ObDASLocalLookupIter::init_rowkey_exprs_for_compat()
       }
     }
   } else if (ObDASOpType::DAS_OP_IR_SCAN == index_ctdef_->op_type_
-      || ObDASOpType::DAS_OP_SORT == index_ctdef_->op_type_) {
-    // only doc_id as rowkey for text retrieval index back
+      || ObDASOpType::DAS_OP_SORT == index_ctdef_->op_type_
+      || ObDASOpType::DAS_OP_VEC_SCAN == index_ctdef_->op_type_) {
+    // only doc_id/vid as rowkey for text retrieval/vector index back
     const ObDASIRScanCtDef *ir_ctdef = nullptr;
+    const ObDASVecAuxScanCtDef *vec_idx_ctdef = nullptr;
     if (ObDASOpType::DAS_OP_SORT == index_ctdef_->op_type_) {
-      if (OB_UNLIKELY(ObDASOpType::DAS_OP_IR_SCAN != index_ctdef_->children_[0]->op_type_)) {
+      if (ObDASOpType::DAS_OP_IR_SCAN != index_ctdef_->children_[0]->op_type_) {
+        ir_ctdef = static_cast<const ObDASIRScanCtDef *>(index_ctdef_->children_[0]);
+      } else if (ObDASOpType::DAS_OP_VEC_SCAN == index_ctdef_->children_[0]->op_type_) {
+        vec_idx_ctdef = static_cast<const ObDASVecAuxScanCtDef *>(index_ctdef_->children_[0]);
+      } else {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected child of sort iter is not an ir scan iter for compatible scan", K(ret));
-      } else {
-        ir_ctdef = static_cast<const ObDASIRScanCtDef *>(index_ctdef_->children_[0]);
       }
-    } else {
+    } else if (ObDASOpType::DAS_OP_IR_SCAN == index_ctdef_->op_type_) {
       ir_ctdef = static_cast<const ObDASIRScanCtDef *>(index_ctdef_);
+    } else if (ObDASOpType::DAS_OP_VEC_SCAN == index_ctdef_->op_type_) {
+      vec_idx_ctdef = static_cast<const ObDASVecAuxScanCtDef *>(index_ctdef_);
     }
-    if (OB_SUCC(ret)) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_NOT_NULL(ir_ctdef)) {
       if (OB_FAIL(rowkey_exprs_.push_back(ir_ctdef->inv_scan_doc_id_col_))) {
         LOG_WARN("gailed to add rowkey exprs", K(ret));
       }
+    } else if (OB_NOT_NULL(vec_idx_ctdef)) {
+      if (OB_FAIL(rowkey_exprs_.push_back(vec_idx_ctdef->inv_scan_vec_id_col_))) {
+        LOG_WARN("gailed to add rowkey exprs", K(ret));
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ir_ctdef and vec_idx_ctdef shouldn't be null at the same time", K(ret));
     }
   } else {
     ret = OB_ERR_UNEXPECTED;

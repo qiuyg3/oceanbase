@@ -26,14 +26,19 @@
 #include "sql/resolver/ddl/ob_alter_table_stmt.h"
 #include "sql/resolver/ddl/ob_create_index_stmt.h"
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
+#include "share/storage_cache_policy/ob_storage_cache_common.h"
+
 namespace oceanbase
 {
 namespace common
 {
 struct ObObjCastParams;
 }
+
 namespace sql
 {
+typedef common::hash::ObPlacementHashSet<share::schema::ObColumnNameHashWrapper, common::OB_MAX_COLUMN_NUMBER> ObReducedVisibleColSet;
+typedef common::hash::ObPlacementHashSet<share::schema::ObPartitionNameHashWrapper, common::OB_MAX_PARTITION_NUM_ORACLE> ObPartitionNameSet;
 struct ObExternalFileFormat;
 struct PartitionInfo
 {
@@ -99,6 +104,13 @@ struct ObColumnResolveStat
   bool is_set_orig_default_value_;
 };
 
+struct ObDefaultValueRes
+{
+  ObDefaultValueRes(common::ObObjParam &value): is_literal_(true), value_(value) {}
+  bool is_literal_;
+  common::ObObjParam &value_;
+};
+
 class ObDDLResolver : public ObStmtResolver
 {
 public:
@@ -124,17 +136,19 @@ public:
   enum RangeNode {
     RANGE_FUN_EXPR_NODE = 0,
     RANGE_ELEMENTS_NODE = 1,
-    RANGE_SUBPARTITIOPPN_NODE = 2,
+    RANGE_SUBPARTITION_NODE = 2,
     RANGE_PARTITION_NUM_NODE = 3,
     RANGE_TEMPLATE_MARK = 4,
     RANGE_INTERVAL_NODE = 5,
+    RANGE_AUTO_SPLIT_TABLET_SIZE = 6,
   };
   enum ElementsNode {
     PARTITION_NAME_NODE = 0,
     PARTITION_ELEMENT_NODE = 1,
     PART_ID_NODE = 2,
     ELEMENT_ATTRIBUTE_NODE = 3,
-    ELEMENT_SUBPARTITION_NODE = 4
+    ELEMENT_SUBPARTITION_NODE = 4,
+    ELEMENT_STORAGE_CACHE_POLICY = 5,
   };
   enum ListNode {
     LIST_FUN_EXPR_NODE = 0,
@@ -156,6 +170,12 @@ public:
     AT_VALUES_NODE = 1,
     SPLIT_PARTITION_TYPE_NODE = 2
   };
+  enum ObTableOrganizationType : uint8_t {
+    OB_ORGANIZATION_INVALID = 0,
+    OB_INDEX_ORGANIZATION = 1,
+    OB_HEAP_ORGANIZATION = 2,
+    OB_ORGANIZATION_MAX
+  };
   static const int NAMENODE = 1;
 
   static const int64_t MAX_PROGRESSIVE_MERGE_NUM = 100;
@@ -166,13 +186,7 @@ public:
   explicit ObDDLResolver(ObResolverParams &params);
   virtual ~ObDDLResolver();
   static int append_fts_args(
-      const ObPartitionResolveResult &resolve_result,
-      const obrpc::ObCreateIndexArg *index_arg,
-      bool &fts_common_aux_table_exist,
-      ObIArray<ObPartitionResolveResult> &resolve_results,
-      ObIArray<obrpc::ObCreateIndexArg *> &index_arg_list,
-      ObIAllocator *arg_allocator);
-  static int append_fts_args(
+      const share::schema::ObTableSchema &data_schema,
       const ObPartitionResolveResult &resolve_result,
       const obrpc::ObCreateIndexArg &index_arg,
       bool &fts_common_aux_table_exist,
@@ -193,14 +207,6 @@ public:
       ObIArray<ObPartitionResolveResult> &resolve_results,
       ObIArray<obrpc::ObCreateIndexArg> &index_arg_list,
       ObIAllocator *allocator);
-  static int append_domain_index_args(
-      const ObTableSchema &table_schema,
-      const ObPartitionResolveResult &resolve_result,
-      const obrpc::ObCreateIndexArg *index_arg,
-      bool &common_aux_table_exist,
-      ObIArray<ObPartitionResolveResult> &resolve_results,
-      ObIArray<obrpc::ObCreateIndexArg *> &index_arg_list,
-      ObIAllocator *arg_allocator);
   static int check_text_length(ObCharsetType cs_type, ObCollationType co_type,
                                const char *name, ObObjType &type,
                                int32_t &length,
@@ -219,9 +225,9 @@ public:
       const share::schema::ObColumnSchemaV2 &column_schema);
   int resolve_default_value(
       ParseNode *def_node,
-      common::ObObjParam &default_value);
+      ObDefaultValueRes &resolve_res);
   int resolve_sign_in_default_value(
-      ObIAllocator *name_pool, ParseNode *def_val, ObObjParam &default_value, const bool is_neg);
+      ObIAllocator *name_pool, ParseNode *def_val, ObDefaultValueRes &resolve_res, const bool is_neg);
   static int check_and_fill_column_charset_info(
       share::schema::ObColumnSchemaV2 &column,
       const common::ObCharsetType table_charset_type,
@@ -239,6 +245,7 @@ public:
       const share::schema::ObColumnSchemaV2 &column,
       common::ObObj &default_value);
   static int cast_default_value(
+      ObSQLSessionInfo *session_info,
       common::ObObj &default_value,
       const common::ObTimeZoneInfo *tz_info,
       const common::ObString *nls_formats,
@@ -253,7 +260,7 @@ public:
                                ObIArray<ObString> &gen_col_expr_arr);
   static int init_empty_session(const common::ObTimeZoneInfoWrap &tz_info_wrap,
                                 const ObString *nls_formats,
-                                const share::schema::ObLocalSessionVar *local_session_var,
+                                const ObLocalSessionVar *local_session_var,
                                 common::ObIAllocator &allocator,
                                 share::schema::ObTableSchema &table_schema,
                                 const ObSQLMode sql_mode,
@@ -262,7 +269,7 @@ public:
   static int reformat_generated_column_expr(ObObj &default_value,
                                             const common::ObTimeZoneInfoWrap &tz_info_wrap,
                                             const common::ObString *nls_formats,
-                                            const share::schema::ObLocalSessionVar &local_session_var,
+                                            const ObLocalSessionVar &local_session_var,
                                             common::ObIAllocator &allocator,
                                             share::schema::ObTableSchema &table_schema,
                                             share::schema::ObColumnSchemaV2 &column,
@@ -346,11 +353,13 @@ public:
                                            ObSchemaChecker *schema_checker,
                                            ObObj &extend_result,
                                            obrpc::ObDDLArg &ddl_arg);
-  static int ob_udt_check_and_add_ddl_dependency(const uint64_t schema_id,
-                                                 const ObSchemaType schema_type,
-                                                 const int64_t schema_version,
-                                                 const uint64_t schema_tenant_id,
-                                                 obrpc::ObDDLArg &ddl_arg);
+  static int ob_add_ddl_dependency(const uint64_t schema_id,
+                                   const ObSchemaType schema_type,
+                                   const int64_t schema_version,
+                                   const uint64_t schema_tenant_id,
+                                   obrpc::ObDDLArg &ddl_arg);
+  static int ob_add_ddl_dependency(const pl::ObPLDependencyTable & dependency_table,
+                                   obrpc::ObDDLArg &ddl_arg);
   static int add_udt_default_dependency(ObRawExpr *expr,
                                         ObSchemaChecker *schema_checker,
                                         obrpc::ObDDLArg &ddl_arg);
@@ -359,6 +368,10 @@ public:
       const bool is_oracle_mode);
   static int adjust_number_decimal_column_accuracy_within_max(share::schema::ObColumnSchemaV2 &column,
                                                               const bool is_oracle_mode);
+  static int fill_column_with_subschema(const ObRawExpr &expr,
+                                        sql::ObSQLSessionInfo &session_info,
+                                        share::schema::ObColumnSchemaV2 &column);
+
   // { used for enum and set
   int fill_extended_type_info(
       const ParseNode &str_list_node,
@@ -385,6 +398,7 @@ public:
       const share::schema::ObColumnSchemaV2 &column,
       common::ObObjCastParams &params, common::ObObj &def_val);
   int check_partition_name_duplicate(ParseNode *node, bool is_oracle_modle = false);
+  static int verify_hbase_table_part_keys(const ObIArray<ObString> &part_keys);
   static int check_text_column_length_and_promote(share::schema::ObColumnSchemaV2 &column,
                                                   int64_t table_id,
                                                   const bool is_byte_length = false);
@@ -452,11 +466,37 @@ public:
       const share::schema::ObTableSchema &table_schema,
       const ObString &column_name,
       ObAlterTableStmt *alter_table_stmt);
-  int check_is_json_contraint(ObTableSchema &tmp_table_schema, ObIArray<ObConstraint> &csts, ParseNode *cst_check_expr_node);
+  int check_is_json_contraint(ObTableSchema &tmp_table_schema,
+                              ObIArray<ObConstraint> &csts,
+                              ParseNode *cst_check_expr_node);
 
+  static int resolve_file_prefix(ObString &url,
+                                 ObSqlString &prefix_str,
+                                 common::ObStorageType &device_type,
+                                 ObResolverParams &params);
+  static int resolve_external_file_format(const ParseNode *format_node,
+                                          ObResolverParams &params,
+                                          ObExternalFileFormat& format,
+                                          ObString &format_str);
+  static int resolve_external_file_pattern(const ParseNode *option_node,
+                                          bool is_external_table,
+                                          common::ObIAllocator &allocator,
+                                          const ObSQLSessionInfo *session_info,
+                                          ObString &pattern);
+
+  static int resolve_external_file_location(ObResolverParams &params,
+                                            ObTableSchema &table_schema,
+                                            common::ObString table_location);
+
+  static int mask_properties_sensitive_info(const ParseNode *node,
+                                            ObString &ddl_sql,
+                                            ObIAllocator *allocator,
+                                            ObString &masked_sql);
+
+  static int check_format_valid(const ObExternalFileFormat &format, bool &is_valid);
   int check_column_in_check_constraint(
       const share::schema::ObTableSchema &table_schema,
-      const ObString &column_name,
+      const ObReducedVisibleColSet &drop_column_names_set,
       ObAlterTableStmt *alter_table_stmt);
 
   int check_index_columns_equal_foreign_key(const share::schema::ObTableSchema &table_schema,
@@ -519,7 +559,52 @@ public:
   int resolve_multivalue_index_constraint(
       const share::schema::ObColumnSchemaV2 &column_schema,
       const int64_t index_keyname_value);
+  int resolve_vec_index_constraint(
+      const share::schema::ObTableSchema &table_schema,
+      ObSchemaChecker &schema_checker,
+      const common::ObString &column_name,
+      const int64_t index_keyname_value,
+      ParseNode *node);
+  int resolve_vec_index_constraint(
+      const share::schema::ObColumnSchemaV2 &column_schema,
+      const int64_t index_keyname_value,
+      ParseNode *node);
+  static int get_partition_keys_by_part_func_expr(
+      const ObString &part_func_expr_str,
+      const bool is_oracle_mode,
+      ObIAllocator &allocator,
+      ObIArray<ObString> &partkey_strs);
 protected:
+  static int append_vec_hnsw_args(
+      const ObPartitionResolveResult &resolve_result,
+      const obrpc::ObCreateIndexArg &index_arg,
+      bool &vec_common_aux_table_exist,
+      ObIArray<ObPartitionResolveResult> &resolve_results,
+      ObIArray<ObCreateIndexArg> &index_arg_list,
+      ObIAllocator *allocator,
+      const ObSQLSessionInfo *session_info);
+
+  static int append_vec_ivfflat_args(
+      const ObPartitionResolveResult &resolve_result,
+      const obrpc::ObCreateIndexArg &index_arg,
+      ObIArray<ObPartitionResolveResult> &resolve_results,
+      ObIArray<ObCreateIndexArg> &index_arg_list,
+      ObIAllocator *allocator);
+
+  static int append_vec_ivfsq8_args(
+      const ObPartitionResolveResult &resolve_result,
+      const obrpc::ObCreateIndexArg &index_arg,
+      ObIArray<ObPartitionResolveResult> &resolve_results,
+      ObIArray<ObCreateIndexArg> &index_arg_list,
+      ObIAllocator *allocator);
+
+  static int append_vec_ivfpq_args(
+      const ObPartitionResolveResult &resolve_result,
+      const obrpc::ObCreateIndexArg &index_arg,
+      ObIArray<ObPartitionResolveResult> &resolve_results,
+      ObIArray<ObCreateIndexArg> &index_arg_list,
+      ObIAllocator *allocator);
+
   static int get_part_str_with_type(
       const bool is_oracle_mode,
       share::schema::ObPartitionFuncType part_func_type,
@@ -533,12 +618,17 @@ protected:
       const uint64_t cg_id,
       share::schema::ObColumnGroupSchema &column_group);
   int parse_cg_node(const ParseNode &cg_node, obrpc::ObCreateIndexArg &create_index_arg) const;
-  int parse_column_group(const ParseNode *cg_node,const share::schema::ObTableSchema &table_schema, share::schema::ObTableSchema &dst_table_schema);
+  int parse_column_group(const ParseNode *cg_node,
+                         const share::schema::ObTableSchema &table_schema,
+                         share::schema::ObTableSchema &dst_table_schema,
+                         const bool is_alter_column_group_delayed = false);
   int resolve_index_column_group(const ParseNode *node, obrpc::ObCreateIndexArg &create_index_arg);
   bool need_column_group(const ObTableSchema &table_schema);
   int resolve_hints(const ParseNode *parse_node, ObDDLStmt &stmt, const ObTableSchema &table_schema);
   int calc_ddl_parallelism(const uint64_t hint_parallelism, const uint64_t table_dop, uint64_t &parallelism);
   int deep_copy_str(const common::ObString &src, common::ObString &dest);
+  int set_vec_column_name(
+      const common::ObString &column_name);
   int set_table_name(
       const common::ObString &table_name);
   int set_database_name(
@@ -574,7 +664,6 @@ protected:
       const bool is_oracle_temp_table = false,
       const bool is_create_table_as = false,
       const bool allow_has_default = true);
-  int resolve_file_prefix(ObString &url, ObSqlString &prefix_str, common::ObStorageType &device_type);
   int resolve_uk_name_from_column_attribute(
       ParseNode *attrs_node,
       common::ObString &uk_name);
@@ -594,6 +683,8 @@ protected:
                                       ParseNode *attrs_node,
                                       ObColumnResolveStat &reslove_stat,
                                       common::ObString &pk_name,
+                                      bool &is_modify_column,
+                                      bool &is_modify_column_visibility,
                                       const bool allow_has_default = true);
   int resolve_normal_column_attribute_check_cons(ObColumnSchemaV2 &column,
                                                  ParseNode *attrs_node,
@@ -621,7 +712,7 @@ protected:
   int resolve_lob_storage_parameter(share::schema::ObColumnSchemaV2 &column, const ParseNode &param_node);
   int resolve_lob_chunk_size(const ParseNode &size_node, int64_t &lob_chunk_size);
   int resolve_lob_chunk_size(share::schema::ObColumnSchemaV2 &column, const ParseNode &lob_chunk_size_node);
-
+  int resolve_semistruct_encoding_type(const ParseNode *option_node, const bool is_index_option);
   /*
   int resolve_generated_column_definition(
       share::schema::ObColumnSchemaV2 &column,
@@ -655,6 +746,17 @@ protected:
       ParseNode *node,
       share::schema::ObTableSchema &table_schema,
       common::ObSEArray<ObRawExpr*, 8> &range_exprs);
+  int resolve_auto_partition_with_tenant_config(ObCreateTableStmt *stmt, ParseNode *node,
+                                                ObTableSchema &table_schema);
+  int resolve_auto_partition(ObPartitionedStmt *stmt, ParseNode *node,
+                             ObTableSchema &table_schema);
+  int resolve_presetting_partition_key(ParseNode *node, share::schema::ObTableSchema &table_schema);
+  int try_set_auto_partition_by_config(const ParseNode *node,
+                                       common::ObIArray<obrpc::ObCreateIndexArg> &index_arg_list,
+                                       ObTableSchema &table_schema);
+  int check_only_modify_auto_partition_attr(ObPartitionedStmt *stmt, ParseNode *node,
+                                            ObTableSchema &table_schema, bool &is_only_modify_auto_part_attr);
+
   static int resolve_interval_node(
       ObResolverParams &params,
       ParseNode *interval_node,
@@ -713,6 +815,10 @@ protected:
     int resolve_enum_or_set_column(
       const ParseNode *type_node,
       share::schema::ObColumnSchemaV2 &column);
+    int resolve_collection_column(
+      const ParseNode *type_node,
+      share::schema::ObColumnSchemaV2 &column);
+
 
   static int is_gen_col_with_udf(const ObTableSchema &table_schema,
                                  const ObRawExpr *col_expr,
@@ -950,23 +1056,54 @@ protected:
                                     bool is_subpart);
   int check_and_set_individual_subpartition_names(ObPartitionedStmt *stmt,
                                                   share::schema::ObTableSchema &table_schema);
-
-  int resolve_file_format(const ParseNode *node, ObExternalFileFormat &format);
-
-  int check_format_valid(const ObExternalFileFormat &format, bool &is_valid);
-
+  int set_partition_name_in_hashset(const share::schema::ObPartitionNameHashWrapper &partition_name_key,
+                                    ObPartitionNameSet &partition_name_set);
   int deep_copy_string_in_part_expr(ObPartitionedStmt* stmt);
   int deep_copy_column_expr_name(common::ObIAllocator &allocator, ObIArray<ObRawExpr*> &exprs);
   int check_ttl_definition(const ParseNode *node);
+  int check_column_is_first_part_key(const ObPartitionKeyInfo &part_key_info, const uint64_t column_id);
 
   int add_new_indexkey_for_oracle_temp_table();
+  int check_index_param(const ParseNode *option_node, ObString &index_params, const int64_t vector_dim);
 
+
+  // for storage cache policy
+  int check_storage_cache_policy(ObStorageCachePolicy &storage_cache_policy, const ObTableSchema *tbl_schema);
+  int check_and_set_default_storage_cache_policy();
+  int check_create_stmt_storage_cache_policy(const ObString &storage_cache_policy_str, const ObTableSchema *tbl_schema);
+  int check_alter_stmt_storage_cache_policy(const ObTableSchema *ori_table_schema);
+  int set_default_storage_cache_policy(const bool is_alter_add_index = false);
+  int resolve_storage_cache_attribute(const ParseNode *node, ObResolverParams &params);
+  int resolve_storage_cache_time_attribute(const ParseNode *node, ObResolverParams &params, ObStorageCachePolicy &cache_policy);
+  int get_storage_cache_tbl_schema(const ObTableSchema *&tbl_schema);
   void reset();
+
+  // for alter table: there may be some index_arg.
+  // while create table can garentee some table info is behind the index arg, which will not be
+  // reset
+  void reset_index();
   int get_mv_container_table(uint64_t tenant_id,
                              const uint64_t mv_container_table_id,
                              const share::schema::ObTableSchema *&mv_container_table_schema,
                              common::ObString &mv_container_table_name);
-  static int trim_space_for_default_value(const bool is_mysql_mode, const ObCollationType &collation_type, ObObj &default_value, ObString &str);
+  static int trim_space_for_default_value(
+      const bool is_mysql_mode,
+      const bool is_char_type,
+      const ObCollationType &collation_type,
+      ObObj &default_value, ObString &str);
+  int get_suggest_index_scope(
+      const uint64_t tenant_id,
+      const uint64_t data_table_id,
+      const ObCreateIndexArg &index_arg,
+      const INDEX_KEYNAME key,
+      bool &global);
+  int check_primary_key_prefix_of_index_columns(
+      const ObTableSchema &table_schema,
+      const ObCreateIndexArg &index_arg,
+      bool &is_prefix);
+  bool is_support_split_index_key(const INDEX_KEYNAME index_keyname);
+  bool is_column_group_supported() const;
+  bool is_organization_set_to_heap() { return table_organization_ == ObTableOrganizationType::OB_HEAP_ORGANIZATION; }
   int64_t block_size_;
   int64_t consistency_level_;
   INDEX_TYPE index_scope_;
@@ -981,6 +1118,7 @@ protected:
   common::ObString expire_info_;
   common::ObString compress_method_;
   common::ObString parser_name_;
+  common::ObString parser_properties_;
   common::ObString comment_;
   common::ObString tablegroup_name_;
   common::ObString primary_zone_;
@@ -1009,13 +1147,14 @@ protected:
   common::hash::ObPlacementHashSet<share::schema::ObColumnNameHashWrapper,
                                    common::OB_MAX_COLUMN_NUMBER> storing_column_set_;
   common::hash::ObPlacementHashSet<share::schema::ObForeignKeyNameHashWrapper,
-                                   common::OB_MAX_INDEX_PER_TABLE> current_foreign_key_name_set_;
+                                   OB_MAX_AUX_TABLE_PER_MAIN_TABLE> current_foreign_key_name_set_;
   common::ObBitSet<> alter_table_bitset_;
   bool has_index_using_type_;
   share::schema::ObIndexUsingType index_using_type_;
   common::ObString locality_;
   bool is_random_primary_zone_;
   share::ObDuplicateScope duplicate_scope_;
+  share::ObDuplicateReadConsistency duplicate_read_consistency_;
   bool enable_row_movement_;
   share::schema::ObTableMode table_mode_;
   common::ObString encryption_;
@@ -1025,12 +1164,23 @@ protected:
   bool is_external_table_;
   common::ObString ttl_definition_;
   common::ObString kv_attributes_;
+  common::ObString storage_cache_policy_;
   ObNameGeneratedType name_generated_type_;
   bool have_generate_fts_arg_;
   bool is_set_lob_inrow_threshold_;
   int64_t lob_inrow_threshold_;
+  bool have_generate_vec_arg_;
   int64_t auto_increment_cache_size_;
   ObExternalFileFormat::FormatType external_table_format_type_;
+  common::ObBitSet<> mocked_external_table_column_ids_;
+  common::ObString index_params_;
+  ObTableOrganizationType table_organization_;
+  int64_t mv_refresh_dop_;
+  common::ObString vec_column_name_;
+  ObIndexType vec_index_type_;
+  bool enable_macro_block_bloom_filter_;
+  ObSemiStructEncodingType semistruct_encoding_type_;
+  common::ObString dynamic_partition_policy_;
 private:
   template <typename STMT>
   DISALLOW_COPY_AND_ASSIGN(ObDDLResolver);

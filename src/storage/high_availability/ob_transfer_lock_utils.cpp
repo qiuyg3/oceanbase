@@ -13,17 +13,11 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_transfer_lock_utils.h"
-#include "ob_transfer_lock_info_operator.h"
-#include "storage/tx_storage/ob_ls_handle.h"
 #include "storage/tx_storage/ob_ls_service.h"
-#include "share/ob_max_id_fetcher.h"
 #include "storage/ob_common_id_utils.h"
-#include "share/ob_common_id.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "storage/high_availability/ob_storage_ha_utils.h"
-#include "storage/ob_storage_rpc.h"
 #include "observer/ob_srv_network_frame.h"
-#include "share/ob_tenant_info_proxy.h"
 
 using namespace oceanbase::share;
 using namespace oceanbase::common;
@@ -45,7 +39,7 @@ static int get_ls_handle(const uint64_t tenant_id, const share::ObLSID &ls_id, s
   } else if (OB_ISNULL(ls_service = MTL_WITH_CHECK_TENANT(ObLSService *, tenant_id))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("log stream service is NULL", K(ret), K(tenant_id));
-  } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+  } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::HA_MOD))) {
     LOG_WARN("failed to get log stream", K(ret), K(tenant_id), K(ls_id));
   }
   return ret;

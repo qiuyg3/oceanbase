@@ -20,10 +20,8 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <linux/sockios.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
-#include <stdlib.h>                                     // strtoll
 #include <openssl/md5.h>                                // MD5
 
 #include "lib/string/ob_string.h"                       // ObString
@@ -34,7 +32,6 @@
 #include "share/schema/ob_table_schema.h"               // ObTableSchema
 #include "share/schema/ob_column_schema.h"              // ObColumnSchemaV2
 #include "share/schema/ob_schema_struct.h"
-#include "share/ob_get_compat_mode.h"
 #include "rpc/obmysql/ob_mysql_global.h"                // MYSQL_TYPE_*
 #include "ob_log_config.h"
 #include "ob_log_schema_cache_info.h"                   // ColumnSchemaInfo
@@ -195,8 +192,8 @@ RecordType get_record_type(const ObDmlRowFlag &dml_flag)
 
   // Set record type
   // Note: The REPLACE type is not handled, it does not exist in Redo
-  // Note: must judge is_delete_insert first because PUT is also is_insert, but it's flag_type is DF_TYPE_INSERT_DELETE
-  if (OB_UNLIKELY(dml_flag.is_delete_insert())) {
+  // Note: must judge is_upsert first because PUT is also is_insert, but it's flag_type is DF_TYPE_INSERT_DELETE
+  if (OB_UNLIKELY(dml_flag.is_upsert())) {
     record_type = EPUT;
   } else if (dml_flag.is_insert()) {
     record_type = EINSERT;
@@ -215,7 +212,7 @@ const char *print_dml_flag(const blocksstable::ObDmlRowFlag &dml_flag)
 {
   const char *str = "UNKNOWN";
 
-  if (dml_flag.is_delete_insert()) {
+  if (dml_flag.is_upsert()) {
     str = "put";
   } else if (dml_flag.is_insert()) {
     str = "insert";
@@ -491,6 +488,22 @@ const char *get_ctype_string(int ctype)
       sc_type = "MYSQL_TYPE_ROARINGBITMAP";
       break;
 
+    case oceanbase::obmysql::MYSQL_TYPE_OB_VECTOR:
+      sc_type = "MYSQL_TYPE_OB_VECTOR";
+      break;
+
+    case oceanbase::obmysql::MYSQL_TYPE_OB_ARRAY:
+      sc_type = "MYSQL_TYPE_OB_ARRAY";
+      break;
+
+    case oceanbase::obmysql::MYSQL_TYPE_OB_MAP:
+      sc_type = "MYSQL_TYPE_OB_MAP";
+      break;
+
+    case oceanbase::obmysql::MYSQL_TYPE_OB_SPARSE_VECTOR:
+      sc_type = "MYSQL_TYPE_OB_SPARSE_VECTOR";
+      break;
+
     case oceanbase::obmysql::MYSQL_TYPE_NEWDECIMAL:
       sc_type = "MYSQL_TYPE_NEWDECIMAL";
       break;
@@ -628,6 +641,14 @@ bool is_xml_type(const int ctype)
 bool is_roaringbitmap_type(const int ctype)
 {
   return (ctype == oceanbase::obmysql::MYSQL_TYPE_ROARINGBITMAP);
+}
+
+bool is_collection_type(const int ctype)
+{
+  return (ctype == oceanbase::obmysql::MYSQL_TYPE_OB_ARRAY
+          || ctype == oceanbase::obmysql::MYSQL_TYPE_OB_VECTOR
+          || ctype == oceanbase::obmysql::MYSQL_TYPE_OB_MAP)
+          || ctype == oceanbase::obmysql::MYSQL_TYPE_OB_SPARSE_VECTOR;
 }
 
 double get_delay_sec(const int64_t tstamp_ns)
@@ -1326,38 +1347,6 @@ int64_t ObLogTimeMonitor::mark_and_get_cost(const char *log_msg_suffix, bool nee
 bool is_backup_mode()
 {
   return (TCONF.enable_backup_mode != 0);
-}
-
-char *lbt_oblog()
-{
-  int ret = OB_SUCCESS;
-  //As lbt used when print error log, can not print error log
-  //in this function and functions called.
-  static __thread void *addrs[100];
-  static __thread char buf[LBT_BUFFER_LENGTH];
-  int size = ob_backtrace(addrs, 100);
-  char **res = backtrace_symbols(addrs, 100);
-  int64_t pos = 0;
-
-  for (int idx = 0; OB_SUCC(ret) && idx < size; ++idx) {
-    char *res_idx = res[idx];
-    int tmp_ret = OB_SUCCESS;
-
-    if (OB_NOT_NULL(res_idx)) {
-      if (OB_TMP_FAIL(databuff_printf(buf, LBT_BUFFER_LENGTH, pos, "%s", res_idx))) {
-        if (OB_SIZE_OVERFLOW != ret) {
-          LOG_WARN("atabuff_printf fail when lbt, ignore", KR(tmp_ret), K(idx), K(size), K(buf), K(pos),
-              K(LBT_BUFFER_LENGTH));
-        }
-      }
-    }
-  }
-
-  if (OB_NOT_NULL(res)) {
-    free(res);
-  }
-
-  return buf;
 }
 
 int get_br_value(IBinlogRecord *br,

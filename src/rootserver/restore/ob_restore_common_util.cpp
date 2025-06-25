@@ -13,13 +13,11 @@
 #define USING_LOG_PREFIX RS_RESTORE
 
 #include "ob_restore_common_util.h"
-#include "share/ls/ob_ls_status_operator.h" //ObLSStatusOperator
-#include "share/ls/ob_ls_operator.h"//ObLSAttr
 #include "rootserver/ob_ls_service_helper.h"
-#include "rootserver/ob_tenant_role_transition_service.h"
+#include "rootserver/standby/ob_tenant_role_transition_service.h"
 #include "src/share/ob_schema_status_proxy.h"
-#include "src/share/ob_rpc_struct.h"
 #include "rootserver/ob_ddl_service.h"
+#include "rootserver/ob_tenant_ddl_service.h"
 #ifdef OB_BUILD_TDE_SECURITY
 #include "share/ob_master_key_getter.h"
 #endif
@@ -69,7 +67,7 @@ int ObRestoreCommonUtil::notify_root_key(
       }
     }
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(ObDDLService::notify_root_key(*srv_rpc_proxy_, arg, addrs, result))) {
+    } else if (OB_FAIL(ObTenantDDLService::notify_root_key(*srv_rpc_proxy_, arg, addrs, result))) {
       LOG_WARN("failed to notify root key", KR(ret));
     }
   }
@@ -204,6 +202,9 @@ int ObRestoreCommonUtil::try_update_tenant_role(common::ObMySQLProxy *sql_proxy,
   ObAllTenantInfo all_tenant_info;
   int64_t new_switch_ts = 0;
   bool need_update = false;
+  ObTenantRoleTransitionService role_transition_service;
+  ObTenantRoleTransCostDetail cost_detail;
+  ObTenantRoleTransAllLSInfo all_ls;
 
   if (OB_UNLIKELY(!is_user_tenant(tenant_id)
                   || OB_ISNULL(sql_proxy)
@@ -224,16 +225,24 @@ int ObRestoreCommonUtil::try_update_tenant_role(common::ObMySQLProxy *sql_proxy,
     //update tenant role to standby tenant
     if (all_tenant_info.get_sync_scn() != restore_scn) {
       sync_satisfied = false;
-      LOG_WARN("tenant sync scn not equal to restore scn", KR(ret),
-                      K(all_tenant_info), K(restore_scn));
+      LOG_WARN("tenant sync scn not equal to restore scn", KR(ret), K(all_tenant_info), K(restore_scn));
     } else if (OB_FAIL(ObAllTenantInfoProxy::update_tenant_role(
             tenant_id, sql_proxy, all_tenant_info.get_switchover_epoch(),
             share::STANDBY_TENANT_ROLE, all_tenant_info.get_switchover_status(),
             share::NORMAL_SWITCHOVER_STATUS, new_switch_ts))) {
       LOG_WARN("failed to update tenant role", KR(ret), K(tenant_id), K(all_tenant_info));
+    } else if (OB_FAIL(all_ls.init())) {
+      LOG_WARN("fail to init all_ls", KR(ret));
+    } else if (OB_FAIL(role_transition_service.init(
+        tenant_id,
+        obrpc::ObSwitchTenantArg::OpType::INVALID,
+        false, /* is_verify */
+        sql_proxy,
+        GCTX.srv_rpc_proxy_,
+        &cost_detail,
+        &all_ls))) {
+      LOG_WARN("fail to init role_transition_service", KR(ret), K(tenant_id), KP(sql_proxy), KP(GCTX.srv_rpc_proxy_));
     } else {
-      ObTenantRoleTransitionService role_transition_service(tenant_id, sql_proxy,
-                                GCTX.srv_rpc_proxy_, obrpc::ObSwitchTenantArg::OpType::INVALID);
       (void)role_transition_service.broadcast_tenant_info(
             ObTenantRoleTransitionConstants::RESTORE_TO_STANDBY_LOG_MOD_STR);
     }
@@ -324,7 +333,6 @@ int ObRestoreCommonUtil::check_tenant_is_existed(ObMultiVersionSchemaService *sc
 }
 
 int ObRestoreCommonUtil::set_tde_parameters(common::ObMySQLProxy *sql_proxy,
-                                            obrpc::ObCommonRpcProxy *rpc_proxy,
                                             const uint64_t tenant_id,
                                             const ObString &tde_method,
                                             const ObString &kms_info)
@@ -335,10 +343,9 @@ int ObRestoreCommonUtil::set_tde_parameters(common::ObMySQLProxy *sql_proxy,
   int64_t affected_row = 0;
   if (OB_UNLIKELY(!is_user_tenant(tenant_id)
                   || !ObTdeMethodUtil::is_valid(tde_method)
-                  || NULL == sql_proxy
-                  || NULL == rpc_proxy)) {
+                  || NULL == sql_proxy)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(tde_method), KP(sql_proxy), KP(rpc_proxy));
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(tde_method), KP(sql_proxy));
   } else if (OB_FAIL(sql.assign_fmt("ALTER SYSTEM SET tde_method = '%.*s'",
                                                     tde_method.length(), tde_method.ptr()))) {
     LOG_WARN("failed to assign fmt", KR(ret), K(tde_method));
@@ -356,7 +363,25 @@ int ObRestoreCommonUtil::set_tde_parameters(common::ObMySQLProxy *sql_proxy,
   } else if (OB_FAIL(sql_proxy->write(tenant_id, sql.ptr(), affected_row))) {
     LOG_WARN("failed to execute", KR(ret), K(tenant_id));
   }
-  if (OB_SUCC(ret)) {
+#endif
+  return ret;
+}
+
+int ObRestoreCommonUtil::rebuild_master_key_version(obrpc::ObCommonRpcProxy *rpc_proxy, const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+#ifdef OB_BUILD_TDE_SECURITY
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+  if (OB_UNLIKELY(!is_user_tenant(tenant_id)
+                  || NULL == rpc_proxy)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), KP(rpc_proxy));
+  } else if (!tenant_config.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid tenant config", K(ret), K(tenant_id));
+  } else if (!ObTdeMethodUtil::is_valid(ObString(tenant_config->tde_method.get_value()))) {
+    //do nothing
+  } else {
     const int64_t DEFAULT_TIMEOUT = GCONF.internal_sql_execute_timeout;
     obrpc::ObReloadMasterKeyArg arg;
     obrpc::ObReloadMasterKeyResult result;

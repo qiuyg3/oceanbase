@@ -13,9 +13,8 @@
 #define USING_LOG_PREFIX RS
 
 #include "ob_backup_service.h"
-#include "ob_backup_schedule_task.h"
+#include "src/rootserver/backup/ob_backup_base_service.h"
 #include "ob_backup_task_scheduler.h"
-#include "rootserver/ob_root_utils.h"
 
 namespace oceanbase 
 {
@@ -325,7 +324,7 @@ int ObBackupCleanService::handle_backup_delete(const obrpc::ObBackupCleanArg &ar
     };
     case ObNewBackupCleanType::DELETE_BACKUP_SET: 
     case ObNewBackupCleanType::DELETE_BACKUP_PIECE: {
-    // TODO(wenjinyu.wjy) 4.3 support delete backup set/piece
+    // TODO(xingzhi) 4.4 support delete backup set/piece
       ret = OB_NOT_SUPPORTED;
       break;
     };
@@ -337,7 +336,7 @@ int ObBackupCleanService::handle_backup_delete(const obrpc::ObBackupCleanArg &ar
       break;
     };
     case ObNewBackupCleanType::DELETE_BACKUP_ALL: {
-    // TODO(wenjinyu.wjy) 4.3 support delete backup all function
+    // TODO(xingzhi) 4.4 support delete backup all function
       ret = OB_NOT_SUPPORTED;
       break;
     };

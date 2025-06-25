@@ -438,7 +438,7 @@ REGISTER_OPERATOR(ObLogJoin, PHY_NESTED_LOOP_CONNECT_BY_WITH_INDEX,
 class ObLogJoin;
 class ObNLConnectBySpec;
 class ObNLConnectByOp;
-REGISTER_OPERATOR(ObLogJoin, PHY_NESTED_LOOP_CONNECT_BY, ObNLConnectBySpec,
+REGISTER_OPERATOR(ObLogJoin, PHY_CONNECT_BY, ObNLConnectBySpec,
                   ObNLConnectByOp, NOINPUT);
 
 class ObLogJoin;
@@ -462,12 +462,26 @@ class ObNestedLoopJoinOp;
 REGISTER_OPERATOR(ObLogJoin, PHY_NESTED_LOOP_JOIN, ObNestedLoopJoinSpec,
                   ObNestedLoopJoinOp, NOINPUT, VECTORIZED_OP);
 
+class ObNestedLoopJoinVecSpec;
+class ObNestedLoopJoinVecOp;
+REGISTER_OPERATOR(ObLogJoin, PHY_VEC_NESTED_LOOP_JOIN, ObNestedLoopJoinVecSpec,
+                  ObNestedLoopJoinVecOp, NOINPUT, VECTORIZED_OP, 0 /*+version*/,
+                  SUPPORT_RICH_FORMAT);
+
+
 class ObLogSubPlanFilter;
 class ObSubPlanFilterSpec;
 class ObSubPlanFilterOp;
 REGISTER_OPERATOR(ObLogSubPlanFilter, PHY_SUBPLAN_FILTER,
                   ObSubPlanFilterSpec, ObSubPlanFilterOp,
                   NOINPUT, VECTORIZED_OP);
+
+class ObLogSubPlanFilter;
+class ObSubPlanFilterVecSpec;
+class ObSubPlanFilterVecOp;
+REGISTER_OPERATOR(ObLogSubPlanFilter, PHY_VEC_SUBPLAN_FILTER,
+                  ObSubPlanFilterVecSpec, ObSubPlanFilterVecOp,
+                  NOINPUT, VECTORIZED_OP, 0 /*+version*/, SUPPORT_RICH_FORMAT);
 
 class ObLogSubPlanScan;
 class ObSubPlanScanSpec;
@@ -481,6 +495,12 @@ class ObUnpivotSpec;
 class ObUnpivotOp;
 REGISTER_OPERATOR(ObLogUnpivot, PHY_UNPIVOT, ObUnpivotSpec,
                   ObUnpivotOp, NOINPUT, VECTORIZED_OP);
+
+class ObUnpivotV2Spec;
+class ObUnpivotV2Op;
+REGISTER_OPERATOR(ObLogUnpivot, PHY_UNPIVOT_V2, ObUnpivotV2Spec, ObUnpivotV2Op,
+                  NOINPUT, VECTORIZED_OP, 0 /*+version*/, SUPPORT_RICH_FORMAT,
+                  "PHY_VEC_UNPIVOT");
 
 class ObLogForUpdate;
 class ObTableLockOpInput;
@@ -518,6 +538,11 @@ class ObMergeGroupBySpec;
 class ObMergeGroupByOp;
 REGISTER_OPERATOR(ObLogGroupBy, PHY_MERGE_GROUP_BY, ObMergeGroupBySpec,
                   ObMergeGroupByOp, NOINPUT, VECTORIZED_OP);
+class ObMergeGroupByVecSpec;
+class ObMergeGroupByVecOp;
+REGISTER_OPERATOR(ObLogGroupBy, PHY_VEC_MERGE_GROUP_BY, ObMergeGroupByVecSpec,
+                  ObMergeGroupByVecOp, NOINPUT, VECTORIZED_OP, 0 /*+version*/,
+                  SUPPORT_RICH_FORMAT);
 
 class ObLogGroupBy;
 class ObHashGroupBySpec;
@@ -549,6 +574,12 @@ class ObMergeJoinSpec;
 class ObMergeJoinOp;
 REGISTER_OPERATOR(ObLogJoin, PHY_MERGE_JOIN, ObMergeJoinSpec, ObMergeJoinOp,
                   NOINPUT, VECTORIZED_OP);
+class ObMergeJoinVecSpec;
+class ObMergeJoinVecOp;
+class ObMergeJoinVecInput;
+REGISTER_OPERATOR(ObLogJoin, PHY_VEC_MERGE_JOIN, ObMergeJoinVecSpec, ObMergeJoinVecOp,
+                  NOINPUT, VECTORIZED_OP, 0 /*+version*/,
+                  SUPPORT_RICH_FORMAT);
 
 class ObLogTopk;
 class ObTopKSpec;
@@ -734,6 +765,39 @@ class ObOptimizerStatsGatheringSpec;
 class ObOptimizerStatsGatheringOp;
 REGISTER_OPERATOR(ObLogOptimizerStatsGathering, PHY_OPTIMIZER_STATS_GATHERING,
                   ObOptimizerStatsGatheringSpec, ObOptimizerStatsGatheringOp, NOINPUT, VECTORIZED_OP);
+
+
+class ObLogSet;
+class ObMergeUnionVecSpec;
+class ObMergeUnionVecOp;
+REGISTER_OPERATOR(ObLogSet, PHY_VEC_MERGE_UNION, ObMergeUnionVecSpec, ObMergeUnionVecOp,
+                  NOINPUT, VECTORIZED_OP, 0, SUPPORT_RICH_FORMAT);
+
+class ObLogSet;
+class ObMergeIntersectVecSpec;
+class ObMergeIntersectVecOp;
+REGISTER_OPERATOR(ObLogSet, PHY_VEC_MERGE_INTERSECT, ObMergeIntersectVecSpec,
+                  ObMergeIntersectVecOp, NOINPUT, VECTORIZED_OP, 0,
+                  SUPPORT_RICH_FORMAT);
+
+class ObLogSet;
+class ObMergeExceptVecSpec;
+class ObMergeExceptVecOp;
+REGISTER_OPERATOR(ObLogSet, PHY_VEC_MERGE_EXCEPT, ObMergeExceptVecSpec, ObMergeExceptVecOp,
+                  NOINPUT, VECTORIZED_OP, 0, SUPPORT_RICH_FORMAT);
+class ObLogExpand;
+class ObExpandVecSpec;
+class ObExpandVecOp;
+REGISTER_OPERATOR(ObLogExpand, PHY_EXPAND, ObExpandVecSpec, ObExpandVecOp, NOINPUT, VECTORIZED_OP,
+                  0, /*version*/
+                  SUPPORT_RICH_FORMAT, "PHY_VEC_EXPAND");
+
+// table-direct-insert
+class ObLogInsert;
+class ObTableDirectInsertSpec;
+class ObTableDirectInsertOp;
+class ObTableDirectInsertOpInput;
+REGISTER_OPERATOR(ObLogInsert, PHY_TABLE_DIRECT_INSERT, ObTableDirectInsertSpec, ObTableDirectInsertOp, ObTableDirectInsertOpInput, VECTORIZED_OP, 0 /*version*/, SUPPORT_RICH_FORMAT, "PHY_TABLE_DIRECT_INSERT");
 
 #undef REGISTER_OPERATOR
 #undef REGISTER_OPERATOR_FULL

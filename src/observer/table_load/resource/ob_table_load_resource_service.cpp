@@ -15,9 +15,6 @@
 #include "observer/table_load/resource/ob_table_load_resource_service.h"
 #include "observer/omt/ob_tenant.h"
 #include "observer/table_load/ob_table_load_table_ctx.h"
-#include "share/rc/ob_tenant_base.h"
-#include "share/schema/ob_table_schema.h"
-#include "share/location_cache/ob_location_struct.h"
 
 namespace oceanbase
 {
@@ -227,22 +224,6 @@ int ObTableLoadResourceService::check_inner_stat()
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", KR(ret), K_(tenant_id));
-  }
-
-  return ret;
-}
-
-int ObTableLoadResourceService::check_tenant()
-{
-  int ret = OB_SUCCESS;
-  const uint64_t tenant_id = MTL_ID();
-  ObTenant *tenant = nullptr;
-  if (OB_FAIL(GCTX.omt_->get_tenant(tenant_id, tenant))) {
-    LOG_WARN("fail to get tenant", KR(ret), K(tenant_id));
-  } else if (OB_UNLIKELY(ObUnitInfoGetter::ObUnitStatus::UNIT_NORMAL !=
-                         tenant->get_unit_status())) {
-    ret = OB_ERR_UNEXPECTED_UNIT_STATUS;
-    LOG_WARN("unit status not normal", KR(ret), K(tenant->get_unit_status()));
   }
 
   return ret;

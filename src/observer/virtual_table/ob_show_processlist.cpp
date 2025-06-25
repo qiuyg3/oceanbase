@@ -10,14 +10,9 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "lib/string/ob_string.h"
-#include "share/config/ob_server_config.h"
 #include "observer/virtual_table/ob_show_processlist.h"
 #include "observer/ob_server.h"
-//#include "sql/engine/expr/ob_expr_promotion_util.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/privilege_check/ob_ora_priv_check.h"
-#include "lib/utility/ob_print_utils.h"
 
 using namespace oceanbase::common;
 namespace oceanbase
@@ -151,9 +146,8 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
     //Otherwise, you can show only the threads at the same Tenant with you.
     //If you have the PROCESS privilege, you can show all threads at your Tenant.
     //Otherwise, you can show only your own threads.
-    // if session is marked killed, no display to user.
-    if (sess_info->is_shadow() || sess_info->is_mark_killed()) {
-      //this session info is logical free, shouldn't be added to scanner
+    if (sess_info->is_shadow()) {
+      // do not show shadow session
     } else if ((OB_SYS_TENANT_ID == my_session_->get_priv_tenant_id())
         || (sess_info->get_priv_tenant_id() == my_session_->get_priv_tenant_id()
             && (has_process_privilege()
@@ -168,7 +162,7 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
         switch(col_id) {
           case ID: {
             cur_row_->cells_[cell_idx].set_uint64(static_cast<uint64_t>(
-                                  sess_info->get_compatibility_sessid()));
+                                  sess_info->get_sid()));
             break;
           }
           case USER: {
@@ -487,7 +481,12 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
             break;
           }
           case SERVICE_NAME: {
-            cur_row_->cells_[cell_idx].set_null();
+            if (!sess_info->get_service_name().is_empty()) {
+              cur_row_->cells_[cell_idx].set_varchar(sess_info->get_service_name().ptr());
+              cur_row_->cells_[cell_idx].set_collation_type(default_collation);
+            } else {
+              cur_row_->cells_[cell_idx].set_null();
+            }
             break;
           }
           case TOTAL_CPU_TIME: {
@@ -500,6 +499,27 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
               cur_row_->cells_[cell_idx].set_double(time_sec);
             }
             cur_row_->cells_[cell_idx].set_scale(6);
+            break;
+          }
+          case TOP_INFO: {
+            if ((obmysql::COM_QUERY == sess_info->get_mysql_cmd() ||
+                obmysql::COM_STMT_EXECUTE == sess_info->get_mysql_cmd() ||
+                obmysql::COM_STMT_PREPARE == sess_info->get_mysql_cmd() ||
+                obmysql::COM_STMT_PREXECUTE == sess_info->get_mysql_cmd()) &&
+                !sess_info->get_top_query_string().empty()) {
+              cur_row_->cells_[cell_idx].set_varchar(sess_info->get_top_query_string());
+              cur_row_->cells_[cell_idx].set_collation_type(default_collation);
+            } else {
+              cur_row_->cells_[cell_idx].set_null();
+            }
+            break;
+          }
+          case MEMORY_USAGE: {
+            if (ObSQLSessionState::QUERY_ACTIVE == sess_info->get_session_state()) {
+              cur_row_->cells_[cell_idx].set_int(sess_info->get_sql_mem_used());
+            } else {
+              cur_row_->cells_[cell_idx].set_int(0);
+            }
             break;
           }
           default: {

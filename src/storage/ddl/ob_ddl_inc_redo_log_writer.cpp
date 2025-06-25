@@ -13,7 +13,6 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/ddl/ob_ddl_inc_redo_log_writer.h"
-#include "storage/ls/ob_ls_tx_service.h"
 #include "storage/tx/ob_trans_part_ctx.h"
 #include "storage/tx/ob_trans_service.h"
 #include "storage/tx_storage/ob_ls_service.h"
@@ -171,8 +170,6 @@ int ObDDLIncRedoLogWriter::write_inc_redo_log(
     LOG_WARN("allocate memory failed", K(ret), K(BUF_SIZE));
   } else if (OB_FAIL(local_write_inc_redo_log(redo_info, macro_block_id, task_id, tx_desc))) {
     LOG_WARN("local write inc redo log fail", K(ret), K(redo_info));
-  } else {
-    LOG_INFO("local write inc redo log success", K(macro_block_id));
   }
 
   return ret;
@@ -211,8 +208,6 @@ int ObDDLIncRedoLogWriter::write_inc_commit_log(
   if (OB_SUCC(ret) && remote_write_) {
     if (OB_FAIL(retry_remote_write_inc_commit_log(lob_meta_tablet_id, tx_desc))) {
       LOG_WARN("remote write inc commit log fail", K(ret), K(tablet_id_));
-    } else {
-      LOG_INFO("remote write inc commit log success", K(tablet_id_));
     }
   }
 
@@ -251,21 +246,24 @@ int ObDDLIncRedoLogWriter::write_inc_start_log_with_retry(
   int64_t start_ts = ObTimeUtility::fast_current_time();
   const int64_t timeout_us = ObDDLIncRedoLogWriter::DEFAULT_RETRY_TIMEOUT_US;
   int64_t retry_count = 0;
-  do {
+  while (OB_SUCC(ret)) {
     if (OB_FAIL(THIS_WORKER.check_status())) {
       LOG_WARN("check status failed", K(ret));
+    } else if (ObTimeUtility::fast_current_time() - start_ts > timeout_us) {
+      ret = OB_TIMEOUT;
+      LOG_WARN("already timeout", K(ret), K(start_ts));
     } else if (OB_FAIL(write_inc_start_log(lob_meta_tablet_id, tx_desc, start_scn))) {
       LOG_WARN("write inc ddl start log failed", K(ret));
-    }
-    if (ObDDLIncRedoLogWriter::need_retry(ret, false/*allow_remote_write*/)) {
-      usleep(1000L * 1000L); // 1s
-      ++retry_count;
-      LOG_INFO("retry write ddl inc start log", K(ret), K(ls_id_), K(tablet_id_), K(retry_count));
+      if (ObDDLIncRedoLogWriter::need_retry(ret, false/*allow_remote_write*/)) {
+        usleep(1000L * 1000L); // 1s
+        ++retry_count;
+        LOG_WARN("retry write ddl inc start log", K(ret), K(ls_id_), K(tablet_id_), K(retry_count));
+        ret = OB_SUCCESS;
+      }
     } else {
       break;
     }
-  } while (ObTimeUtility::fast_current_time() - start_ts < timeout_us);
-
+  }
   return ret;
 }
 
@@ -276,10 +274,8 @@ int ObDDLIncRedoLogWriter::write_inc_redo_log_with_retry(
     transaction::ObTxDesc *tx_desc)
 {
   int ret = OB_SUCCESS;
-  int64_t start_ts = ObTimeUtility::fast_current_time();
-  const int64_t timeout_us = ObDDLIncRedoLogWriter::DEFAULT_RETRY_TIMEOUT_US;
   int64_t retry_count = 0;
-  do {
+  while (OB_SUCC(ret)) {
     if (OB_FAIL(THIS_WORKER.check_status())) {
       LOG_WARN("check status failed", K(ret));
     } else if (OB_FAIL(write_inc_redo_log(redo_info, macro_block_id, task_id, tx_desc))) {
@@ -288,11 +284,12 @@ int ObDDLIncRedoLogWriter::write_inc_redo_log_with_retry(
     if (ObDDLIncRedoLogWriter::need_retry(ret, false/*allow_remote_write*/)) {
       usleep(1000L * 1000L); // 1s
       ++retry_count;
-      LOG_INFO("retry write ddl inc start log", K(ret), K(ls_id_), K(tablet_id_), K(retry_count));
+      LOG_WARN("retry write ddl inc redo log", K(ret), K(ls_id_), K(tablet_id_), K(retry_count));
+      ret = OB_SUCCESS;
     } else {
       break;
     }
-  } while (ObTimeUtility::fast_current_time() - start_ts < timeout_us);
+  }
 
   return ret;
 }
@@ -306,21 +303,24 @@ int ObDDLIncRedoLogWriter::write_inc_commit_log_with_retry(
   int64_t start_ts = ObTimeUtility::fast_current_time();
   const int64_t timeout_us = ObDDLIncRedoLogWriter::DEFAULT_RETRY_TIMEOUT_US;
   int64_t retry_count = 0;
-  do {
+  while (OB_SUCC(ret)) {
     if (OB_FAIL(THIS_WORKER.check_status())) {
       LOG_WARN("check status failed", K(ret));
+    } else if (ObTimeUtility::fast_current_time() - start_ts > timeout_us) {
+      ret = OB_TIMEOUT;
+      LOG_WARN("already timeout", K(ret), K(start_ts));
     } else if (OB_FAIL(write_inc_commit_log(allow_remote_write, lob_meta_tablet_id, tx_desc))) {
       LOG_WARN("write inc ddl commit log failed", K(ret));
-    }
-    if (ObDDLIncRedoLogWriter::need_retry(ret, allow_remote_write)) {
-      usleep(1000L * 1000L); // 1s
-      ++retry_count;
-      LOG_INFO("retry write ddl commit log", K(ret), K(ls_id_), K(tablet_id_), K(retry_count));
+      if (ObDDLIncRedoLogWriter::need_retry(ret, false/*allow_remote_write*/)) {
+        usleep(1000L * 1000L); // 1s
+        ++retry_count;
+        LOG_WARN("retry write ddl inc commit log", K(ret), K(ls_id_), K(tablet_id_), K(retry_count));
+        ret = OB_SUCCESS;
+      }
     } else {
       break;
     }
-  } while (ObTimeUtility::fast_current_time() - start_ts < timeout_us);
-
+  }
   return ret;
 }
 
@@ -412,14 +412,23 @@ int ObDDLIncRedoLogWriter::local_write_inc_start_log(
   } else if (OB_ISNULL(ls) || !tablet_id_.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KP(ls), K(tablet_id_));
-  } else if (OB_FAIL(ls->tablet_freeze(tablet_id_, is_sync, abs_timeout_ts))) {
+  } else if (OB_FAIL(ls->tablet_freeze(tablet_id_,
+                                       is_sync,
+                                       abs_timeout_ts,
+                                       false, /*need_rewrite_meta*/
+                                       ObFreezeSourceFlag::DIRECT_INC_START))) {
     LOG_WARN("sync tablet freeze failed", K(ret), K(tablet_id_));
-  } else if (lob_meta_tablet_id.is_valid() && OB_FAIL(ls->tablet_freeze(lob_meta_tablet_id, is_sync, abs_timeout_ts))) {
+  } else if (lob_meta_tablet_id.is_valid() &&
+             OB_FAIL(ls->tablet_freeze(lob_meta_tablet_id,
+                                       is_sync,
+                                       abs_timeout_ts,
+                                       false, /*need_rewrite_meta*/
+                                       ObFreezeSourceFlag::DIRECT_INC_START))) {
     LOG_WARN("sync tablet freeze failed", K(ret), K(lob_meta_tablet_id));
   } else if (OB_ISNULL(cb = OB_NEW(ObDDLIncStartClogCb, ObMemAttr(MTL_ID(), "DDL_IRLW")))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("fail to alloc memory", K(ret));
-  } else if (OB_FAIL(cb->init(log.get_log_basic()))) {
+  } else if (OB_FAIL(cb->init(ls_id_, log.get_log_basic()))) {
     LOG_WARN("failed to init cb", K(ret));
   } else if (OB_ISNULL(trans_ctx = ctx_guard.get_store_ctx().mvcc_acc_ctx_.tx_ctx_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -646,7 +655,10 @@ ObDDLIncRedoLogWriterCallback::ObDDLIncRedoLogWriterCallback()
     data_format_version_(0),
     direct_load_type_(DIRECT_LOAD_INVALID),
     tx_desc_(nullptr),
-    trans_id_()
+    trans_id_(),
+    parallel_cnt_(0),
+    cg_cnt_(0),
+    seq_no_()
 {
 }
 
@@ -665,7 +677,10 @@ int ObDDLIncRedoLogWriterCallback::init(
     const uint64_t data_format_version,
     const ObDirectLoadType direct_load_type,
     ObTxDesc *tx_desc,
-    const ObTransID &trans_id)
+    const ObTransID &trans_id,
+    const int64_t parallel_cnt,
+    const int64_t cg_cnt,
+    const ObTxSEQ seq_no)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
@@ -673,10 +688,11 @@ int ObDDLIncRedoLogWriterCallback::init(
     LOG_WARN("inited twice", K(ret));
   } else if (OB_UNLIKELY(!ls_id.is_valid() || !tablet_id.is_valid() || block_type == DDL_MB_INVALID_TYPE ||
                          !table_key.is_valid() || task_id == 0 || data_format_version < 0 ||
-                         !is_valid_direct_load(direct_load_type) || OB_ISNULL(tx_desc) || !trans_id.is_valid())) {
+                         !is_valid_direct_load(direct_load_type) || OB_ISNULL(tx_desc) || !trans_id.is_valid() ||
+                         !seq_no.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(ls_id), K(tablet_id), K(block_type), K(table_key), K(task_id), K(data_format_version),
-        K(direct_load_type), KP(tx_desc), K(trans_id));
+        K(direct_load_type), KP(tx_desc), K(trans_id), K(seq_no));
   } else if (OB_FAIL(ddl_inc_writer_.init(ls_id, tablet_id))) {
     LOG_WARN("fail to init ddl_inc_writer_", K(ret), K(ls_id), K(tablet_id));
   } else {
@@ -688,6 +704,9 @@ int ObDDLIncRedoLogWriterCallback::init(
     direct_load_type_ = direct_load_type;
     tx_desc_ = tx_desc;
     trans_id_ = trans_id;
+    seq_no_ = seq_no;
+    parallel_cnt_ =  parallel_cnt;
+    cg_cnt_ = cg_cnt;
     is_inited_ = true;
   }
 
@@ -707,11 +726,14 @@ void ObDDLIncRedoLogWriterCallback::reset()
   data_format_version_ = 0;
   direct_load_type_ = DIRECT_LOAD_INVALID;
   tx_desc_ = nullptr;
+  parallel_cnt_ = 0;
+  cg_cnt_ = 0;
   trans_id_.reset();
+  seq_no_.reset();
 }
 
 int ObDDLIncRedoLogWriterCallback::write(
-    ObMacroBlockHandle &macro_handle,
+    const ObStorageObjectHandle &macro_handle,
     const ObLogicMacroBlockId &logic_id,
     char *buf,
     const int64_t buf_len,
@@ -724,8 +746,6 @@ int ObDDLIncRedoLogWriterCallback::write(
   } else if (OB_UNLIKELY(!macro_handle.is_valid() || !logic_id.is_valid() || nullptr == buf || row_count <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(macro_handle), K(logic_id), KP(buf), K(row_count));
-  } else if (OB_FAIL(macro_handle.wait())) {
-    STORAGE_LOG(WARN, "macro block writer fail to wait io finish", K(ret));
   } else {
     macro_block_id_ = macro_handle.get_macro_id();
     redo_info_.table_key_ = table_key_;
@@ -736,6 +756,12 @@ int ObDDLIncRedoLogWriterCallback::write(
     redo_info_.data_format_version_ = data_format_version_;
     redo_info_.type_ = direct_load_type_;
     redo_info_.trans_id_ = trans_id_;
+    redo_info_.macro_block_id_ = MacroBlockId::mock_valid_macro_id();
+    redo_info_.macro_block_id_.set_id_mode((uint64_t)ObMacroBlockIdMode::ID_MODE_SHARE);
+    redo_info_.parallel_cnt_ = parallel_cnt_;
+    redo_info_.cg_cnt_ = cg_cnt_;
+    redo_info_.seq_no_ = seq_no_;
+    redo_info_.with_cs_replica_ = false; // TODO(chengkong): placeholder for column store replica feature
     if (OB_FAIL(ddl_inc_writer_.write_inc_redo_log_with_retry(redo_info_, macro_block_id_, task_id_, tx_desc_))) {
       LOG_WARN("write ddl inc redo log fail", K(ret));
     }

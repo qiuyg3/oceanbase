@@ -27,6 +27,7 @@
 #include "storage/meta_mem/ob_storage_meta_cache.h"
 #include "share/ob_table_range.h"
 #include "share/scn.h"
+#include "storage/blocksstable/ob_table_flag.h"
 
 namespace oceanbase
 {
@@ -108,12 +109,39 @@ public:
     DDL_MEM_MINI_SSTABLE = 25,
     MDS_MINI_SSTABLE = 26,
     MDS_MINOR_SSTABLE = 27,
+    MICRO_MINI_SSTABLE = 28,
+    INC_MAJOR_SSTABLE = 29,
+    INC_COLUMN_ORIENTED_SSTABLE = 30,
+    INC_NORMAL_COLUMN_GROUP_SSTABLE = 31,
+    INC_ROWKEY_COLUMN_GROUP_SSTABLE = 32,
+    INC_MAJOR_DDL_DUMP_SSTABLE = 33,
+    INC_MAJOR_DDL_MERGE_CO_SSTABLE = 34,
+    INC_MAJOR_DDL_MERGE_CG_SSTABLE = 35,
+    INC_MAJOR_DDL_MEM_CO_SSTABLE = 36,
+    INC_MAJOR_DDL_MEM_CG_SSTABLE = 37,
+    INC_MAJOR_DDL_MEM_SSTABLE = 38,
+    INC_MAJOR_DDL_AGGREGATE_CO_SSTABLE = 39,
+    INC_MAJOR_DDL_AGGREGATE_CG_SSTABLE = 40,
     // < add new sstable before here, See is_sstable()
 
     MAX_TABLE_TYPE
   };
 
   OB_INLINE static bool is_table_type_valid(const TableType &type);
+
+  struct SliceRange
+  {
+    OB_UNIS_VERSION(1);
+  public:
+    SliceRange() : start_slice_idx_(0), end_slice_idx_(0) {}
+    void reset() { start_slice_idx_ = 0; end_slice_idx_ = 0; }
+    bool operator ==(const SliceRange &other) const { return start_slice_idx_ == other.start_slice_idx_ && end_slice_idx_ == other.end_slice_idx_; }
+    bool is_merge_slice() const { return 0 == start_slice_idx_ && end_slice_idx_ > 0; }
+    TO_STRING_KV(K_(start_slice_idx), K_(end_slice_idx));
+  public:
+    int32_t start_slice_idx_;
+    int32_t end_slice_idx_;
+  };
 
   struct TableKey
   {
@@ -143,6 +171,9 @@ public:
     OB_INLINE bool is_ddl_mem_co_cg_sstable() const { return ObITable::is_ddl_mem_co_cg_sstable(table_type_); }
     OB_INLINE bool is_meta_major_sstable() const { return ObITable::is_meta_major_sstable(table_type_); }
     OB_INLINE bool is_multi_version_table() const { return ObITable::is_multi_version_table(table_type_); }
+    OB_INLINE bool is_mds_sstable() const { return ObITable::is_mds_sstable(table_type_); }
+    OB_INLINE bool is_mds_mini_sstable() const { return ObITable::is_mds_mini_sstable(table_type_); }
+    OB_INLINE bool is_mds_minor_sstable() const { return ObITable::is_mds_minor_sstable(table_type_); }
     OB_INLINE bool is_ddl_sstable() const { return ObITable::is_ddl_sstable(table_type_); }
     OB_INLINE bool is_ddl_dump_sstable() const { return ObITable::is_ddl_dump_sstable(table_type_); }
     OB_INLINE bool is_ddl_mem_sstable() const { return ObITable::is_ddl_mem_sstable(table_type_); }
@@ -153,25 +184,31 @@ public:
     OB_INLINE bool is_normal_cg_sstable() const { return ObITable::is_normal_cg_sstable(table_type_); }
     OB_INLINE bool is_cg_sstable() const { return ObITable::is_cg_sstable(table_type_); }
     OB_INLINE bool is_column_store_sstable() const { return is_co_sstable() || is_cg_sstable(); }
+    OB_INLINE bool is_row_store_major_sstable() const { return ObITable::is_row_store_major_sstable(table_type_); }
+    OB_INLINE bool is_column_store_major_sstable() const { return ObITable::is_column_store_major_sstable(table_type_); }
+    OB_INLINE bool is_true_major_sstable() const { return is_row_store_major_sstable() || is_column_store_major_sstable(); }
 
     OB_INLINE const common::ObTabletID &get_tablet_id() const { return tablet_id_; }
-    share::SCN get_start_scn() const { return scn_range_.start_scn_; }
-    share::SCN get_end_scn() const { return scn_range_.end_scn_; }
+    share::SCN get_start_scn() const { return scn_range_.start_scn_.atomic_get(); }
+    share::SCN get_end_scn() const { return scn_range_.end_scn_.atomic_get(); }
     OB_INLINE int64_t get_snapshot_version() const
     {
       return version_range_.snapshot_version_;
     }
     OB_INLINE uint16_t get_column_group_id() const { return column_group_idx_; }
+    OB_INLINE uint16_t get_slice_idx() const { return slice_range_.end_slice_idx_; }
     OB_INLINE TableKey& operator=(const TableKey &key)
     {
       table_type_ = key.table_type_;
+      column_group_idx_ = key.column_group_idx_;
       tablet_id_ = key.tablet_id_;
       scn_range_ = key.scn_range_;
-      column_group_idx_ = key.column_group_idx_;
+      slice_range_ = key.slice_range_;
       return *this;
     }
 
-    TO_STRING_KV(K_(tablet_id), K_(column_group_idx), "table_type", get_table_type_name(table_type_), K_(scn_range));
+    TO_STRING_KV(K_(tablet_id), K_(column_group_idx), K_(slice_range), "table_type", get_table_type_name(table_type_),
+        K_(scn_range));
 
   public:
     common::ObTabletID tablet_id_;
@@ -181,6 +218,7 @@ public:
     };
     uint16_t column_group_idx_;
     ObITable::TableType table_type_;
+    SliceRange slice_range_;
   };
 
   ObITable();
@@ -194,25 +232,6 @@ public:
   void set_table_type(ObITable::TableType table_type) { key_.table_type_ = table_type; }
   void set_snapshot_version(int64_t version) { key_.version_range_.snapshot_version_ = version; }
   ObITable::TableType get_table_type() { return key_.table_type_; }
-
-  virtual int exist(
-      ObStoreCtx &ctx,
-      const uint64_t table_id,
-      const storage::ObITableReadInfo &read_info,
-      const blocksstable::ObDatumRowkey &rowkey,
-      bool &is_exist,
-      bool &has_found);
-  virtual int exist(
-      const ObTableIterParam &param,
-	  ObTableAccessContext &context,
-	  const blocksstable::ObDatumRowkey &rowkey,
-	  bool &is_exist,
-	  bool &has_found);
-
-  virtual int exist(
-      ObRowsInfo &rowsInfo,
-      bool &is_exist,
-      bool &has_found);
 
   virtual int scan(
       const ObTableIterParam &param,
@@ -240,6 +259,8 @@ public:
 
   virtual OB_INLINE share::SCN get_start_scn() const;
   virtual OB_INLINE share::SCN get_end_scn() const;
+  // TODO: yanyuan.cxf make it const
+  virtual OB_INLINE share::SCN get_rec_scn() { return share::SCN::invalid_scn(); }
   virtual OB_INLINE share::ObScnRange &get_scn_range() { return key_.scn_range_; }
   virtual OB_INLINE bool is_trans_state_deterministic() { return get_upper_trans_version() < INT64_MAX; }
   virtual int64_t get_snapshot_version() const { return key_.get_snapshot_version(); }
@@ -247,13 +268,15 @@ public:
   virtual int64_t get_max_merged_trans_version() const { return get_snapshot_version(); }
   virtual int get_frozen_schema_version(int64_t &schema_version) const = 0;
   OB_INLINE uint16_t get_column_group_id() const { return key_.get_column_group_id(); }
-
+  OB_INLINE uint16_t get_slice_idx() const { return key_.get_slice_idx(); }
+  OB_INLINE common::ObNewVersionRange &get_version_range() { return key_.version_range_; }
   virtual void inc_ref();
   virtual int64_t dec_ref();
   virtual int64_t get_ref() const { return ATOMIC_LOAD(&ref_cnt_); }
 
   // TODO @hanhui so many table type judgement
   virtual bool is_sstable() const { return is_sstable(key_.table_type_); }
+  virtual bool is_row_store_major_sstable() const { return is_row_store_major_sstable(key_.table_type_); }
   virtual bool is_co_sstable() const { return is_co_sstable(key_.table_type_); }
   virtual bool is_rowkey_cg_sstable() const { return is_rowkey_cg_sstable(key_.table_type_); }
   virtual bool is_normal_cg_sstable() const { return is_normal_cg_sstable(key_.table_type_); }
@@ -264,6 +287,8 @@ public:
   virtual bool is_major_or_ddl_merge_sstable() const { return is_major_sstable() || is_ddl_merge_sstable(key_.table_type_); }
   virtual bool is_minor_sstable() const { return is_minor_sstable(key_.table_type_); }
   virtual bool is_mini_sstable() const { return is_mini_sstable(key_.table_type_); }
+  virtual bool is_mds_minor_sstable() const { return is_mds_minor_sstable(key_.table_type_); }
+  virtual bool is_mds_mini_sstable() const { return is_mds_mini_sstable(key_.table_type_); }
   virtual bool is_multi_version_minor_sstable() const { return is_multi_version_minor_sstable(key_.table_type_); }
   virtual bool is_multi_version_table() const { return is_multi_version_table(key_.table_type_); }
   virtual bool is_memtable() const { return is_memtable(key_.table_type_); }
@@ -278,6 +303,7 @@ public:
   virtual bool is_active_memtable() { return false; }
   OB_INLINE bool is_table_with_scn_range() const { return is_table_with_scn_range(key_.table_type_); }
   virtual OB_INLINE int64_t get_timestamp() const { return 0; }
+  virtual bool is_mds_sstable() const { return is_mds_sstable(key_.table_type_); }
   virtual bool is_ddl_sstable() const { return is_ddl_sstable(key_.table_type_); }
   virtual bool is_ddl_dump_sstable() const { return is_ddl_dump_sstable(key_.table_type_); }
   virtual bool is_ddl_mem_sstable() const { return is_ddl_mem_sstable(key_.table_type_); }
@@ -310,8 +336,10 @@ public:
   {
     return ObITable::TableType::MINOR_SSTABLE == table_type
         || ObITable::TableType::MINI_SSTABLE == table_type
-        || ObITable::TableType::REMOTE_LOGICAL_MINOR_SSTABLE == table_type
-        || ObITable::TableType::DDL_MEM_MINI_SSTABLE == table_type;
+        || ObITable::TableType::DDL_MEM_MINI_SSTABLE == table_type
+        || ObITable::TableType::MDS_MINOR_SSTABLE == table_type
+        || ObITable::TableType::MDS_MINI_SSTABLE == table_type
+        || ObITable::TableType::REMOTE_LOGICAL_MINOR_SSTABLE == table_type;
   }
 
   static bool is_multi_version_table(const TableType table_type)
@@ -326,7 +354,8 @@ public:
 
   static bool is_mini_sstable(const TableType table_type)
   {
-    return ObITable::TableType::MINI_SSTABLE == table_type;
+    return ObITable::TableType::MINI_SSTABLE == table_type
+        || ObITable::TableType::MDS_MINI_SSTABLE == table_type;
   }
 
   /*
@@ -441,9 +470,37 @@ public:
     return ObITable::TableType::DDL_MEM_CG_SSTABLE == table_type
       || ObITable::TableType::DDL_MEM_CO_SSTABLE == table_type;
   }
+  static bool is_mds_mini_sstable(const TableType table_type)
+  {
+    return ObITable::TableType::MDS_MINI_SSTABLE == table_type;
+  }
+  static bool is_mds_minor_sstable(const TableType table_type)
+  {
+    return ObITable::TableType::MDS_MINOR_SSTABLE == table_type;
+  }
+  static bool is_mds_sstable(const TableType table_type)
+  {
+    return is_mds_mini_sstable(table_type) || is_mds_minor_sstable(table_type);
+  }
+  static bool is_row_store_major_sstable(const TableType table_type)
+  {
+    return ObITable::TableType::MAJOR_SSTABLE == table_type;
+  }
+  static bool is_column_store_major_sstable(const TableType table_type)
+  {
+    return ObITable::TableType::COLUMN_ORIENTED_SSTABLE == table_type;
+  }
   static bool is_table_with_scn_range(const TableType table_type)
   {
     return is_multi_version_table(table_type) || is_meta_major_sstable(table_type);
+  }
+  // row store sstable and corresponding column store sstable
+  static bool is_twin_major_sstable(const TableKey &rs_key, const TableKey &cs_key)
+  {
+    return rs_key.is_true_major_sstable()
+        && cs_key.is_true_major_sstable()
+        && rs_key.tablet_id_ == cs_key.tablet_id_
+        && rs_key.scn_range_ == cs_key.scn_range_;
   }
   OB_INLINE static const char* get_table_type_name(const TableType &table_type)
   {
@@ -530,6 +587,7 @@ class ObTablesHandleArray final
 {
 public:
   typedef common::ObArray<storage::ObTableHandleV2> HandlesArray;
+  typedef bool (*IS_RIGH_SSTABLE_TYPE_FUNC)(const ObITable::TableType table_type);
   ObTablesHandleArray();
   ObTablesHandleArray(const uint64_t tenant_id);
   ~ObTablesHandleArray();
@@ -551,11 +609,17 @@ public:
   int get_tables(common::ObIArray<ObITable *> &tables) const;
   int get_first_memtable(ObIMemtable *&memtable) const;
   int get_all_minor_sstables(common::ObIArray<ObITable *> &tables) const;
+  int get_all_remote_major_sstables(common::ObIArray<ObITable *> &tables) const;
+  int get_all_ddl_sstables(common::ObIArray<ObITable *> &tables) const;
+  int get_all_mds_sstables(common::ObIArray<ObITable *> &tables) const;
   int check_continues(const share::ObScnRange *scn_range) const;
   DECLARE_TO_STRING;
 
 private:
   int tablet_id_check(const common::ObTabletID &tablet_id);
+  int get_sstable_with_type_(
+      IS_RIGH_SSTABLE_TYPE_FUNC is_right_sstable_type,
+      common::ObIArray<ObITable *> &tables) const;
 
 private:
   common::ObTabletID tablet_id_;
@@ -604,7 +668,8 @@ bool ObITable::TableKey::operator ==(const TableKey &table_key) const
   bool bret = table_type_ == table_key.table_type_
       && column_group_idx_ == table_key.column_group_idx_
       && tablet_id_ == table_key.tablet_id_
-      && scn_range_ == table_key.scn_range_;
+      && scn_range_ == table_key.scn_range_
+      && slice_range_ == table_key.slice_range_;
   return bret;
 }
 

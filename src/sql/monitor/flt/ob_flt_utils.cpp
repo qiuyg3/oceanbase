@@ -13,15 +13,8 @@
 
 #define USING_LOG_PREFIX SERVER
 
-#include "sql/monitor/flt/ob_flt_utils.h"
-#include "share/ob_define.h"
-#include "sql/session/ob_basic_session_info.h"
-#include "lib/trace/ob_trace.h"
-#include "lib/trace/ob_trace_def.h"
-#include "sql/monitor/flt/ob_flt_extra_info.h"
+#include "ob_flt_utils.h"
 #include "sql/monitor/flt/ob_flt_control_info_mgr.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "lib/json_type/ob_json_base.h"
 
 namespace oceanbase
 {
@@ -92,7 +85,8 @@ namespace sql
 
   int ObFLTUtils::init_flt_info(Ob20ExtraInfo extra_info,
                                sql::ObSQLSessionInfo &session,
-                               bool is_client_support_flt)
+                               bool is_client_support_flt,
+                               bool enable_flt)
   {
     int ret = OB_SUCCESS;
     if (extra_info.exist_full_link_trace()) {
@@ -101,7 +95,7 @@ namespace sql
                                 session));
       extra_info.get_full_link_trace().reset();
     }
-    if (session.get_control_info().is_valid()){
+    if (enable_flt) {
       OZ(init_flt_log_framework(session, is_client_support_flt));
     } else {
       FLT_SET_TRACE_LEVEL(0);
@@ -626,7 +620,7 @@ namespace sql
               jo_ptr->json_type() != ObJsonNodeType::J_ARRAY) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid json type", K(ret), K(jo_ptr->json_type()));
-    } else if (OB_FAIL(jo_ptr->print(j_buf, true, false, 0))) {
+    } else if (OB_FAIL(jo_ptr->print(j_buf, true, 0, false, 0))) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("fail to convert json to string", K(ret));
     } else {

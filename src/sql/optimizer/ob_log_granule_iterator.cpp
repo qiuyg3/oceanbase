@@ -14,8 +14,6 @@
 #include "sql/optimizer/ob_log_granule_iterator.h"
 
 #include "sql/optimizer/ob_log_table_scan.h"
-#include "ob_opt_est_cost.h"
-#include "ob_select_log_plan.h"
 
 using namespace oceanbase;
 using namespace sql;
@@ -168,9 +166,8 @@ int ObLogGranuleIterator::set_range_order()
     // Suppose (range) partition order is asc, so first order is same partition order
     bool is_asc_order = is_ascending_direction(op_ordering.at(0).order_type_);
     bool used = true;
-    if (((stmt->get_query_ctx()->optimizer_features_enable_version_ >= COMPAT_VERSION_4_2_3 &&
-              stmt->get_query_ctx()->optimizer_features_enable_version_ < COMPAT_VERSION_4_3_0) ||
-              stmt->get_query_ctx()->optimizer_features_enable_version_ >= COMPAT_VERSION_4_3_2) &&
+    if (stmt->get_query_ctx()->check_opt_compat_version(COMPAT_VERSION_4_2_3, COMPAT_VERSION_4_3_0,
+                                                        COMPAT_VERSION_4_3_2) &&
         OB_FAIL(check_op_orderding_used_by_parent(used))) {
       LOG_WARN("failed to check op ordering used by parent", K(ret));
     } else if (!used) {

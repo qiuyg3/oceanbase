@@ -11,7 +11,6 @@
  */
 
 #include "ob_datum_rowkey.h"
-#include "ob_datum_range.h"
 #include "share/schema/ob_table_param.h"
 #include "storage/blocksstable/ob_datum_rowkey_vector.h"
 
@@ -200,15 +199,18 @@ DEF_TO_STRING(ObDatumRowkey)
   if (nullptr != buf && buf_len >= 0) {
     if (nullptr != datums_) {
       for (int64_t i = 0; i < datum_cnt_; ++i) {
+        if (i > 0) {
+          databuff_printf(buf, buf_len, pos, ", ");
+        }
         databuff_printf(buf, buf_len, pos, "idx=%ld:", i);
         pos += datums_[i].storage_to_string(buf + pos, buf_len - pos);
-        databuff_printf(buf, buf_len, pos, ",");
       }
     } else {
       J_EMPTY_OBJ();
     }
   }
   J_ARRAY_END();
+  J_COMMA();
   J_KV(K_(store_rowkey));
   J_OBJ_END();
   return pos;
@@ -246,7 +248,11 @@ int ObDatumRowkey::from_rowkey(const ObRowkey &rowkey, common::ObIAllocator &all
       datums = new (datums) ObStorageDatum[datum_cnt_];
       datums_ = datums;
       for (int64_t i = 0; OB_SUCC(ret) && i < datum_cnt_; i++) {
-        if (OB_FAIL(datums[i].from_obj_enhance(rowkey.get_obj_ptr()[i]))) {
+        const ObObj &rowkey_obj = rowkey.get_obj_ptr()[i];
+        if (rowkey_obj.is_lob_storage() && !rowkey_obj.has_lob_header()) {
+          ret = OB_ERR_UNEXPECTED;
+          STORAGE_LOG(WARN, "Lob rowkey does not has lob header", K(ret), K(rowkey_obj));
+        } else if (OB_FAIL(datums[i].from_obj_enhance(rowkey_obj))) {
           STORAGE_LOG(WARN, "Failed to from obj to datum", K(ret), K(i));
         }
       }
@@ -282,7 +288,11 @@ int ObDatumRowkey::from_rowkey(const ObRowkey &rowkey, ObStorageDatumBuffer &dat
     datum_cnt_ = rowkey.get_obj_cnt();
     datums_ = datums;
     for (int64_t i = 0; OB_SUCC(ret) && i < datum_cnt_; i++) {
-      if (OB_FAIL(datums[i].from_obj_enhance(rowkey.get_obj_ptr()[i]))) {
+      const ObObj &rowkey_obj = rowkey.get_obj_ptr()[i];
+      if (rowkey_obj.is_lob_storage() && !rowkey_obj.has_lob_header()) {
+        ret = OB_ERR_UNEXPECTED;
+        STORAGE_LOG(WARN, "Lob rowkey does not has lob header", K(ret), K(rowkey_obj));
+      } else if (OB_FAIL(datums[i].from_obj_enhance(rowkey_obj))) {
         STORAGE_LOG(WARN, "Failed to from obj to datum", K(ret), K(i), K(rowkey));
       }
     }
@@ -318,6 +328,8 @@ int ObDatumRowkey::to_store_rowkey(const common::ObIArray<share::schema::ObColDe
     for (int64_t i = 0; OB_SUCC(ret) && i < datum_cnt_; i++) {
       if (OB_FAIL(datums_[i].to_obj_enhance(objs[i], col_descs.at(i).col_type_))) {
         STORAGE_LOG(WARN, "Failed to transfer datum to obj", K(ret), K(i), K(datums_[i]));
+      } else if (col_descs.at(i).col_type_.is_lob_storage()) {
+        objs[i].set_has_lob_header();
       }
     }
     if (OB_SUCC(ret)) {
@@ -558,9 +570,9 @@ DEF_TO_STRING(ObCommonDatumRowkey)
   J_KV(K_(type), K_(key_ptr));
   J_COMMA();
   if (is_compact_rowkey()) {
-    KPC_(rowkey);
+    J_KV(KPC_(rowkey));
   } else if (is_discrete_rowkey()) {
-    KPC_(discrete_rowkey);
+    J_KV(KPC_(discrete_rowkey));
   }
   J_OBJ_END();
   return pos;
@@ -601,6 +613,8 @@ int ObDatumRowkeyHelper::convert_store_rowkey(const ObDatumRowkey &datum_rowkey,
     for (int64_t i = 0; OB_SUCC(ret) && i < datum_rowkey.get_datum_cnt(); i++) {
       if (OB_FAIL(datum_rowkey.datums_[i].to_obj_enhance(objs[i], col_descs.at(i).col_type_))) {
         STORAGE_LOG(WARN, "Failed to transfer datum to obj", K(ret), K(i), K(datum_rowkey));
+      } else if (col_descs.at(i).col_type_.is_lob_storage()) {
+        objs[i].set_has_lob_header();
       }
     }
     if (OB_SUCC(ret)) {
@@ -608,6 +622,25 @@ int ObDatumRowkeyHelper::convert_store_rowkey(const ObDatumRowkey &datum_rowkey,
         STORAGE_LOG(WARN, "Failed to assign rowkey", K(ret), K(datum_rowkey), K(objs));
       }
     }
+  }
+
+  return ret;
+}
+
+int ObDatumRowkeyHelper::prepare_datum_rowkey(const ObDatumRow &datum_row,
+                                              const int key_datum_cnt,
+                                              const ObIArray<share::schema::ObColDesc> &col_descs,
+                                              ObDatumRowkey &datum_rowkey)
+{
+  int ret = OB_SUCCESS;
+
+  if (!datum_row.is_valid() || col_descs.count() < datum_row.get_column_count()) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "Get invalid datum row", K(ret), K(datum_row), K(col_descs));
+  } else if (OB_FAIL(datum_rowkey.assign(datum_row.storage_datums_, key_datum_cnt))) {
+    STORAGE_LOG(WARN, "Failed to assign datum rowkey", K(ret), K(datum_row), K(key_datum_cnt));
+  } else if (OB_FAIL(convert_store_rowkey(datum_rowkey, col_descs, datum_rowkey.store_rowkey_))) {
+    STORAGE_LOG(WARN, "Failed to convert store rowkeyy", K(ret), K(datum_rowkey));
   }
 
   return ret;

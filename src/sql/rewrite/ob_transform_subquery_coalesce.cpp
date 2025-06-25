@@ -11,13 +11,9 @@
  */
 
 #define USING_LOG_PREFIX SQL_REWRITE
-#include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/rewrite/ob_transform_subquery_coalesce.h"
-#include "sql/rewrite/ob_stmt_comparer.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_optimizer_util.h"
-#include "sql/resolver/expr/ob_raw_expr_util.h"
-#include "sql/ob_sql_context.h"
 #include "sql/resolver/dml/ob_update_stmt.h"
 
 using namespace oceanbase::common;
@@ -79,6 +75,7 @@ int ObTransformSubqueryCoalesce::transform_one_stmt(common::ObIArray<ObParentDML
       rule_based_equal_infos.reset();
       cost_based_equal_infos.reset();
       bool rule_based_trans_happened = false;
+      bool partial_cost_check = false;
       if (OB_FAIL(try_trans_helper.fill_helper(stmt->get_query_ctx()))) {
         LOG_WARN("failed to fill try trans helper", K(ret));
       } else if (OB_FAIL(transform_diff_exprs(stmt, trans_stmt,
@@ -90,7 +87,12 @@ int ObTransformSubqueryCoalesce::transform_one_stmt(common::ObIArray<ObParentDML
         LOG_WARN("failed to append equal infos", K(ret));
       } else if (OB_ISNULL(trans_stmt)) {
         // do nothing
-      } else if (OB_FAIL(accept_transform(parent_stmts, stmt, trans_stmt, false, false, is_happened))) {
+      } else if (OB_FAIL(ObTransformUtils::partial_cost_eval_validity_check(*ctx_, parent_stmts,
+                                                                            stmt, false,
+                                                                            partial_cost_check))) {
+        LOG_WARN("failed to check partial cost eval validity", K(ret));
+      } else if (OB_FAIL(accept_transform(parent_stmts, stmt, trans_stmt, rule_based_trans_happened, false,
+                                          is_happened, partial_cost_check))) {
         LOG_WARN("failed to accept transform", K(ret), KPC(trans_stmt));
       } else if (!is_happened) {
         // do nothing
@@ -98,10 +100,12 @@ int ObTransformSubqueryCoalesce::transform_one_stmt(common::ObIArray<ObParentDML
         LOG_WARN("failed to append equal infos", K(ret));
       }
       if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(try_trans_helper.finish(rule_based_trans_happened || is_happened,
+                                                 stmt->get_query_ctx(),
+                                                 ctx_))) {
+        LOG_WARN("failed to finish try trans helper", K(ret));
       } else if (rule_based_trans_happened || is_happened) {
         trans_happened = true;
-      } else if (OB_FAIL(try_trans_helper.recover(stmt->get_query_ctx()))) {
-        LOG_WARN("failed to recover params", K(ret));
       }
     } while(OB_SUCC(ret) && is_happened);
   }
@@ -911,7 +915,7 @@ int ObTransformSubqueryCoalesce::coalesce_diff_any_all_exprs(ObDMLStmt *stmt,
           LOG_WARN("the new any all expr is invalid", K(ret));
         } else if (OB_FAIL(stmt->pull_all_expr_relation_id())) {
           LOG_WARN("failed to form pull up expr id and level", K(ret));
-        } else if (OB_FAIL(stmt->formalize_stmt(ctx_->session_info_))) {
+        } else if (OB_FAIL(stmt->formalize_stmt(ctx_->session_info_, false))) {
           LOG_WARN("formalize stmt failed", K(ret));
         } else {
           /*do nothing */
@@ -1240,7 +1244,7 @@ int ObTransformSubqueryCoalesce::create_and_expr(const ObIArray<ObRawExpr *> &pa
   } else if (OB_ISNULL(and_expr)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("and expr is null", K(ret));
-  } else if (OB_FAIL(and_expr->get_param_exprs().assign(params))) {
+  } else if (OB_FAIL(and_expr->set_param_exprs(params))) {
     LOG_WARN("failed to assign params", K(ret));
   } else {
     ret_expr = and_expr;
@@ -1593,6 +1597,8 @@ int ObTransformSubqueryCoalesce::check_subquery_validity(ObQueryRefRawExpr *quer
   } else if (contain_subquery) {
     //do nothing
     LOG_WARN("select item contain subquery, can not be coalesced");
+  } else if (!query_ref->has_exec_param()) {
+    valid = true;
   } else if (OB_FAIL(ObTransformUtils::check_correlated_exprs_can_pullup(query_ref->get_exec_params(),
                                                                          *subquery,
                                                                          valid))) {
@@ -1710,6 +1716,9 @@ int ObTransformSubqueryCoalesce::get_subquery_assign_exprs(ObIArray<ObRawExpr*> 
       LOG_WARN("failed to extract expr", K(ret));
     } else if (alias_exprs.count() > 1 || query_ref_exprs.count() > 1) {
       //disable subquery coalescing in this scenes
+      is_valid = false;
+    } else if ((query_ref_exprs.count() == 1 && query_ref_exprs.at(0)->is_shared_reference()) ||
+               (alias_exprs.count() == 1 && alias_exprs.at(0)->is_shared_reference())) {
       is_valid = false;
     }
     for (int64_t j = 0; OB_SUCC(ret) && is_valid && j < query_ref_exprs.count(); ++j) {
@@ -1990,11 +1999,8 @@ int ObTransformSubqueryCoalesce::inner_coalesce_subquery(ObSelectStmt *subquery,
                                                                           col_ref->get_column_id()))) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpect null column item", K(ret));
-        } else if (OB_FAIL(get_map_table_id(subquery,
-                                            coalesce_query,
-                                            map_info,
-                                            col_ref->get_table_id(),
-                                            table_id))) {
+        } else if (OB_FAIL(ObStmtComparer::get_map_table(map_info, subquery, coalesce_query,
+                                                         col_ref->get_table_id(), table_id))) {
           LOG_WARN("failed to get map table id", K(ret));
         } else if (OB_FALSE_IT(column_item->table_id_ = table_id)) {
         } else if (OB_FALSE_IT(col_ref->set_table_id(table_id))) {
@@ -2073,57 +2079,6 @@ int ObTransformSubqueryCoalesce::inner_coalesce_subquery(ObSelectStmt *subquery,
   return ret;
 }
 
-int ObTransformSubqueryCoalesce::get_map_table_id(ObSelectStmt *subquery,
-                                            ObSelectStmt *coalesce_subquery,
-                                            ObStmtMapInfo& map_info,
-                                            const uint64_t &subquery_table_id,
-                                            uint64_t &table_id)
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(subquery) || OB_ISNULL(coalesce_subquery)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpect null stmt", K(ret));
-  }
-  bool find = false;
-  int64_t idx = OB_INVALID_ID;
-  for (int64_t i = 0; OB_SUCC(ret) && !find && i < subquery->get_table_size(); ++i) {
-    TableItem *table = subquery->get_table_item(i);
-    if (OB_ISNULL(table)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpect null table item", K(ret));
-    } else if (subquery_table_id == table->table_id_) {
-      find =  true;
-      idx = i;
-    }
-  }
-  if (OB_SUCC(ret) && (!find || OB_INVALID_ID == idx)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("table shoud be found in subquery" ,K(subquery_table_id), K(ret));
-  }
-  find = false;
-  for (int64_t i = 0; OB_SUCC(ret) && !find && i < map_info.table_map_.count(); ++i) {
-    if (idx == map_info.table_map_.at(i)) {
-      idx = i;
-      find = true;
-    }
-  }
-  if (OB_SUCC(ret) && (!find || OB_INVALID_ID == idx || 
-      idx < 0 || idx > coalesce_subquery->get_table_size())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("incorrect table idx" ,K(idx), K(ret));
-  }
-  if (OB_SUCC(ret)) {
-    TableItem *table = coalesce_subquery->get_table_item(idx);
-    if (OB_ISNULL(table)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpect null table item", K(ret));
-    } else {
-      table_id = table->table_id_;
-    }
-  }
-  return ret;
-}
-
 int ObTransformSubqueryCoalesce::adjust_assign_exprs(ObUpdateStmt *upd_stmt,
                                               StmtCompareHelper *helper, 
                                               ObIArray<ObRawExpr*> &select_exprs, 
@@ -2135,7 +2090,7 @@ int ObTransformSubqueryCoalesce::adjust_assign_exprs(ObUpdateStmt *upd_stmt,
   ObArray<ObExecParamRawExpr *> all_params;
   ObSEArray<ObRawExpr*, 4> old_exprs;
   ObSEArray<ObRawExpr*, 4> new_exprs;
-  if (OB_ISNULL(upd_stmt) || OB_ISNULL(helper) || OB_ISNULL(coalesce_query)) {
+  if (OB_ISNULL(upd_stmt) || OB_ISNULL(helper) || OB_ISNULL(coalesce_query) || OB_ISNULL(ctx_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpect null param", K(ret));
   } else if (OB_FAIL(ctx_->expr_factory_->create_raw_expr(T_REF_QUERY, coalesce_query_expr))) {
@@ -2211,6 +2166,8 @@ int ObTransformSubqueryCoalesce::adjust_assign_exprs(ObUpdateStmt *upd_stmt,
                                                             new_exprs,
                                                             assign.expr_))) {
             LOG_WARN("failed to replace expr", K(ret));
+          } else if (OB_FAIL(assign.expr_->formalize(ctx_->session_info_))) {
+            LOG_WARN("failed to formalize expr", K(ret));
           }
         }
       }
@@ -2608,6 +2565,18 @@ int ObTransformSubqueryCoalesce::sort_coalesce_stmts(Ob2DArray<CoalesceStmts *> 
     if (OB_FAIL(coalesce_stmts.assign(new_stmts))) {
       LOG_WARN("failed to assign array", K(ret));
     }
+  }
+  return ret;
+}
+
+int ObTransformSubqueryCoalesce::check_rule_bypass(const ObDMLStmt &stmt, bool &reject)
+{
+  int ret = OB_SUCCESS;
+  reject = false;
+  if (is_normal_disabled_transform(stmt)) {
+    reject = true;
+  } else if (stmt.get_subquery_expr_size() < 2) {
+    reject = true;
   }
   return ret;
 }

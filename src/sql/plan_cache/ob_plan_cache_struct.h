@@ -37,6 +37,7 @@ class ObString;
 
 namespace sql
 {
+class ObPhysicalPlan;
 
 typedef common::ObSEArray<ObString, 1, common::ModulePageAllocator, true> TmpTableNameArray;
 
@@ -123,7 +124,6 @@ struct ObPlanCacheKey : public ObILibCacheKey
     hash_ret = common::murmurhash(&mode_, sizeof(PlanCacheMode), hash_ret);
     hash_ret = common::murmurhash(&flag_, sizeof(flag_), hash_ret);
     hash_ret = common::murmurhash(&namespace_, sizeof(ObLibCacheNameSpace), hash_ret);
-
     return hash_ret;
   }
 
@@ -169,9 +169,10 @@ struct ObPlanCacheKey : public ObILibCacheKey
     struct
     {
       uint16_t is_weak_read_ : 1;
-      uint16_t use_rich_vector_format_ : 1;
+      uint16_t use_rich_vector_format_ : 1; // FARM COMPAT WHITELIST
       uint16_t config_use_rich_format_ : 1;
-      uint16_t reserved_ : 13; // reserved
+      uint16_t enable_mysql_compatible_dates_ : 1;
+      uint16_t reserved_ : 12; // reserved
     };
   };
   uint64_t sys_var_config_hash_val_;
@@ -229,18 +230,17 @@ public:
     : inner_alloc_("FastParserRes"),
       parameterized_params_(&inner_alloc_),
       cache_params_(NULL),
-      values_token_pos_(0),
-      values_tokens_(&inner_alloc_)
+      values_token_pos_(0)
   {
     reset_question_mark_ctx();
   }
   ObPlanCacheKey pc_key_; //plan cache key, parameterized by fast parser
-  common::ObSEArray<ObPCParam *, 4> raw_params_;
+  common::ObSEArray<ObPCParam *, 16> raw_params_;
   common::ObFixedArray<const common::ObObjParam *, common::ObIAllocator> parameterized_params_;
   ParamStore *cache_params_;
   ObQuestionMarkCtx question_mark_ctx_;
   int64_t values_token_pos_; // for insert values
-  common::ObFixedArray<ObValuesTokenPos, common::ObIAllocator> values_tokens_; // for values table
+  common::ObSEArray<ObValuesTokenPos, 4> values_tokens_; // for values table
   common::ObSEArray<ObArrayPCParam *, 4, common::ModulePageAllocator, true> array_params_;
 
   void reset() {
@@ -249,7 +249,7 @@ public:
     parameterized_params_.reuse();
     cache_params_ = NULL;
     values_token_pos_ = 0;
-    values_tokens_.reuse();
+    values_tokens_.reset();
     array_params_.reuse();
   }
   void reset_question_mark_ctx()
@@ -268,7 +268,6 @@ public:
     parameterized_params_.set_allocator(&inner_alloc_);
     cache_params_ = other.cache_params_;
     question_mark_ctx_ = other.question_mark_ctx_;
-    values_tokens_.set_allocator(&inner_alloc_);
     if (OB_FAIL(raw_params_.assign(other.raw_params_))) {
       SQL_PC_LOG(WARN, "failed to assign fix array", K(ret));
     } else if (OB_FAIL(parameterized_params_.assign(other.parameterized_params_))) {
@@ -401,7 +400,13 @@ struct ObPlanCacheCtx : public ObILibCacheCtx
       tpl_sql_const_cons_(allocator),
       need_retry_add_plan_(true),
       insert_batch_opt_info_(allocator),
-      is_max_curr_limit_(false)
+      is_max_curr_limit_(false),
+      is_batch_insert_opt_(false),
+      is_arraybinding_(false),
+      exist_local_plan_(false),
+      compare_plan_(nullptr),
+      flag_(0),
+      parameterized_ps_sql_()
   {
     fp_result_.pc_key_.mode_ = mode_;
   }
@@ -475,7 +480,12 @@ struct ObPlanCacheCtx : public ObILibCacheCtx
     K(new_raw_sql_),
     K(need_retry_add_plan_),
     K(insert_batch_opt_info_),
-    K(is_max_curr_limit_)
+    K(is_max_curr_limit_),
+    K(is_batch_insert_opt_),
+    K(is_arraybinding_),
+    K(exist_local_plan_),
+    K(flag_),
+    K(parameterized_ps_sql_)
     );
   PlanCacheMode mode_; //control use which variables to do match
 
@@ -538,6 +548,26 @@ struct ObPlanCacheCtx : public ObILibCacheCtx
   bool need_retry_add_plan_;
   ObInsertBatchOptInfo insert_batch_opt_info_;
   bool is_max_curr_limit_;
+  bool is_batch_insert_opt_;
+
+  bool is_arraybinding_;
+  bool exist_local_plan_;
+  common::ObBitSet<common::OB_DEFAULT_BITSET_SIZE, common::ModulePageAllocator, true> fmt_int_or_ch_decint_idx_;
+  ObPhysicalPlan *compare_plan_;
+  union
+  {
+    struct
+    {
+      uint16_t try_get_plan_ : 1;
+      uint16_t add_with_compare_ : 1;
+      uint16_t enable_adaptive_plan_cache_ : 1;
+      uint16_t has_inactive_plan_ : 1;
+      uint16_t force_enable_plan_tracing_ : 1;
+      uint16_t reserved_ : 11;
+    };
+    uint16_t flag_;
+  };
+  common::ObString parameterized_ps_sql_;
 };
 
 struct ObPlanCacheStat

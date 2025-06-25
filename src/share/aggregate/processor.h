@@ -36,8 +36,11 @@ public:
     agg_ctx_(eval_ctx, tenant_id, aggr_infos, label),
     aggregates_(allocator_, aggr_infos.count()),
     fast_single_row_aggregates_(allocator_, aggr_infos.count()), extra_rt_info_buf_(nullptr),
-    cur_extra_rt_info_idx_(0), add_one_row_fns_(allocator_, aggr_infos.count()), row_selector_(nullptr)
-  {}
+    cur_extra_rt_info_idx_(0), add_one_row_fns_(allocator_, aggr_infos.count()),
+    cur_batch_group_idx_(0), cur_batch_group_buf_(nullptr)
+  {
+    agg_ctx_.op_monitor_info_ = &monitor_info;
+  }
   ~Processor() { destroy(); }
   int init();
   void destroy();
@@ -71,19 +74,12 @@ public:
   }
 
   inline int add_batch_for_multi_groups(const int32_t start_agg_id, const int32_t end_agg_id,
-                                        AggrRowPtr *agg_rows, const int64_t batch_size)
+                                        AggrRowPtr *agg_rows, const int64_t batch_size,
+                                        uint16_t *selector, int64_t selector_cnt)
   {
     int ret = OB_SUCCESS;
-    int size = 0;
     OB_ASSERT(batch_size <= agg_ctx_.eval_ctx_.max_batch_size_);
-    if (OB_ISNULL(row_selector_)) {
-      ret = OB_ERR_UNEXPECTED;
-      SQL_LOG(WARN, "unexpected null selector", K(ret));
-    }
-    for (int i = 0; OB_SUCC(ret) && i < batch_size; i++) {
-      if (OB_NOT_NULL(agg_rows[i])) { row_selector_[size++] = i; }
-    }
-    RowSelector iter(row_selector_, size);
+    RowSelector iter(selector, selector_cnt);
     for (int col_id = start_agg_id; OB_SUCC(ret) && col_id < end_agg_id; col_id++) {
       if (OB_FAIL(aggregates_.at(col_id)->add_batch_for_multi_groups(agg_ctx_, agg_rows, iter,
                                                                      batch_size, col_id))) {
@@ -93,6 +89,10 @@ public:
     return ret;
   }
 
+  int advance_collect_result(const int64_t group_id, const RowMeta &row_meta,
+                             aggregate::AggrRowPtr group_row);
+  int collect_group_results(const RowMeta &row_meta, int32_t &output_batch_size,
+                            ObBatchRows &output_brs, int64_t &cur_group_id);
   int collect_group_results(const RowMeta &row_meta, const ObIArray<ObExpr *> &group_exprs,
                             const int32_t output_batch_size, ObBatchRows &output_brs,
                             int64_t &cur_group_id);
@@ -116,6 +116,7 @@ public:
   int generate_group_rows(AggrRowPtr *row_arr, const int32_t batch_size);
   int add_one_aggregate_row(AggrRowPtr data, const int32_t row_size,
                                    bool push_agg_row = true);
+  int add_batch_aggregate_rows(AggrRowPtr *ptrs, uint16_t *selector, int64_t selector_cnt, bool push_agg_row);
 
   inline int64_t get_aggr_used_size() const
   {
@@ -126,6 +127,8 @@ public:
   {
     return agg_ctx_.allocator_.total();
   }
+  inline common::ObIAllocator &get_aggr_alloc()
+  { return agg_ctx_.allocator_; }
   inline void prefetch_aggregate_row(AggrRowPtr row) const
   {
     __builtin_prefetch(row, 0/* read */, 2 /*high temp locality*/);
@@ -160,7 +163,7 @@ public:
   }
   inline bool has_distinct() const
   {
-    return has_distinct_;
+    return agg_ctx_.distinct_count_ > 0;
   }
 
   inline bool has_order_by() const
@@ -170,15 +173,15 @@ public:
 
   // FIXME: support all aggregate functions
   inline static bool all_supported_aggregate_functions(const ObIArray<sql::ObRawExpr *> &aggr_exprs,
-                                                       bool is_scalar_gby = false)
+                                                       bool use_hash_rollup = false,
+                                                       bool has_rollup = false)
   {
     bool supported = true;
     for (int i = 0; supported && i < aggr_exprs.count(); i++) {
       ObAggFunRawExpr *agg_expr = static_cast<ObAggFunRawExpr *>(aggr_exprs.at(i));
       OB_ASSERT(agg_expr != NULL);
-      // TODO: remove distinct constraint @zongmei.zzm
-      supported = aggregate::supported_aggregate_function(agg_expr->get_expr_type())
-                  && !agg_expr->is_param_distinct();
+      supported = aggregate::supported_aggregate_function(agg_expr->get_expr_type(),
+                                                          use_hash_rollup, has_rollup);
     }
     return supported;
   }
@@ -209,17 +212,64 @@ public:
     return *reinterpret_cast<const ObCompactRow *>(payload - sizeof(RowHeader));
   }
 
-  int init_scalar_aggregate_row(ObCompactRow *&row, RowMeta &row_meta, ObIAllocator &allocator);
+  int init_aggr_row_meta(RowMeta &row_meta);
+  int init_one_aggr_row(const RowMeta &row_meta, ObCompactRow *&row, ObIAllocator &extra_allocator,
+                        const int64_t group_id = 0);
+  int reuse_group(const int64_t group_id);
 
   int init_fast_single_row_aggs();
+  bool has_extra() const { return agg_ctx_.has_extra_; }
+  bool get_need_advance_collect() const { return agg_ctx_.need_advance_collect_; }
+  void set_in_window_func(bool v = true) { agg_ctx_.in_window_func_ = v; }
+  bool is_in_window_func() const { return agg_ctx_.in_window_func_; }
+  void set_hp_infras_mgr(ObHashPartInfrasVecMgr *hp_infras_mgr)
+  {
+    agg_ctx_.hp_infras_mgr_ = hp_infras_mgr;
+  }
+  int rollup_batch_process(const AggrRowPtr group_row, AggrRowPtr rollup_row,
+                           int64_t diff_group_idx = -1, const int64_t max_group_cnt = INT64_MIN);
+  inline int swap_group_row(const int a, const int b) // dangerous
+  {
+    int ret = OB_SUCCESS;
+    if (a == b) { // do nothing
+    } else if (agg_ctx_.agg_rows_.count() > common::max(a, b)) {
+      AggrRowPtr groupb = agg_ctx_.agg_rows_.at(b);
+      agg_ctx_.agg_rows_.at(b) = agg_ctx_.agg_rows_.at(a);
+      agg_ctx_.agg_rows_.at(a) = groupb;
+    } else {
+      ret = OB_ARRAY_OUT_OF_RANGE;
+    }
+    return ret;
+  }
+  void set_has_rollup()
+  {
+    agg_ctx_.has_rollup_ = true;
+  }
+  void set_rollup_ctx(RollupContext *ctx)
+  {
+    agg_ctx_.rollup_context_ = ctx;
+  }
+  uint32_t get_distinct_count() const
+  {
+    return agg_ctx_.distinct_count_;
+  }
 
   RuntimeContext *get_rt_ctx() { return &agg_ctx_; }
 
-  static int setup_rt_info(AggrRowPtr data, RuntimeContext &agg_ctx);
+  static ExtraStores *&get_extra_stores(const int64_t agg_col_id, RuntimeContext &agg_ctx,
+                                         char *extra_array_buf);
+  HashBasedDistinctVecExtraResult *&
+  get_distinct_store(const int64_t agg_col_id, RuntimeContext &agg_ctx, char *extra_array_buf);
+  DataStoreVecExtraResult *&get_extra_data_store(const int64_t agg_col_id,
+                                                   RuntimeContext &agg_ctx, char *extra_array_buf);
+  static int setup_rt_info(AggrRowPtr data, RuntimeContext &agg_ctx,
+                           ObIAllocator *extra_allocator = nullptr, const int64_t group_id = 0);
 
   ObIArray<IAggregate *> &get_aggregates() { return aggregates_; }
 
 private:
+  static int init_aggr_row_extra_info(RuntimeContext &agg_ctx, char *extra_array_buf,
+                                      ObIAllocator &extra_allocator, const int64_t group_id = 0);
   int setup_bypass_rt_infos(const int64_t batch_size);
 
   int llc_init_empty(ObExpr &expr, ObEvalCtx &eval_ctx) const;
@@ -231,6 +281,7 @@ private:
   }
 private:
   static const int32_t MAX_SUPPORTED_AGG_CNT = 1000000;
+  static const int64_t BATCH_GROUP_SIZE = 16;
   friend class ObScalarAggregateVecOp;
   using add_one_row_fn = int (*)(IAggregate *, RuntimeContext &, const int32_t, AggrRowPtr,
                                  ObIVector *, const int64_t, const int64_t);
@@ -248,7 +299,8 @@ private:
   char *extra_rt_info_buf_;
   int32_t cur_extra_rt_info_idx_;
   ObFixedArray<add_one_row_fn, ObIAllocator> add_one_row_fns_;
-  uint16_t *row_selector_;
+  int64_t cur_batch_group_idx_;
+  char *cur_batch_group_buf_;
   // ObFixedArray<typename T>
 };
 } // end aggregate

@@ -36,7 +36,6 @@ namespace schema
 {
 class ObMultiVersionSchemaService;
 class ObTableSchema;
-class ObLocality;
 class ObSchemaGetterGuard;
 }
 }
@@ -80,6 +79,7 @@ enum ObResourceType
   RES_CPU = 0,
   RES_MEM = 1,
   RES_LOG_DISK = 2,
+  RES_DATA_DISK = 3,
   RES_MAX
 };
 
@@ -132,10 +132,11 @@ public:
           } else {
             const double factor = assigned / capacity;
             weights[res_type] += factor;
+            ObCStringHelper helper;
             _RS_LOG(INFO, "server resource weight factor: "
                 "[%ld/%ld] server=%s, resource=%s, assigned=%.6g, capacity=%.6g, factor=%.6g, weight=%.6g",
                 i, servers.count(),
-                to_cstring(server_resource.get_server()),
+                helper.convert(server_resource.get_server()),
                 resource_type_to_str(res_type),
                 assigned,
                 capacity,
@@ -394,35 +395,6 @@ public:
   }
 };
 
-class ObLocalityTaskHelp
-{
-public:
-  ObLocalityTaskHelp() {}
-  virtual ~ObLocalityTaskHelp() {}
-  static int filter_logonly_task(
-      const common::ObIArray<share::ObResourcePoolName> &pools,
-      ObUnitManager &unit_mgr,
-      common::ObIArray<share::ObZoneReplicaAttrSet> &zone_locality);
-
-  static int filter_logonly_task(
-      const uint64_t tenant_id,
-      ObUnitManager &unit_manager,
-      share::schema::ObSchemaGetterGuard &schema_guard,
-      common::ObIArray<share::ObZoneReplicaAttrSet> &zone_locality);
-
-  static int alloc_logonly_replica(
-      ObUnitManager &unit_manager,
-      const common::ObIArray<share::ObResourcePoolName> &pools,
-      const common::ObIArray<share::ObZoneReplicaAttrSet> &zone_locality,
-      ObPartitionAddr &partition_addr);
-
-  static int get_logonly_task_with_logonly_unit(
-      const uint64_t tenant_id,
-      ObUnitManager &unit_mgr,
-      share::schema::ObSchemaGetterGuard &schema_guard,
-      common::ObIArray<share::ObZoneReplicaAttrSet> &zone_locality);
-};
-
 enum PaxosReplicaNumberTaskType
 {
   NOP_PAXOS_REPLICA_NUMBER = 0,
@@ -577,6 +549,14 @@ private:
       int64_t pre_paxos_num,
       int64_t cur_paxos_num,
       const share::ObArbitrationServiceStatus &arb_service_status);
+  static int check_zone_same_region(
+      const common::ObZone &z1,
+      const common::ObZone &z2,
+      bool &same_region);
+  static int check_replace_locality_valid(
+      const ObIArray<share::ObZoneReplicaNumSet> &pre_zone_locality,
+      const ObIArray<share::ObZoneReplicaNumSet> &cur_zone_locality,
+      bool &single_replace_valid);
   static int add_multi_zone_locality_task(
       common::ObIArray<AlterPaxosLocalityTask> &alter_paxos_tasks,
       const share::ObZoneReplicaAttrSet &multi_zone_locality,
@@ -602,6 +582,7 @@ public:
   ObRootUtils() {}
   virtual ~ObRootUtils() {}
 
+  static bool if_deployment_mode_match();
   static int get_rs_default_timeout_ctx(ObTimeoutCtx &ctx);
   static int get_invalid_server_list(
     const ObIArray<share::ObServerInfoInTable> &servers_info,

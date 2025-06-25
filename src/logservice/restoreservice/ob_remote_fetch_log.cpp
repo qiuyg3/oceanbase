@@ -11,14 +11,8 @@
  */
 
 #include "ob_remote_fetch_log.h"
-#include "lib/net/ob_addr.h"
-#include "lib/ob_errno.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "logservice/restoreservice/ob_log_restore_define.h"
 #include "ob_log_restore_archive_driver.h"    // ObLogRestoreArchiveDriver
 #include "ob_log_restore_net_driver.h"        // ObLogRestoreNetDriver
-#include "share/restore/ob_log_restore_source.h"
 
 namespace oceanbase
 {
@@ -70,6 +64,7 @@ void ObRemoteFetchLogImpl::destroy()
 
 int ObRemoteFetchLogImpl::do_schedule(const share::ObLogRestoreSourceItem &source)
 {
+  ObDIActionGuard(ObDIActionGuard::NS_ACTION, "SourceType[%s]", ObLogRestoreSourceItem::get_source_type_str(source.type_));
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;

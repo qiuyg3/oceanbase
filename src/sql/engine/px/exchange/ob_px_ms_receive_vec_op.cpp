@@ -13,17 +13,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "ob_px_ms_receive_vec_op.h"
-#include "lib/container/ob_fixed_array.h"
-#include "sql/engine/px/exchange/ob_row_heap.h"
-#include "sql/engine/px/ob_dfo.h"
-#include "sql/engine/px/ob_px_dtl_msg.h"
-#include "sql/engine/px/ob_px_util.h"
-#include "sql/engine/px/ob_px_data_ch_provider.h"
-#include "sql/engine/px/ob_px_dtl_proc.h"
-#include "sql/dtl/ob_dtl_channel_loop.h"
-#include "sql/engine/basic/ob_ra_row_store.h"
 #include "sql/engine/px/ob_px_scheduler.h"
-#include "sql/engine/basic/ob_temp_row_store.h"
 
 namespace oceanbase
 {
@@ -405,7 +395,7 @@ int ObPxMSReceiveVecOp::GlobalOrderInput::get_rows_from_channels(
   while (OB_SUCC(ret) && !fetched && !is_finish()) {
     got_channel_idx = hint_channel_idx;
     if (OB_FAIL(ms_receive_op->ptr_row_msg_loop_->process_one(got_channel_idx))) {
-      if (OB_EAGAIN == ret) {
+      if (OB_DTL_WAIT_EAGAIN == ret) {
         ret = OB_SUCCESS;
         if (OB_FAIL(eval_ctx.exec_ctx_.check_status())) {
           LOG_WARN("check status failed", K(channel_idx), K(ret));
@@ -871,8 +861,8 @@ int ObPxMSReceiveVecOp::get_all_rows_from_channels(ObPhysicalPlanCtx *phy_plan_c
 
         int64_t got_channel_idx = OB_INVALID_INDEX_INT64;
         if (OB_FAIL(ptr_row_msg_loop_->process_one(got_channel_idx))) {
-          if (OB_EAGAIN == ret) {
-            // If no data fetch, then return OB_EAGAIN after OB_ITER_END
+          if (OB_DTL_WAIT_EAGAIN == ret) {
+            // If no data fetch, then return OB_DTL_WAIT_EAGAIN after OB_ITER_END
             ret = OB_SUCCESS;
             if (OB_FAIL(ctx_.check_status())) {
               LOG_WARN("check status failed", K(ret));
@@ -1073,7 +1063,7 @@ int ObPxMSReceiveVecOp::inner_rescan()
   output_iter_.reset();
   output_store_.reset();
   if (OB_FAIL(ObPxReceiveOp::inner_rescan())) {
-    LOG_WARN("fail to do recieve op rescan", K(ret));
+    LOG_WARN("fail to do receive op rescan", K(ret));
   } else if (!MY_SPEC.local_order_
              && OB_FAIL(row_heap_.init(get_channel_count(),
                                        &MY_SPEC.sort_collations_,

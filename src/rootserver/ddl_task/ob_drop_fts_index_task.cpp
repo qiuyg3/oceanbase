@@ -13,10 +13,7 @@
 #define USING_LOG_PREFIX STORAGE_FTS
 
 #include "rootserver/ddl_task/ob_drop_fts_index_task.h"
-#include "share/schema/ob_multi_version_schema_service.h"
-#include "share/ob_ddl_error_message_table_operator.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
-#include "rootserver/ob_root_service.h"
 
 using namespace oceanbase::share;
 
@@ -48,16 +45,18 @@ int ObDropFTSIndexTask::init(
     const ObFTSDDLChildTaskInfo &doc_rowkey,
     const ObFTSDDLChildTaskInfo &domain_index,
     const ObFTSDDLChildTaskInfo &fts_doc_word,
+    const ObString &ddl_stmt_str,
     const int64_t schema_version,
-    const int64_t consumer_group_id)
+    const int64_t consumer_group_id,
+    const int64_t target_object_id)
 {
   int ret = OB_SUCCESS;
   const bool is_fts_task = ddl_type == DDL_DROP_FTS_INDEX;
 
+  // remove !domain_index.is_valid() check, as create fts index may not build all index table success
   if (OB_UNLIKELY(OB_INVALID_ID == tenant_id
                || task_id <= 0
                || OB_INVALID_ID == data_table_id
-               || !domain_index.is_valid()
                || schema_version <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(tenant_id), K(task_id), K(data_table_id),
@@ -73,12 +72,14 @@ int ObDropFTSIndexTask::init(
     LOG_WARN("fail to deep copy from other", K(ret), K(domain_index));
   } else if (is_fts_task && OB_FAIL(fts_doc_word_.deep_copy_from_other(fts_doc_word, allocator_))) {
     LOG_WARN("fail to deep copy from other", K(ret), K(fts_doc_word));
+  } else if (OB_FAIL(set_ddl_stmt_str(ddl_stmt_str))) {
+    LOG_WARN("fail to deep copy drop index arg", K(ret));
   } else {
     task_type_ = ddl_type;
     set_gmt_create(ObTimeUtility::current_time());
     tenant_id_ = tenant_id;
     object_id_ = data_table_id;
-    target_object_id_ = domain_index.table_id_;
+    target_object_id_ = target_object_id; // not use this id
     schema_version_ = schema_version;
     task_id_ = task_id;
     parent_task_id_ = 0; // no parent task
@@ -188,6 +189,8 @@ int ObDropFTSIndexTask::serialize_params_to_message(char *buf, const int64_t buf
     LOG_WARN("fail to serialize aux fts index table info", K(ret), K(domain_index_));
   } else if (OB_FAIL(fts_doc_word_.serialize(buf, buf_size, pos))) {
     LOG_WARN("fail to serialize aux doc word aux table info", K(ret), K(fts_doc_word_));
+  } else if (OB_FAIL(ddl_stmt_str_.serialize(buf, buf_size, pos))) {
+    LOG_WARN("fail to serialize ddl stmt string", K(ret));
   }
   return ret;
 }
@@ -199,8 +202,8 @@ int ObDropFTSIndexTask::deserialize_params_from_message(
     int64_t &pos)
 {
   int ret = OB_SUCCESS;
-  obrpc::ObDropIndexArg tmp_drop_index_arg;
   ObFTSDDLChildTaskInfo tmp_info;
+  ObString tmp_ddl_stmt_str;
   if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || nullptr == buf || buf_size <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(tenant_id), KP(buf), K(buf_size));
@@ -222,6 +225,13 @@ int ObDropFTSIndexTask::deserialize_params_from_message(
     LOG_WARN("fail to deserialize aux doc word table info", K(ret));
   } else if (OB_FAIL(fts_doc_word_.deep_copy_from_other(tmp_info, allocator_))) {
     LOG_WARN("fail to deep copy from tmp info", K(ret), K(tmp_info));
+  } else if (OB_UNLIKELY(pos >= buf_size)) {
+    // The end of the message has been reached. It is an old version message without drop index arg.
+    // just skip.
+  } else if (OB_FAIL(tmp_ddl_stmt_str.deserialize(buf, buf_size, pos))) {
+    LOG_WARN("fail to deserialize drop index arg", K(ret));
+  } else if (OB_FAIL(ob_write_string(allocator_, tmp_ddl_stmt_str, ddl_stmt_str_))) {
+    LOG_WARN("fail to copy ddl stmt string", K(ret), K(tmp_ddl_stmt_str));
   }
   return ret;
 }
@@ -232,17 +242,8 @@ int64_t ObDropFTSIndexTask::get_serialize_param_size() const
        + rowkey_doc_.get_serialize_size()
        + doc_rowkey_.get_serialize_size()
        + domain_index_.get_serialize_size()
-       + fts_doc_word_.get_serialize_size();
-}
-
-void ObDropFTSIndexTask::flt_set_task_span_tag() const
-{
-  // TODO: @hanxuan, add me for tracing.
-}
-
-void ObDropFTSIndexTask::flt_set_status_span_tag() const
-{
-  // TODO: @hanxuan, add me for tracing.
+       + fts_doc_word_.get_serialize_size()
+       + ddl_stmt_str_.get_serialize_size();
 }
 
 int ObDropFTSIndexTask::check_switch_succ()
@@ -256,23 +257,50 @@ int ObDropFTSIndexTask::check_switch_succ()
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("hasn't initialized", K(ret));
-  } else if (OB_ISNULL(root_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected error, root service is nullptr", K(ret), KP(root_service_));
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), KP(GCTX.schema_service_));
   } else if (OB_FAIL(refresh_schema_version())) {
     LOG_WARN("refresh schema version failed", K(ret));
-  } else if (OB_FAIL(root_service_->get_schema_service().get_tenant_schema_guard(tenant_id_, schema_guard))) {
+  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id_, schema_guard))) {
     LOG_WARN("fail to get tenant schema", K(ret), K(tenant_id_));
-  } else if (OB_FAIL(schema_guard.check_table_exist(tenant_id_, domain_index_.table_id_, is_domain_index_exist))) {
+  } else if (domain_index_.is_valid()
+          && OB_FAIL(schema_guard.check_table_exist(tenant_id_, domain_index_.table_id_, is_domain_index_exist))) {
     LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(domain_index_));
-  } else if (OB_FAIL(is_fts_task() && schema_guard.check_table_exist(tenant_id_, fts_doc_word_.table_id_, is_doc_word_exist))) {
+  } else if (fts_doc_word_.is_valid()
+          && OB_FAIL(is_fts_task() && schema_guard.check_table_exist(tenant_id_, fts_doc_word_.table_id_, is_doc_word_exist))) {
     LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(fts_doc_word_));
-  } else if (OB_FAIL(schema_guard.check_table_exist(tenant_id_, doc_rowkey_.table_id_, is_doc_rowkey_exist))) {
+  } else if (doc_rowkey_.is_valid()
+          && OB_FAIL(schema_guard.check_table_exist(tenant_id_, doc_rowkey_.table_id_, is_doc_rowkey_exist))) {
     LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(doc_rowkey_));
-  } else if (OB_FAIL(schema_guard.check_table_exist(tenant_id_, rowkey_doc_.table_id_, is_rowkey_doc_exist))) {
+  } else if (rowkey_doc_.is_valid()
+          && OB_FAIL(schema_guard.check_table_exist(tenant_id_, rowkey_doc_.table_id_, is_rowkey_doc_exist))) {
     LOG_WARN("fail to check table exist", K(ret), K(tenant_id_), K(rowkey_doc_));
   } else if (!is_domain_index_exist && !is_doc_word_exist && !is_rowkey_doc_exist && !is_doc_rowkey_exist) {
-    task_status_ = ObDDLTaskStatus::SUCCESS;
+    uint64_t doc_id_col_id = OB_INVALID_ID;
+    uint64_t ft_col_id = OB_INVALID_ID;
+    const ObTableSchema *data_table_schema = nullptr;
+    bool has_fts_index = false;
+    bool has_multivalue_index = false;
+
+    int tmp_ret = schema_guard.get_table_schema(tenant_id_, object_id_, data_table_schema);
+    if (tmp_ret != OB_SUCCESS) {
+    } else if (OB_ISNULL(data_table_schema)) {
+    } else if ((tmp_ret = data_table_schema->check_has_fts_index(schema_guard, has_fts_index))!= OB_SUCCESS) {
+    } else if ((tmp_ret = data_table_schema->check_has_multivalue_index(schema_guard, has_multivalue_index))!= OB_SUCCESS) {
+    } else if (!has_fts_index && !has_multivalue_index
+      && (tmp_ret = data_table_schema->get_fulltext_column_ids(doc_id_col_id, ft_col_id)) != OB_SUCCESS) {
+    }
+
+    // 主表存在，并且fts,multivalue索引不存在了，doc-id列从主表中移除
+    // 否则可能出现小概率的dml的时候，schema没有刷新，导致cg阶段多了doc-id列
+    if (tmp_ret == OB_SUCCESS
+        && OB_ISNULL(data_table_schema)
+        && doc_id_col_id != OB_INVALID_ID) {
+      // do nothing
+    } else {
+      task_status_ = ObDDLTaskStatus::SUCCESS;
+    }
   }
   return ret;
 }
@@ -282,19 +310,24 @@ int ObDropFTSIndexTask::prepare(const share::ObDDLTaskStatus &new_status)
   int ret = OB_SUCCESS;
   bool has_finished = false;
   ObSchemaGetterGuard schema_guard;
+  DEBUG_SYNC(DROP_FTS_INDEX_PREPARE_STATUS);
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObDropFTSIndexTask has not been inited", K(ret));
-  } else if (OB_ISNULL(root_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected error, root service is nullptr", K(ret), KP(root_service_));
-  } else if (OB_FAIL(root_service_->get_schema_service().get_tenant_schema_guard(tenant_id_, schema_guard))) {
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), KP(GCTX.schema_service_));
+  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id_, schema_guard))) {
     LOG_WARN("fail to get tenant schema guard", K(ret), K(tenant_id_));
-  } else if (0 == domain_index_.task_id_
+  } else if (!domain_index_.is_valid() && !fts_doc_word_.is_valid()) {
+    // create fts/multivalue index may also fail, there's possility that domain index create failed just jump into next status
+    // maybe calling ObDropFTSIndexTask do cleaning work
+    has_finished = true;
+    LOG_INFO("prepare drop index, 3rd and 4th table is not valid.", K(domain_index_), K(fts_doc_word_), K(rowkey_doc_), K(doc_rowkey_));
+  } else if (0 == domain_index_.task_id_ && domain_index_.is_valid()
       && OB_FAIL(create_drop_index_task(schema_guard, domain_index_.table_id_, domain_index_.index_name_, domain_index_.task_id_))) {
       LOG_WARN("fail to create drop index task", K(ret), K(domain_index_));
-  } else if (is_fts_task()
-      && 0 == fts_doc_word_.task_id_
+  } else if (fts_doc_word_.is_valid() && 0 == fts_doc_word_.task_id_
       && OB_FAIL(create_drop_index_task(schema_guard, fts_doc_word_.table_id_, fts_doc_word_.index_name_, fts_doc_word_.task_id_))) {
     LOG_WARN("fail to create drop index task", K(ret), K(fts_doc_word_));
   } else if (OB_FAIL(wait_fts_child_task_finish(has_finished))) {
@@ -407,9 +440,9 @@ int ObDropFTSIndexTask::wait_doc_child_task_finish(bool &has_finished)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObFTSDDLChildTaskInfo, 2> doc_child_tasks;
-  if (OB_FAIL(doc_child_tasks.push_back(doc_rowkey_))) {
+  if (doc_rowkey_.is_valid() && OB_FAIL(doc_child_tasks.push_back(doc_rowkey_))) {
     LOG_WARN("fail to push back doc rowkey child task", K(ret));
-  } else if (OB_FAIL(doc_child_tasks.push_back(rowkey_doc_))) {
+  } else if (rowkey_doc_.is_valid() && OB_FAIL(doc_child_tasks.push_back(rowkey_doc_))) {
     LOG_WARN("fail to push back rowkey doc child task", K(ret));
   } else if (OB_FAIL(wait_child_task_finish(doc_child_tasks, has_finished))) {
     LOG_WARN("fail to wait child task finish", K(ret), K(doc_child_tasks));
@@ -427,10 +460,11 @@ int ObDropFTSIndexTask::create_drop_index_task(
   const ObTableSchema *index_schema = nullptr;
   const ObDatabaseSchema *database_schema = nullptr;
   const ObTableSchema *data_table_schema = nullptr;
+  ObSqlString drop_index_sql;
   bool is_index_exist = false;
-  if (OB_ISNULL(root_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected error, root service is nullptr", K(ret), KP(root_service_));
+  if (OB_ISNULL(GCTX.rs_rpc_proxy_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), KP(GCTX.rs_rpc_proxy_));
   } else if (OB_INVALID_ID == index_tid) {
     // nothing to do, just by pass.
     task_id = -1;
@@ -454,6 +488,8 @@ int ObDropFTSIndexTask::create_drop_index_task(
   } else if (OB_UNLIKELY(nullptr == database_schema || nullptr == data_table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected error, schema is nullptr", K(ret), KP(database_schema), KP(data_table_schema));
+  } else if (index_schema->is_fts_index_aux() && OB_FAIL(drop_index_sql.assign(ddl_stmt_str_))) {
+    LOG_WARN("fail to assign drop index sql", K(ret));
   } else {
     int64_t ddl_rpc_timeout_us = 0;
     obrpc::ObDropIndexArg arg;
@@ -470,18 +506,25 @@ int ObDropFTSIndexTask::create_drop_index_task(
     arg.ddl_stmt_str_        = nullptr;
     arg.is_add_to_scheduler_ = true;
     arg.task_id_             = task_id_;
+    if (index_schema->is_fts_index_aux()) {
+      arg.ddl_stmt_str_ = drop_index_sql.string();
+    }
     if (OB_FAIL(ObDDLUtil::get_ddl_rpc_timeout(
             index_schema->get_all_part_num() + data_table_schema->get_all_part_num(), ddl_rpc_timeout_us))) {
       LOG_WARN("fail to get ddl rpc timeout", K(ret));
-    } else if (OB_FAIL(root_service_->get_common_rpc_proxy().timeout(ddl_rpc_timeout_us).drop_index(arg, res))) {
+    } else if (OB_FAIL(GCTX.rs_rpc_proxy_->timeout(ddl_rpc_timeout_us).drop_index(arg, res))) {
       LOG_WARN("fail to drop index", K(ret), K(ddl_rpc_timeout_us), K(arg), K(res.task_id_));
     } else {
       task_id = res.task_id_;
     }
     LOG_INFO("drop index", K(ret), K(index_tid), K(index_name), K(task_id),
         "data table name", data_table_schema->get_table_name_str(),
-        "database name", database_schema->get_database_name_str());
+        "database name", database_schema->get_database_name_str(),
+        K(drop_index_sql.ptr()));
   }
+
+  DEBUG_SYNC(AFTER_DROP_FTS_SUBMIT_SUBTASK);
+
   return ret;
 }
 
@@ -492,15 +535,15 @@ int ObDropFTSIndexTask::create_drop_doc_rowkey_task()
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (OB_ISNULL(root_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected error, root service is nullptr", K(ret), KP(root_service_));
-  } else if (OB_FAIL(root_service_->get_schema_service().get_tenant_schema_guard(tenant_id_, schema_guard))) {
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), KP(GCTX.schema_service_));
+  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id_, schema_guard))) {
     LOG_WARN("fail to get tenant schema guard", K(ret), K(tenant_id_));
-  } else if (0 == rowkey_doc_.task_id_
+  } else if (0 == rowkey_doc_.task_id_ && rowkey_doc_.is_valid()
       && OB_FAIL(create_drop_index_task(schema_guard, rowkey_doc_.table_id_, rowkey_doc_.index_name_, rowkey_doc_.task_id_))) {
       LOG_WARN("fail to create drop index task", K(ret), K(rowkey_doc_));
-  } else if (0 == doc_rowkey_.task_id_
+  } else if (0 == doc_rowkey_.task_id_ && doc_rowkey_.is_valid()
       && OB_FAIL(create_drop_index_task(schema_guard, doc_rowkey_.table_id_, doc_rowkey_.index_name_, doc_rowkey_.task_id_))) {
       LOG_WARN("fail to create drop index task", K(ret), K(doc_rowkey_));
   }
@@ -509,12 +552,20 @@ int ObDropFTSIndexTask::create_drop_doc_rowkey_task()
 
 int ObDropFTSIndexTask::succ()
 {
-  return cleanup();
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(cleanup())) {
+    LOG_WARN("cleanup task failed", K(ret));
+  }
+  return ret;
 }
 
 int ObDropFTSIndexTask::fail()
 {
-  return cleanup();
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(cleanup())) {
+    LOG_WARN("cleanup task failed", K(ret));
+  }
+  return ret;
 }
 
 int ObDropFTSIndexTask::cleanup_impl()
@@ -526,7 +577,10 @@ int ObDropFTSIndexTask::cleanup_impl()
     LOG_WARN("not init", K(ret));
   } else if (OB_FAIL(report_error_code(unused_str))) {
     LOG_WARN("report error code failed", K(ret));
-  } else if (OB_FAIL(ObDDLTaskRecordOperator::delete_record(root_service_->get_sql_proxy(), tenant_id_, task_id_))) {
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), KP(GCTX.sql_proxy_));
+  } else if (OB_FAIL(ObDDLTaskRecordOperator::delete_record(*GCTX.sql_proxy_, tenant_id_, task_id_))) {
     LOG_WARN("delete task record failed", K(ret), K(task_id_), K(schema_version_));
   } else {
     need_retry_ = false;      // clean succ, stop the task

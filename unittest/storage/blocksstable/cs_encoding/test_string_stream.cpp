@@ -13,16 +13,9 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include <gtest/gtest.h>
-#include <iostream>
-#include <random>
 #define protected public
 #define private public
-#include "storage/blocksstable/cs_encoding/ob_string_stream_encoder.h"
 #include "storage/blocksstable/cs_encoding/ob_string_stream_decoder.h"
-#include "storage/blocksstable/cs_encoding/ob_column_encoding_struct.h"
-#include "storage/blocksstable/cs_encoding/ob_cs_decoding_util.h"
-#include "lib/codec/ob_fast_delta.h"
-#include "lib/compress/ob_compress_util.h"
 
 namespace oceanbase
 {
@@ -167,7 +160,7 @@ public:
       total_len = datums->count() * fixed_len;
     }
     ctx.build_string_stream_meta(fixed_len, is_use_zero_len_as_null, total_len);
-    ctx.build_string_stream_encoder_info(type, false, &encoding_opt, nullptr, -1, &allocator_);
+    ctx.build_string_stream_encoder_info(type, false, &encoding_opt, nullptr, -1, DATA_VERSION_4_3_2_1, &allocator_);
     int64_t bitmap_size = pad8(size);
     char *bitmap = new char[bitmap_size];
     memset(bitmap, 0, bitmap_size);

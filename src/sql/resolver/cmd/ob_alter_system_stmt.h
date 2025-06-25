@@ -18,6 +18,9 @@
 #include "share/scheduler/ob_sys_task_stat.h"
 #include "share/backup/ob_backup_clean_struct.h"
 #include "rootserver/ob_transfer_partition_command.h"
+#include "share/ob_service_name_proxy.h"
+#include "share/rebuild_tablet/ob_rebuild_tablet_location.h"
+#include "share/table/ob_redis_importer.h"
 
 namespace oceanbase
 {
@@ -129,6 +132,16 @@ public:
   int32_t file_id_;
 };
 
+class ObFlushSSMicroCacheStmt : public ObSystemCmdStmt
+{
+public:
+  ObFlushSSMicroCacheStmt() : ObSystemCmdStmt(stmt::T_FLUSH_SS_MICRO_CACHE) {}
+  virtual ~ObFlushSSMicroCacheStmt() {}
+
+  TO_STRING_KV(N_STMT_TYPE, ((int)stmt_type_), K_(tenant_name));
+  common::ObFixedLengthString<common::OB_MAX_TENANT_NAME_LENGTH + 1> tenant_name_;
+};
+
 class ObFlushDagWarningsStmt : public ObSystemCmdStmt
 {
 public:
@@ -218,6 +231,60 @@ public:
   const obrpc::ObAdminZoneArg &get_arg() const { return arg_; }
 private:
   obrpc::ObAdminZoneArg arg_;
+};
+
+class ObAdminStorageStmt : public ObSystemCmdStmt
+{
+public:
+  ObAdminStorageStmt()
+      : ObSystemCmdStmt(stmt::T_ADMIN_STORAGE),
+        arg_()
+  {
+  }
+
+  ObAdminStorageStmt(common::ObIAllocator *name_pool)
+      : ObSystemCmdStmt(name_pool, stmt::T_ADMIN_STORAGE),
+        arg_()
+  {
+  }
+
+  virtual ~ObAdminStorageStmt() {}
+
+  inline const common::ObString get_path() const { return arg_.path_.str(); }
+  inline int set_path(const common::ObString &path) { return arg_.path_.assign(path); }
+  inline const common::ObString get_accessinfo() const { return arg_.access_info_.str(); }
+  inline int set_accessinfo(const common::ObString &access_info) { return arg_.access_info_.assign(access_info); }
+  inline const common::ObString get_attribute() const { return arg_.attribute_.str(); }
+  inline int set_attribute(const common::ObString &attribute) { return arg_.attribute_.assign(attribute); }
+  inline const common::ObZone &get_zone() const { return arg_.zone_; }
+  inline void set_zone(const common::ObZone &zone) { arg_.zone_ = zone; }
+  inline const common::ObRegion &get_region() const { return arg_.region_; }
+  inline void set_region(const common::ObRegion &region) { arg_.region_ = region; }
+  inline const share::ObScopeType::TYPE &get_scope_type() const { return arg_.scope_type_; }
+  inline void set_scope_type(const share::ObScopeType::TYPE &scope_type) { arg_.scope_type_ = scope_type; }
+  inline const share::ObStorageUsedType::TYPE &get_storage_use_type() const { return arg_.use_for_; }
+  inline void set_storage_use_type(const share::ObStorageUsedType::TYPE &use_for) { arg_.use_for_ = use_for; }
+  inline const bool &get_force_type() const { return arg_.force_type_; }
+  inline void set_force_type(const bool &force_type) { arg_.force_type_ = force_type; }
+  inline const bool &get_wait_type() const { return arg_.wait_type_; }
+  inline void set_wait_type(const bool &wait_type) { arg_.wait_type_ = wait_type; }
+  inline obrpc::ObAdminStorageArg::AdminStorageOp get_op() const { return arg_.op_; }
+  inline void set_op(const obrpc::ObAdminStorageArg::AdminStorageOp op) { arg_.op_ = op; }
+  inline int set_alter_accessinfo_option() {
+    return arg_.alter_storage_options_.add_member(obrpc::ObAdminStorageArg::ALTER_STORAGE_ACCESS_INFO);
+  }
+  inline bool has_alter_accessinfo_option() {
+    return arg_.alter_storage_options_.has_member(obrpc::ObAdminStorageArg::ALTER_STORAGE_ACCESS_INFO);
+  }
+  inline int set_alter_attribute_option() {
+    return arg_.alter_storage_options_.add_member(obrpc::ObAdminStorageArg::ALTER_STORAGE_ATTRIBUTE);
+  }
+  inline bool has_alter_attribute_option() {
+    return arg_.alter_storage_options_.has_member(obrpc::ObAdminStorageArg::ALTER_STORAGE_ATTRIBUTE);
+  }
+  const obrpc::ObAdminStorageArg &get_arg() const { return arg_; }
+private:
+  obrpc::ObAdminStorageArg arg_;
 };
 
 class ObSwitchReplicaRoleStmt : public ObSystemCmdStmt
@@ -376,6 +443,19 @@ private:
   obrpc::ObAdminSetConfigArg rpc_arg_;
 };
 
+class ObChangeExternalStorageDestStmt : public ObSystemCmdStmt
+{
+public:
+  ObChangeExternalStorageDestStmt() : ObSystemCmdStmt(stmt::T_CHANGE_EXTERNAL_STORAGE_DEST) {}
+  virtual ~ObChangeExternalStorageDestStmt() {}
+
+  obrpc::ObAdminSetConfigArg &get_rpc_arg() { return rpc_arg_; }
+
+  TO_STRING_KV(N_STMT_TYPE, ((int)stmt_type_), K_(rpc_arg));
+private:
+  obrpc::ObAdminSetConfigArg rpc_arg_;
+};
+
 class ObSetTPStmt : public ObSystemCmdStmt
 {
 public:
@@ -400,6 +480,18 @@ public:
   TO_STRING_KV(N_STMT_TYPE, ((int)stmt_type_), K_(rpc_arg));
 private:
   obrpc::ObAdminMigrateUnitArg rpc_arg_;
+};
+
+class ObAlterLSReplicaStmt : public ObSystemCmdStmt
+{
+public:
+  ObAlterLSReplicaStmt() : ObSystemCmdStmt(stmt::T_ALTER_LS_REPLICA) {}
+  virtual ~ObAlterLSReplicaStmt() {}
+
+  obrpc::ObAdminAlterLSReplicaArg &get_rpc_arg() { return rpc_arg_; }
+  TO_STRING_KV(N_STMT_TYPE, ((int)stmt_type_), K_(rpc_arg));
+private:
+  obrpc::ObAdminAlterLSReplicaArg rpc_arg_;
 };
 
 class ObAddArbitrationServiceStmt : public ObSystemCmdStmt
@@ -583,18 +675,22 @@ private:
   obrpc::ObUpgradeJobArg rpc_arg_;
 };
 
-class ObRefreshTimeZoneInfoStmt : public ObSystemCmdStmt
+class ObLoadTimeZoneInfoStmt : public ObSystemCmdStmt
 {
 public:
-  ObRefreshTimeZoneInfoStmt() : ObSystemCmdStmt(stmt::T_REFRESH_TIME_ZONE_INFO),
-                                tenant_id_(OB_INVALID_TENANT_ID)
+  ObLoadTimeZoneInfoStmt() : ObSystemCmdStmt(stmt::T_LOAD_TIME_ZONE_INFO),
+                                tenant_id_(OB_INVALID_TENANT_ID), path_()
   { }
-  virtual ~ObRefreshTimeZoneInfoStmt() {}
+  virtual ~ObLoadTimeZoneInfoStmt() {}
   void set_tenant_id(uint64_t tenant_id) { tenant_id_ = tenant_id; }
   uint64_t get_tenant_id() { return tenant_id_; }
+  ObString get_path() const { return path_; }
+  void set_path(ObString path) { path_ = path; }
   TO_STRING_KV(N_STMT_TYPE, ((int)stmt_type_), K_(tenant_id));
 
+private:
   uint64_t tenant_id_;
+  ObString path_;
 };
 
 class ObCancelTaskStmt : public ObSystemCmdStmt
@@ -1183,6 +1279,30 @@ private:
   share::ObBackupPathString backup_dest_;
   ObString encrypt_key_;
 };
+
+class ObBackupClusterParamStmt : public ObSystemCmdStmt
+{
+public:
+  ObBackupClusterParamStmt()
+    : ObSystemCmdStmt(stmt::T_BACKUP_CLUSTER_PARAMETERS),
+      backup_dest_() {}
+  virtual ~ObBackupClusterParamStmt() {}
+  const share::ObBackupPathString &get_backup_dest() const { return backup_dest_; }
+  int set_param(const share::ObBackupPathString &backup_dest)
+  {
+    int ret = common::OB_SUCCESS;
+    if (OB_FAIL(backup_dest_.assign(backup_dest))) {
+      COMMON_LOG(WARN, "set backup dest failed", K(backup_dest));
+    }
+    return ret;
+  }
+
+  TO_STRING_KV(N_STMT_TYPE, ((int)stmt_type_), K_(backup_dest));
+
+private:
+  share::ObBackupPathString backup_dest_;
+};
+
 class ObTableTTLStmt : public ObSystemCmdStmt {
 public:
   ObTableTTLStmt()
@@ -1376,6 +1496,78 @@ public:
   rootserver::ObTransferPartitionArg &get_arg() { return arg_; }
 private:
   rootserver::ObTransferPartitionArg arg_;
+};
+
+class ObServiceNameStmt : public ObSystemCmdStmt
+{
+public:
+  ObServiceNameStmt() : ObSystemCmdStmt(stmt::T_SERVICE_NAME), arg_() {}
+  virtual ~ObServiceNameStmt() {}
+  share::ObServiceNameArg &get_arg() { return arg_; }
+private:
+  share::ObServiceNameArg arg_;
+};
+
+class ObRebuildTabletStmt : public ObSystemCmdStmt
+{
+public:
+  ObRebuildTabletStmt():
+      ObSystemCmdStmt(stmt::T_REBUILD_TABLET),
+      tenant_id_(OB_INVALID_ID),
+      ls_id_(),
+      tablet_id_array_(),
+      src_(),
+      dest_()
+  {
+  }
+  virtual ~ObRebuildTabletStmt() {}
+  uint64_t get_tenant_id() const { return tenant_id_; }
+  const common::ObSArray<common::ObTabletID> &get_tablet_ids() const { return tablet_id_array_; }
+  const share::ObLSID &get_ls_id() const { return ls_id_; }
+  const share::ObRebuildTabletLocation &get_dest_location() const  {return dest_; }
+  const share::ObRebuildTabletLocation &get_src_location() const { return src_; }
+  int set_param(const uint64_t tenant_id,
+      const share::ObLSID &ls_id, const common::ObIArray<common::ObTabletID> &tablet_id_array,
+      const share::ObRebuildTabletLocation &dest, const share::ObRebuildTabletLocation &src)
+  {
+    int ret = common::OB_SUCCESS;
+
+    if (tenant_id == OB_INVALID_ID || !ls_id.is_valid() || tablet_id_array.empty() || !src.is_valid()
+        || !dest.is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "invalid args", K(tenant_id), K(ls_id), K(tablet_id_array), K(src), K(dest));
+    } else if (OB_FAIL(tablet_id_array_.assign(tablet_id_array))) {
+      LOG_WARN("failed to assign tablet id array", K(ret), K(tenant_id), K(tablet_id_array));
+    } else {
+      tenant_id_ = tenant_id;
+      ls_id_ = ls_id;
+      dest_ = dest;
+      src_ = src;
+    }
+    return ret;
+  }
+  TO_STRING_KV(N_STMT_TYPE, ((int)stmt_type_), K_(tenant_id), K_(tablet_id_array), K_(src), K_(dest));
+
+private:
+  uint64_t tenant_id_;
+  share::ObLSID ls_id_;
+  ObSArray<common::ObTabletID> tablet_id_array_;
+  share::ObRebuildTabletLocation src_;
+  share::ObRebuildTabletLocation dest_;
+};
+
+class ObModuleDataStmt : public ObSystemCmdStmt
+{
+public:
+  ObModuleDataStmt() : ObSystemCmdStmt(stmt::T_MODULE_DATA), arg_() {}
+  virtual ~ObModuleDataStmt() {}
+
+  OB_INLINE table::ObModuleDataArg &get_arg() { return arg_; }
+  OB_INLINE const table::ObModuleDataArg &get_arg() const { return arg_; }
+
+  TO_STRING_KV(N_STMT_TYPE, ((int)stmt_type_), K_(arg));
+private:
+  table::ObModuleDataArg arg_;
 };
 
 } // end namespace sql

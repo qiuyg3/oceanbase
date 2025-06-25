@@ -13,23 +13,16 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_raw_decoder.h"
-
-#include "storage/blocksstable/ob_block_sstable_struct.h"
-#include "ob_bit_stream.h"
-#include "ob_integer_array.h"
-#include "ob_row_index.h"
 #include "ob_vector_decode_util.h"
 #include "common/ob_target_specific.h"
-#include "lib/hash/ob_hashset.h"
-#include "sql/engine/expr/ob_expr_cmp_func.h"
 
 namespace oceanbase
 {
+using namespace common;
 namespace blocksstable
 {
 
 class ObIRowIndex;
-using namespace common;
 const ObColumnHeader::Type ObRawDecoder::type_;
 
 // define fast batch decode function family
@@ -622,6 +615,7 @@ int ObRawDecoder::decode_vector_bitpacked(
       break;
     }
     case VEC_TC_DATE:
+    case VEC_TC_MYSQL_DATE:
     case VEC_TC_DEC_INT32: {
       // int32_t
       FILL_VECTOR_FUNC(ObFixedLengthFormat<int32_t>, decoder_ctx.has_extend_value());
@@ -629,6 +623,7 @@ int ObRawDecoder::decode_vector_bitpacked(
     }
     case VEC_TC_INTEGER:
     case VEC_TC_DATETIME:
+    case VEC_TC_MYSQL_DATETIME:
     case VEC_TC_TIME:
     case VEC_TC_UNKNOWN:
     case VEC_TC_INTERVAL_YM:
@@ -831,6 +826,8 @@ int ObRawDecoder::check_fast_filter_valid(
     case ObIntTC:
     case ObDateTimeTC:
     case ObDateTC:
+    case ObMySQLDateTC:
+    case ObMySQLDateTimeTC:
     case ObTimeTC: {
       is_signed_data = true;
       break;
@@ -1054,7 +1051,7 @@ int ObRawDecoder::fast_datum_comparison_operator(
       }
       if (OB_FAIL(batch_decode_fast(col_ctx, row_index, row_ids, curr_batch_size, datums))) {
         LOG_WARN("Failed to batch decode", K(ret), K(col_ctx), K(evaluated_row_cnt), K(curr_batch_size));
-      } else if (col_ctx.obj_meta_.is_fixed_len_char_type() && nullptr != col_ctx.col_param_
+      } else if (need_padding(filter.is_padding_mode(), col_ctx.obj_meta_)
           && OB_FAIL(storage::pad_on_datums(
               col_ctx.col_param_->get_accuracy(),
               col_ctx.obj_meta_.get_collation_type(),
@@ -1230,7 +1227,7 @@ int ObRawDecoder::traverse_all_data(
           LOG_WARN("Failed to load data to object cell", K(ret), K(cell_data), K(cell_len));
         } else {
           // Padding for non-bitpacking data if required
-          if (col_ctx.obj_meta_.is_fixed_len_char_type() && nullptr != col_ctx.col_param_) {
+          if (need_padding(filter.is_padding_mode(), col_ctx.obj_meta_)) {
             if (OB_FAIL(storage::pad_column(col_ctx.obj_meta_, col_ctx.col_param_->get_accuracy(),
                                             *col_ctx.allocator_, cur_datum))) {
               LOG_WARN("Failed to pad column", K(ret));
@@ -1296,7 +1293,7 @@ int ObRawDecoder::ObRawDecoderFilterInFunc::operator()(
     bool &result) const
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(filter.exist_in_datum_set(cur_datum, result))) {
+  if (OB_FAIL(filter.exist_in_set(cur_datum, result))) {
     LOG_WARN("Failed to check datum in hashset", K(ret), K(cur_datum));
   }
   return ret;
@@ -1651,10 +1648,14 @@ class RawAggFunctionImpl
     const DataType *start_pos = reinterpret_cast<const DataType *>(raw_data);
     const DataType *a_end = start_pos + to;
     const DataType * __restrict a_pos = start_pos + from;
-    DataType res_value = *(start_pos + from);
+    DataType res_value = null_value;
     while (a_pos < a_end) {
-      if (*a_pos != null_value && Op::apply(*a_pos, res_value)) {
-        res_value = *a_pos;
+      if (*a_pos != null_value) {
+        if (res_value == null_value) {
+          res_value = *a_pos;
+        } else if (Op::apply(*a_pos, res_value)) {
+          res_value = *a_pos;
+        }
       }
       ++a_pos;
     }
@@ -1662,6 +1663,7 @@ class RawAggFunctionImpl
   }))
 
   // can use SIMD
+  // Make sure that: res = 0 for min, res = UINT64_MAX for max
   OB_MULTITARGET_FUNCTION_AVX2_SSE42(
   OB_MULTITARGET_FUNCTION_HEADER(static void), raw_min_max_function_with_null_bitmap, OB_MULTITARGET_FUNCTION_BODY((
       const unsigned char* raw_data,
@@ -1674,15 +1676,13 @@ class RawAggFunctionImpl
     const DataType *a_end = start_pos + to;
     const DataType * __restrict a_pos = start_pos + from;
     const uint8_t * __restrict b_pos = null_bitmap;
-    DataType res_value = *(start_pos + from);
     while (a_pos < a_end) {
-      if (!*b_pos && Op::apply(*a_pos, res_value)) {
-        res_value = *a_pos;
+      if (!*b_pos && Op::apply(*a_pos, res)) {
+        res = *a_pos;
       }
       ++a_pos;
       ++b_pos;
     }
-    res = res_value;
   }))
 };
 

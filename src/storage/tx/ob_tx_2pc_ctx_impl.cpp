@@ -12,7 +12,6 @@
 
 #include "storage/tx/ob_trans_part_ctx.h"
 #include "storage/tx/ob_trans_service.h"
-#include "storage/tx/ob_committer_define.h"
 
 namespace oceanbase
 {
@@ -351,7 +350,7 @@ int ObPartTransCtx::on_abort()
   }
   if (OB_FAIL(on_dist_end_(false /*commit*/))) {
     TRANS_LOG(WARN, "transaciton end error", KR(ret), "context", *this);
-  } else if (OB_FAIL(trans_clear_())) {
+  } else if (OB_FAIL(trans_clear_(ctx_tx_data_.get_end_log_ts()))) {
     TRANS_LOG(WARN, "transaciton clear error", KR(ret), "context", *this);
   }
 
@@ -377,7 +376,7 @@ int ObPartTransCtx::on_clear()
   int ret = OB_SUCCESS;
 
   (void)unregister_timeout_task_();
-  (void)trans_clear_();
+  (void)trans_clear_(exec_info_.max_applied_log_ts_);
   (void)set_exiting_();
 
   return ret;

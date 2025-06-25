@@ -31,7 +31,7 @@ public:
   SysBitAggregate() {}
 
   template <typename ColumnFmt>
-  inline int add_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
+  OB_INLINE int add_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
                      const int32_t agg_col_id, char *agg_cell, void *tmp_res, int64_t &calc_info)
   {
     int ret = OB_SUCCESS;
@@ -52,7 +52,7 @@ public:
   }
 
   template <typename ColumnFmt>
-  inline int add_nullable_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
+  OB_INLINE int add_nullable_row(RuntimeContext &agg_ctx, ColumnFmt &columns, const int32_t row_num,
                        const int32_t agg_col_id, char *agg_cell, void *tmp_res, int64_t &calc_info)
   {
     int ret = OB_SUCCESS;
@@ -95,6 +95,20 @@ public:
         ob_assert(false);
       }
     }
+    return ret;
+  }
+  virtual int rollup_aggregation(RuntimeContext &agg_ctx, const int32_t agg_col_idx,
+                                 AggrRowPtr group_row, AggrRowPtr rollup_row,
+                                 int64_t cur_rollup_group_idx,
+                                 int64_t max_group_cnt = INT64_MIN) override
+  {
+    int ret = OB_SUCCESS;
+    UNUSEDx(cur_rollup_group_idx, max_group_cnt);
+    const char *curr_agg_cell = agg_ctx.row_meta().locate_cell_payload(agg_col_idx, group_row);
+    char *rollup_agg_cell = agg_ctx.row_meta().locate_cell_payload(agg_col_idx, rollup_row);
+    const uint64_t &curr_data = *reinterpret_cast<const uint64_t *>(curr_agg_cell);
+    uint64_t &rollup_data = *reinterpret_cast<uint64_t *>(rollup_agg_cell);
+    rollup_data = curr_data;
     return ret;
   }
   TO_STRING_KV("aggregate", "sysbit_ops", K(in_tc), K(out_tc), K(agg_func));

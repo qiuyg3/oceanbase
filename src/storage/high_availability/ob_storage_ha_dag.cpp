@@ -12,12 +12,8 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_storage_ha_dag.h"
-#include "observer/ob_server.h"
-#include "share/rc/ob_tenant_base.h"
-#include "share/scn.h"
 #include "observer/ob_server_event_history_table_operator.h"
-#include "storage/tx_storage/ob_ls_service.h"
-#include "storage/tablet/ob_tablet.h"
+#include "storage/high_availability/ob_cs_replica_migration.h"
 
 namespace oceanbase
 {
@@ -53,12 +49,13 @@ int ObStorageHAResultMgr::set_result(
     if (NULL != ObCurTraceId::get_trace_id() && OB_FAIL(failed_task_id_list_.push_back(*ObCurTraceId::get_trace_id()))) {
       LOG_WARN("failed to push trace id into array", K(ret));
     } else {
+      ObCStringHelper helper;
       SERVER_EVENT_ADD("storage_ha", "set_first_result",
         "tenant_id", tenant_id,
         "result", result,
         "allow_retry", allow_retry,
         "retry_count", retry_count_,
-        "failed_task_id", to_cstring(failed_task_id_list_),
+        "failed_task_id", helper.convert(failed_task_id_list_),
         "dag_type", OB_DAG_TYPES[type].dag_type_str_);
       FLOG_INFO("set first result", K(result), K(allow_retry), K(retry_count_), K(failed_task_id_list_));
     }
@@ -254,7 +251,7 @@ int ObIHADagNetCtx::get_retry_count(int32_t &retry_count)
 ObStorageHADag::ObStorageHADag(
     const share::ObDagType::ObDagTypeEnum &dag_type)
   : ObIDag(dag_type),
-    ha_dag_net_ctx_(),
+    ha_dag_net_ctx_(nullptr),
     result_mgr_(),
     compat_mode_(lib::Worker::CompatMode::MYSQL)
 {
@@ -289,7 +286,7 @@ int ObStorageHADag::inner_reset_status_for_retry()
   return ret;
 }
 
-bool ObStorageHADag::check_can_retry()
+bool ObStorageHADag::inner_check_can_retry()
 {
   bool bool_ret = false;
   int ret = OB_SUCCESS;
@@ -376,7 +373,8 @@ int ObStorageHADagUtils::deal_with_fo(
   } else if (0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "MIGRATE")
       && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "RESTORE")
       && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "BACKFILL_TX")
-      && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "TRANSFER")) {
+      && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "TRANSFER")
+      && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "REBUILD_TABLET")) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("dag type is unexpected", K(ret), KPC(dag));
   } else if (OB_ISNULL(ha_dag = static_cast<ObStorageHADag *>(dag))) {
@@ -436,7 +434,7 @@ int ObStorageHADagUtils::check_self_is_valid_member(
   } else if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls service should not be NULL", K(ret), K(tenant_id), K(ls_id));
-  } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+  } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::HA_MOD))) {
     LOG_WARN("failed to get ls", K(ret), K(ls_id));
   } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
@@ -476,11 +474,12 @@ int ObStorageHADagUtils::check_self_is_valid_member(
 }
 
 /******************ObHATabletGroupCtx*********************/
-ObHATabletGroupCtx::ObHATabletGroupCtx()
+ObHATabletGroupCtx::ObHATabletGroupCtx(const TabletGroupCtxType type)
   : is_inited_(false),
     lock_(),
     tablet_id_array_(),
-    index_(0)
+    index_(0),
+    type_(type)
 {
 }
 
@@ -488,7 +487,7 @@ ObHATabletGroupCtx::~ObHATabletGroupCtx()
 {
 }
 
-int ObHATabletGroupCtx::init(const common::ObIArray<ObTabletID> &tablet_id_array)
+int ObHATabletGroupCtx::init(const common::ObIArray<ObLogicTabletID> &tablet_id_array)
 {
   int ret = OB_SUCCESS;
   if (is_inited_) {
@@ -499,6 +498,8 @@ int ObHATabletGroupCtx::init(const common::ObIArray<ObTabletID> &tablet_id_array
     LOG_WARN("init ha tablet group ctx get invalid argument", K(ret), K(tablet_id_array));
   } else if (OB_FAIL(tablet_id_array_.assign(tablet_id_array))) {
     LOG_WARN("failed to assign tablet id array", K(ret), K(tablet_id_array));
+  } else if (OB_FAIL(inner_init())) {
+    LOG_WARN("failed to inner init", K(ret));
   } else {
     index_ = 0;
     is_inited_ = true;
@@ -506,10 +507,10 @@ int ObHATabletGroupCtx::init(const common::ObIArray<ObTabletID> &tablet_id_array
   return ret;
 }
 
-int ObHATabletGroupCtx::get_next_tablet_id(ObTabletID &tablet_id)
+int ObHATabletGroupCtx::get_next_tablet_id(ObLogicTabletID &logic_tablet_id)
 {
   int ret = OB_SUCCESS;
-  tablet_id.reset();
+  logic_tablet_id.reset();
 
   if (!is_inited_) {
     ret = OB_NOT_INIT;
@@ -522,14 +523,14 @@ int ObHATabletGroupCtx::get_next_tablet_id(ObTabletID &tablet_id)
     } else if (index_ == tablet_id_array_.count()) {
       ret = OB_ITER_END;
     } else {
-      tablet_id = tablet_id_array_.at(index_);
+      logic_tablet_id = tablet_id_array_.at(index_);
       index_++;
     }
   }
   return ret;
 }
 
-int ObHATabletGroupCtx::get_all_tablet_ids(ObIArray<ObTabletID> &tablet_id_array)
+int ObHATabletGroupCtx::get_all_tablet_ids(ObIArray<ObLogicTabletID> &tablet_id_array)
 {
   int ret = OB_SUCCESS;
   tablet_id_array.reset();
@@ -546,9 +547,19 @@ int ObHATabletGroupCtx::get_all_tablet_ids(ObIArray<ObTabletID> &tablet_id_array
   return ret;
 }
 
+bool ObHATabletGroupCtx::is_cs_replica_ctx() const {
+  common::SpinRLockGuard guard(lock_);
+  return TabletGroupCtxType::CS_REPLICA_TYPE == type_;
+}
+
 void ObHATabletGroupCtx::reuse()
 {
   common::SpinWLockGuard guard(lock_);
+  inner_reuse();
+}
+
+void ObHATabletGroupCtx::inner_reuse()
+{
   tablet_id_array_.reuse();
   index_ = 0;
   is_inited_ = false;
@@ -608,10 +619,10 @@ int ObHATabletGroupMgr::get_next_tablet_group_ctx(
 }
 
 int ObHATabletGroupMgr::build_tablet_group_ctx(
-    const ObIArray<ObTabletID> &tablet_id_array)
+    const ObIArray<ObLogicTabletID> &tablet_id_array,
+    const ObHATabletGroupCtx::TabletGroupCtxType type /*=NORMAL_TYPE*/)
 {
   int ret = OB_SUCCESS;
-  void *buf = nullptr;
   ObHATabletGroupCtx *tablet_group_ctx = nullptr;
 
   if (!is_inited_) {
@@ -622,10 +633,11 @@ int ObHATabletGroupMgr::build_tablet_group_ctx(
     LOG_WARN("build tablet group ctx get invalid argument", K(ret), K(tablet_id_array));
   } else {
     common::SpinWLockGuard guard(lock_);
-    if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObHATabletGroupCtx)))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to alloc memory", K(ret), KP(buf));
-    } else if (FALSE_IT(tablet_group_ctx = new (buf) ObHATabletGroupCtx())) {
+    if (OB_FAIL(alloc_and_new_tablet_group_ctx(type, tablet_group_ctx))) {
+      LOG_WARN("failed to alloc and new tablet group ctx", K(ret));
+    } else if (OB_ISNULL(tablet_group_ctx)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tablet group ctx should not be NULL", K(ret), KP(tablet_group_ctx));
     } else if (OB_FAIL(tablet_group_ctx->init(tablet_id_array))) {
       LOG_WARN("failed to init tablet group ctx", K(ret), K(tablet_id_array));
     } else if (OB_FAIL(tablet_group_ctx_array_.push_back(tablet_group_ctx))) {
@@ -637,6 +649,38 @@ int ObHATabletGroupMgr::build_tablet_group_ctx(
     if (OB_NOT_NULL(tablet_group_ctx)) {
       tablet_group_ctx->~ObHATabletGroupCtx();
     }
+  }
+  return ret;
+}
+
+int ObHATabletGroupMgr::alloc_and_new_tablet_group_ctx(
+    const ObHATabletGroupCtx::TabletGroupCtxType type,
+    ObHATabletGroupCtx *&tablet_group_ctx)
+{
+  int ret = OB_SUCCESS;
+  void *buf = nullptr;
+  if (ObHATabletGroupCtx::TabletGroupCtxType::NORMAL_TYPE == type) {
+    if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObHATabletGroupCtx)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to alloc memory", K(ret), KP(buf));
+    } else {
+      tablet_group_ctx = new (buf) ObHATabletGroupCtx();
+    }
+  } else if (ObHATabletGroupCtx::TabletGroupCtxType::CS_REPLICA_TYPE == type) {
+    if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObHATabletGroupCOConvertCtx)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to alloc memory", K(ret), KP(buf));
+    } else {
+      tablet_group_ctx = new (buf) ObHATabletGroupCOConvertCtx();
+    }
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid ctx type", K(ret), K(type));
+  }
+
+  if (OB_FAIL(ret) && OB_NOT_NULL(tablet_group_ctx)) {
+    tablet_group_ctx->~ObHATabletGroupCtx();
+    tablet_group_ctx = nullptr;
   }
   return ret;
 }
@@ -655,9 +699,38 @@ void ObHATabletGroupMgr::reuse()
   index_ = 0;
 }
 
+int64_t ObHATabletGroupMgr::get_tablet_group_ctx_count() const
+{
+  common::SpinRLockGuard guard(lock_);
+  return tablet_group_ctx_array_.count();
+}
+
+int ObHATabletGroupMgr::get_tablet_group_ctx(
+    const int64_t idx,
+    ObHATabletGroupCtx *&tablet_group_ctx)
+{
+  int ret = OB_SUCCESS;
+  tablet_group_ctx = nullptr;
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ha tablet group mgr do not init", K(ret));
+  } else {
+    common::SpinRLockGuard guard(lock_);
+    if (OB_UNLIKELY(idx < 0 || idx >= tablet_group_ctx_array_.count())) {
+      ret = OB_INDEX_OUT_OF_RANGE;
+    } else if (OB_ISNULL(tablet_group_ctx = tablet_group_ctx_array_.at(idx))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tablet group ctx is null", K(ret), K(idx), K_(tablet_group_ctx_array));
+    }
+  }
+  return ret;
+}
+
 /******************ObStorageHATaskUtils*********************/
 int ObStorageHATaskUtils::check_need_copy_sstable(
     const ObMigrationSSTableParam &param,
+    const bool &is_restore,
     ObTabletHandle &tablet_handle,
     bool &need_copy)
 {
@@ -667,7 +740,7 @@ int ObStorageHATaskUtils::check_need_copy_sstable(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("check need copy sstable get invalid argument", K(ret), K(param));
   } else if (param.table_key_.is_major_sstable()) {
-    if (OB_FAIL(check_major_sstable_need_copy_(param, tablet_handle, need_copy))) {
+    if (OB_FAIL(check_major_sstable_need_copy_(param, is_restore, tablet_handle, need_copy))) {
       LOG_WARN("failed to check major sstable need copy", K(ret), K(param), K(tablet_handle));
     }
   } else if (param.table_key_.is_minor_sstable()) {
@@ -678,6 +751,8 @@ int ObStorageHATaskUtils::check_need_copy_sstable(
     if (OB_FAIL(check_ddl_sstable_need_copy_(param, tablet_handle, need_copy))) {
       LOG_WARN("failed to check ddl sstable need copy", K(ret), K(param), K(tablet_handle));
     }
+  } else if (param.table_key_.is_mds_sstable()) {
+    need_copy = true;
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("copy sstable table type is unexpected", K(ret), K(param));
@@ -687,6 +762,7 @@ int ObStorageHATaskUtils::check_need_copy_sstable(
 
 int ObStorageHATaskUtils::check_major_sstable_need_copy_(
     const ObMigrationSSTableParam &param,
+    const bool &is_restore,
     ObTabletHandle &tablet_handle,
     bool &need_copy)
 {
@@ -716,6 +792,11 @@ int ObStorageHATaskUtils::check_major_sstable_need_copy_(
       LOG_WARN("failed to get sstable meta handle", K(ret));
     } else if (OB_FAIL(ObSSTableMetaChecker::check_sstable_meta(param, sst_meta_hdl.get_sstable_meta()))) {
       LOG_WARN("failed to check sstable meta", K(ret), K(param), K(sstable_wrapper));
+    } else if (!is_restore && sst_meta_hdl.get_sstable_meta().get_basic_meta().table_backup_flag_.has_backup()
+        && param.basic_meta_.table_backup_flag_.has_no_backup()) {
+      // when migration or rebuild, if dst sstable has backup macro and the corresponding src sstable has no backup macro, need copy
+      need_copy = true;
+      FLOG_INFO("dst sstable has backup macro and src sstable has no backup macro, need copy", K(need_copy), K(sst_meta_hdl), K(param.basic_meta_));
     } else {
       need_copy = false;
     }
@@ -821,6 +902,66 @@ int ObStorageHATaskUtils::check_ddl_sstable_need_copy_(
   return ret;
 }
 
+int ObStorageHATaskUtils::check_need_copy_macro_blocks(
+    const ObMigrationSSTableParam &param,
+    const bool is_leader_restore,
+    bool &need_copy)
+{
+  int ret = OB_SUCCESS;
+  need_copy = true;
+  if (param.is_empty_sstable()) {
+    need_copy = false;
+  } else if (!is_leader_restore) {
+    if (param.is_shared_macro_blocks_sstable()) {
+      need_copy = false;
+    } else {
+      need_copy = true;
+    }
+  } else {
+    need_copy = true;
+  }
+  return ret;
+}
+
+int ObStorageHACancelDagNetUtils::cancel_task(const share::ObLSID &ls_id, const share::ObTaskId &task_id)
+{
+  int ret = OB_SUCCESS;
+  ObLSHandle ls_handle;
+  if (!ls_id.is_valid() || !task_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(task_id), K(task_id));
+  } else if (OB_FAIL(ObStorageHADagUtils::get_ls(ls_id, ls_handle))) {
+    LOG_WARN("failed to get ls", K(ret), K(ls_id));
+  } else {
+    bool is_exist = false;
+    if (OB_FAIL(cancel_migration_task_(task_id, ls_handle, is_exist))) {
+      LOG_WARN("failed to cancel migration task.", K(ret), K(ls_id), K(task_id), K(ls_handle));
+    } else if (is_exist) {
+    } else {
+      ret = OB_ENTRY_NOT_EXIST;
+      LOG_WARN("task is not exist", K(ret), K(ls_id), K(task_id));
+    }
+  }
+  return ret;
+}
+
+int ObStorageHACancelDagNetUtils::cancel_migration_task_(const share::ObTaskId &task_id,
+    const ObLSHandle &ls_handle, bool &is_exist)
+{
+  int ret = OB_SUCCESS;
+  ObLS *ls = nullptr;
+  is_exist = false;
+  if (!task_id.is_valid() || !ls_handle.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(task_id), K(ls_handle));
+  } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("log stream should not be nullptr", K(ret), KP(ls));
+  } else if (OB_FAIL(ls->get_ls_migration_handler()->cancel_task(task_id, is_exist))) {
+    LOG_WARN("failed to cancel migration task", K(ret), K(task_id), K(ls_handle));
+  }
+  return ret;
+}
 
 }
 }

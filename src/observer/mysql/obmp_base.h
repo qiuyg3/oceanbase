@@ -78,6 +78,9 @@ protected:
 
   // send a ok packet to client
   int send_ok_packet(sql::ObSQLSessionInfo &session, ObOKPParam &ok_param, obmysql::ObMySQLPacket* pkt=NULL);
+  int send_ok_packet_without_lock(sql::ObSQLSessionInfo &session,
+                                  ObOKPParam &ok_param,
+                                  obmysql::ObMySQLPacket* pkt);
   int send_eof_packet(const sql::ObSQLSessionInfo &session, const ObMySQLResultSet &result, ObOKPParam *ok_param = NULL);
 
   int send_null_packet(sql::ObSQLSessionInfo &session, ObOKPParam &ok_param);
@@ -113,11 +116,12 @@ protected:
                                sql::ObSQLSessionInfo *session = NULL);
   bool need_flush_buffer() const;
   int update_transmission_checksum_flag(const sql::ObSQLSessionInfo &session);
-  int update_proxy_sys_vars(sql::ObSQLSessionInfo &session);
+  int update_proxy_and_client_sys_vars(sql::ObSQLSessionInfo &session);
   int update_charset_sys_vars(ObSMConnection &conn, sql::ObSQLSessionInfo &sess_info);
 
   int build_encode_param_(obmysql::ObProtoEncodeParam &param,
                           obmysql::ObMySQLPacket *pkt, const bool is_last);
+  void set_request_expect_group_id(sql::ObSQLSessionInfo *session);
   // 计算并设置当前用户所属 cgroup，用于资源隔离。如未设置，默认 cgroup id 为 0
   int setup_user_resource_group(
       ObSMConnection &conn,

@@ -19,12 +19,18 @@
 
 namespace oceanbase
 {
+namespace blocksstable
+{
+  class ObSSTableMacroInfo;
+  class ObIMacroBlockFlushCallback;
+}
 namespace storage
 {
 
 struct ObLinkedMacroBlockHeader final
 {
-  static const int32_t LINKED_MACRO_BLOCK_HEADER_VERSION = 1;
+  static const int32_t LINKED_MACRO_BLOCK_HEADER_VERSION_V1 = 1;
+  static const int32_t LINKED_MACRO_BLOCK_HEADER_VERSION_V2 = 2;
   static const int32_t LINKED_MACRO_BLOCK_HEADER_MAGIC = 10000;
 
   ObLinkedMacroBlockHeader()
@@ -44,14 +50,15 @@ struct ObLinkedMacroBlockHeader final
 
   int serialize(char *buf, const int64_t buf_len, int64_t &pos) const;
   int deserialize(const char *buf, const int64_t data_len, int64_t &pos);
-  static int64_t get_serialize_size()
+  int64_t get_serialize_size()
   {
-    return sizeof(ObLinkedMacroBlockHeader);
+    return sizeof(version_) + sizeof(magic_) + sizeof(item_count_) + sizeof(fragment_offset_)
+        + previous_macro_block_id_.get_serialize_size();
   }
 
   void reset()
   {
-    version_ = LINKED_MACRO_BLOCK_HEADER_VERSION;
+    version_ = LINKED_MACRO_BLOCK_HEADER_VERSION_V2;
     magic_ = LINKED_MACRO_BLOCK_HEADER_MAGIC;
     item_count_ = 0;
     fragment_offset_ = 0;
@@ -108,8 +115,72 @@ private:
   void reset_new_handle();
 private:
   static const int64_t META_BLOCK_HANDLE_CNT = 2;
-  blocksstable::ObMacroBlocksHandle meta_handles_[META_BLOCK_HANDLE_CNT];
+  blocksstable::ObStorageObjectsHandle meta_handles_[META_BLOCK_HANDLE_CNT];
   int64_t cur_handle_pos_;
+};
+
+struct ObSSTableLinkBlockWriteInfo
+{
+public:
+  ObSSTableLinkBlockWriteInfo(const int64_t start_macro_seq):
+    start_macro_seq_(start_macro_seq),
+    ddl_redo_callback_(nullptr),
+    written_macro_cnt_(0)
+  {}
+  ~ObSSTableLinkBlockWriteInfo() = default;
+  int assign(const ObSSTableLinkBlockWriteInfo& other)
+  {
+    int ret = OB_SUCCESS;
+    if (&other == this) {
+      // do nothing
+    } else {
+      ddl_redo_callback_ = other.ddl_redo_callback_;
+      written_macro_cnt_ = other.written_macro_cnt_;
+    }
+    return ret;
+  }
+  int init(blocksstable::ObIMacroBlockFlushCallback *ddl_redo_cb)
+  {
+    int ret = OB_SUCCESS;
+    ddl_redo_callback_ = ddl_redo_cb;
+    written_macro_cnt_ = 0;
+    return ret;
+  }
+  void reset_written_macro_cnt()
+  {
+    written_macro_cnt_ = 0;
+  }
+  TO_STRING_KV(KP_(ddl_redo_callback), K_(start_macro_seq), K_(written_macro_cnt));
+  const int64_t start_macro_seq_;
+  inline int64_t get_written_macro_cnt() const { return written_macro_cnt_; }
+  inline void set_written_macro_cnt(const int64_t written_macro_cnt) { written_macro_cnt_ = written_macro_cnt; }
+  inline blocksstable::ObIMacroBlockFlushCallback* get_ddl_redo_callback() const { return ddl_redo_callback_; }
+private:
+  blocksstable::ObIMacroBlockFlushCallback *ddl_redo_callback_;
+  int64_t written_macro_cnt_; // default is zero, do not modify
+  DISALLOW_COPY_AND_ASSIGN(ObSSTableLinkBlockWriteInfo);
+};
+
+class ObSlogCheckpointFdDispenser final
+{
+public:
+  ObSlogCheckpointFdDispenser() : min_file_id_(0), max_file_id_(0) {}
+  explicit ObSlogCheckpointFdDispenser(const int64_t cur_file_id)
+  {
+    min_file_id_ = max_file_id_ = cur_file_id + 1;
+  }
+  ~ObSlogCheckpointFdDispenser() = default;
+  void set_cur_max_file_id(const int64_t cur_file_id) {  min_file_id_ = max_file_id_ = cur_file_id + 1; }
+  int64_t get_min_file_id() const { return min_file_id_; }
+  int64_t get_max_file_id() const { return max_file_id_; }
+  int64_t acquire_new_file_id() { return ATOMIC_AAF(&max_file_id_, 1); }
+
+  TO_STRING_KV(K_(min_file_id), K_(max_file_id));
+private :
+  int64_t min_file_id_;
+  int64_t max_file_id_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObSlogCheckpointFdDispenser);
 };
 
 }  // end namespace storage

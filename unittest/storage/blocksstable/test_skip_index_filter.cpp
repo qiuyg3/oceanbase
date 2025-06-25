@@ -8,32 +8,12 @@
 // MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 // See the Mulan PubL v2 for more details.
 
-#include <errno.h>
 #include <gtest/gtest.h>
-#include <stdlib.h>
 #define protected public
 #define OK(ass) ASSERT_EQ(OB_SUCCESS, (ass))
 #define private public
-#include "storage/blocksstable/ob_data_file_prepare.h"
 #include "storage/blocksstable/ob_row_generate.h"
-#include "observer/ob_server_struct.h"
-#include "observer/ob_service.h"
-#include "observer/omt/ob_tenant_node_balancer.h"
-#include "share/config/ob_server_config.h"
-#include "share/ob_simple_mem_limit_getter.h"
-#include "share/rc/ob_tenant_base.h"
-#include "storage/blocksstable/index_block/ob_index_block_builder.h"
-#include "storage/blocksstable/ob_macro_block_writer.h"
-#include "storage/blocksstable/ob_sstable_meta.h"
-#include "storage/blocksstable/ob_storage_cache_suite.h"
-#include "storage/memtable/ob_memtable_interface.h"
-#include "storage/ob_i_store.h"
-#include "storage/compaction/ob_tenant_freeze_info_mgr.h"
-#include "storage/blocksstable/index_block/ob_index_block_dual_meta_iterator.h"
 #include "mtlenv/mock_tenant_module_env.h"
-#include "storage/blocksstable/index_block/ob_agg_row_struct.h"
-#include "storage/blocksstable/index_block/ob_skip_index_filter_executor.h"
-#include "sql/engine/basic/ob_pushdown_filter.h"
 #include "ob_row_generate.h"
 
 namespace oceanbase
@@ -297,8 +277,7 @@ void TestSkipIndexFilter::init_in_filter(
                 return cmp_ret < 0;
             });
   filter.cmp_func_ = cmp_func;
-  filter.cmp_func_rev_ = cmp_func;
-  filter.param_set_.set_hash_and_cmp_func(basic_funcs->murmur_hash_v2_, filter.cmp_func_rev_);
+  filter.param_set_.set_hash_and_cmp_func(basic_funcs->murmur_hash_v2_, filter.cmp_func_);
 }
 
 int TestSkipIndexFilter::test_skip_index_filter_pushdown (
@@ -347,8 +326,9 @@ int TestSkipIndexFilter::test_skip_index_filter_pushdown (
 
   // generate agg_row_writer and reader
   ObArray<ObSkipIndexColMeta> agg_cols;
-  ObDatumRow agg_row;
-  agg_row.init(3); // min, max, null_count
+  ObSkipIndexAggResult agg_result;
+  EXPECT_EQ(OB_SUCCESS, agg_result.init(3, allocator_));
+  ObDatumRow &agg_row = agg_result.agg_row_;
 
   ObSkipIndexColMeta skip_col_meta;
   skip_col_meta.col_idx_ = col_idx;
@@ -365,13 +345,13 @@ int TestSkipIndexFilter::test_skip_index_filter_pushdown (
   agg_row.storage_datums_[2].from_obj_enhance(null_count_obj);
 
   ObAggRowWriter row_writer;
-  row_writer.init(agg_cols, agg_row, allocator_);
-  int64_t buf_size = row_writer.get_data_size();
+  EXPECT_EQ(OB_SUCCESS, row_writer.init(agg_cols, agg_result, DATA_CURRENT_VERSION, allocator_));
+  int64_t buf_size = row_writer.get_serialize_data_size();
   char *buf = reinterpret_cast<char *>(allocator_.alloc(buf_size));
   EXPECT_TRUE(buf != nullptr);
   MEMSET(buf, 0, buf_size);
   int64_t pos = 0;
-  row_writer.write_agg_data(buf, buf_size, pos);
+  EXPECT_EQ(OB_SUCCESS, row_writer.write_agg_data(buf, buf_size, pos));
   EXPECT_TRUE(buf_size == pos);
 
 

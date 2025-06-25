@@ -11,16 +11,19 @@
  */
 
 #define USING_LOG_PREFIX COMMON
-#include "common/ob_common_utility.h"
-#include "lib/alloc/malloc_hook.h"
-#include "lib/string/ob_string.h"
-#include "lib/utility/ob_print_utils.h"
+#include "ob_common_utility.h"
+#include "lib/utility/ob_sort.h"
 using namespace oceanbase::lib;
 
 namespace oceanbase
 {
 namespace common
 {
+int64_t __attribute__((weak)) get_tenant_stack_size(const uint64_t tenant_id) {
+  UNUSED(tenant_id);
+  return OB_DEFAULT_STACK_SIZE;
+}
+
 _RLOCAL(char*, g_stackaddr);
 _RLOCAL(size_t, g_stacksize);
 
@@ -109,19 +112,16 @@ int get_stackattr(void *&stackaddr, size_t &stacksize)
     stackaddr = g_stackaddr;
     stacksize = g_stacksize;
   } else {
-    bool in_hook_bak = in_hook();
-    in_hook() = true;
-    DEFER(in_hook() = in_hook_bak);
     pthread_attr_t attr;
     if (OB_UNLIKELY(0 != pthread_getattr_np(pthread_self(), &attr))) {
-      ret = OB_ERR_UNEXPECTED;
-      COMMON_LOG(ERROR, "cannot get thread params", K(ret));
+      ret = OB_ERROR;
+      COMMON_LOG(ERROR, "cannot get thread params", K(ret), KERRMSG);
     } else if (OB_UNLIKELY(0 != pthread_attr_getstack(&attr, &stackaddr, &stacksize))) {
-      ret = OB_ERR_UNEXPECTED;
-      COMMON_LOG(ERROR, "cannot get thread statck params", K(ret));
+      ret = OB_ERROR;
+      COMMON_LOG(ERROR, "cannot get thread statck params", K(ret), KERRMSG);
     } else if (OB_UNLIKELY(0 != pthread_attr_destroy(&attr))) {
-      ret = OB_ERR_UNEXPECTED;
-      COMMON_LOG(ERROR, "destroy thread attr failed", K(ret));
+      ret = OB_ERROR;
+      COMMON_LOG(ERROR, "destroy thread attr failed", K(ret), KERRMSG);
     }
     if (OB_SUCC(ret)) {
       g_stackaddr = (char*)stackaddr;

@@ -11,28 +11,18 @@
  */
 
 #define USING_LOG_PREFIX LIB
-#include "lib/oblog/ob_log.h"
-#include <string.h>
-#include <sys/uio.h>
+#include "ob_log.h"
 #include <dirent.h>
 #include <libgen.h>
-#include <sys/prctl.h>
-#include <linux/prctl.h>
 #include <regex.h>
 #include "lib/oblog/ob_warning_buffer.h"
-#include "lib/ob_errno.h"
-#include "lib/profile/ob_trace_id.h"
-#include "lib/ob_define.h"
 #include "lib/list/ob_list.h"
-#include "lib/utility/utility.h"
 #include "lib/utility/ob_fast_convert.h"
-#include "lib/utility/ob_rate_limiter.h"
-#include "lib/container/ob_vector.h"
-#include "lib/container/ob_se_array.h"
 #include "lib/allocator/ob_vslice_alloc.h"
 #include "lib/allocator/ob_fifo_allocator.h"
 #include "common/ob_smart_var.h"
 #include "lib/oblog/ob_log_compressor.h"
+#include "lib/stat/ob_diagnostic_info_guard.h"
 
 using namespace oceanbase::lib;
 
@@ -747,7 +737,7 @@ int ObLogger::log_head(const int64_t ts,
                            "|%s|%s|%s|%d|%lu|%ld|%s|%s|%s|%s:%d|",
                            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
                            tm.tm_sec, tv.tv_usec, errstr_[level], mod_name, dba_event, errcode,
-                           GET_TENANT_ID(), GETTID(), GETTNAME(), ObCurTraceId::get_trace_id_str(),
+                           GET_TENANT_ID(), GETTID(), GETTNAME_V2(), ObCurTraceId::get_trace_id_str(),
                            function, base_file_name, line);
     } else {
       if (level == OB_LOG_LEVEL_DBA_ERROR
@@ -762,7 +752,7 @@ int ObLogger::log_head(const int64_t ts,
                              "[%04d-%02d-%02d %02d:%02d:%02d.%06ld] "
                              "[%ld][%s][T%lu][%s] ",
                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
-                             tm.tm_sec, tv.tv_usec, GETTID(), GETTNAME(), GET_TENANT_ID(), ObCurTraceId::get_trace_id_str());
+                             tm.tm_sec, tv.tv_usec, GETTID(), GETTNAME_V2(), GET_TENANT_ID(), ObCurTraceId::get_trace_id_str());
       } else {
         constexpr int cluster_id_buf_len = 8;
         char cluster_id_buf[cluster_id_buf_len] = {'\0'};
@@ -772,7 +762,7 @@ int ObLogger::log_head(const int64_t ts,
                              "%-5s %s%s (%s:%d) [%ld][%s]%s[T%lu][%s] [lt=%ld]%s ",
                              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
                              tm.tm_sec, tv.tv_usec, errstr_[level], mod_name, function,
-                             base_file_name, line, GETTID(), GETTNAME(), is_arb_replica_ ? cluster_id_buf : "",
+                             base_file_name, line, GETTID(), GETTNAME_V2(), is_arb_replica_ ? cluster_id_buf : "",
                              is_arb_replica_ ? GET_ARB_TENANT_ID() : GET_TENANT_ID(), ObCurTraceId::get_trace_id_str(),
                              last_logging_cost_time_us_, errcode_buf);
       }
@@ -1558,7 +1548,7 @@ int ObLogger::init(const ObBaseLogWriterCfg &log_cfg,
     }
     if (OB_SUCC(ret)) {
       allocator_->set_limit(limit);
-      allocator_->set_nway(4);
+      allocator_->set_nway(8);
       if (OB_FAIL(ObBaseLogWriter::init(log_cfg, thread_name))) {
         LOG_STDERR("init ObBaseLogWriter error. ret=%d\n", ret);
       } else if (OB_FAIL(ObBaseLogWriter::start())) {
@@ -1697,6 +1687,8 @@ void ObLogger::flush_logs_to_file(ObPLogItem **log_item, const int64_t count)
           (void)ATOMIC_AAF(&log_file_[i].write_size_, size);
           (void)ATOMIC_AAF(&log_file_[i].file_size_, size);
           (void)ATOMIC_AAF(&log_file_[i].write_count_, iovcnt[i]);
+          EVENT_ADD(ObStatEventIds::IO_WRITE_COUNT, iovcnt[i]);
+          EVENT_ADD(ObStatEventIds::IO_WRITE_BYTES, size);
         }
         if (wf_iovcnt[i] > 0 && log_file_[i].wf_fd_ > 0) {
           (void)::writev(log_file_[i].wf_fd_, wf_vec[i], wf_iovcnt[i]);

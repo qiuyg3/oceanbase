@@ -251,6 +251,7 @@ bool is_json_type(const int ctype);
 bool is_geometry_type(const int ctype);
 bool is_xml_type(const int ctype);
 bool is_roaringbitmap_type(const int ctype);
+bool is_collection_type(const int ctype);
 int64_t get_non_hidden_column_count(const oceanbase::share::schema::ObTableSchema &table_schema);
 
 double get_delay_sec(const int64_t tstamp);
@@ -523,8 +524,6 @@ int get_tenant_compat_mode(const uint64_t tenant_id,
     lib::Worker::CompatMode &compat_mode,
     const int64_t timeout);
 
-char *lbt_oblog();
-
 bool is_backup_mode();
 
 struct BRColElem
@@ -588,6 +587,14 @@ struct CDCLSNComparator
     return a < b;
   }
 };
+
+struct LSNComparator
+{
+  static int compare(const palf::LSN& lsn1, const palf::LSN& lsn2) {
+    return lsn1.val_ > lsn2.val_ ? 1 : (lsn1.val_ == lsn2.val_ ? 0 : -1);
+  }
+};
+
 // sort and unique lsn arr.
 // NOT THREAD_SAFE
 int sort_and_unique_lsn_arr(ObLogLSNArray &lsn_arr);

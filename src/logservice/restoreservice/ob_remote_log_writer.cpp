@@ -12,14 +12,7 @@
 
 #define USING_LOG_PREFIX CLOG
 #include "ob_remote_log_writer.h"
-#include "lib/ob_errno.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "lib/ob_define.h"
-#include "share/rc/ob_tenant_base.h"                    // mtl_alloc
-#include "storage/tx_storage/ob_ls_map.h"               // ObLSIterator
 #include "storage/tx_storage/ob_ls_service.h"           // ObLSService
-#include "ob_fetch_log_task.h"                          // ObFetchLogTask
-#include "ob_remote_fetch_log_worker.h"                 // ObRemoteFetchWorker
 #include "ob_log_restore_service.h"                     // ObLogRestoreService
 
 namespace oceanbase
@@ -122,6 +115,7 @@ void ObRemoteLogWriter::wait()
 void ObRemoteLogWriter::run1()
 {
   LOG_INFO("ObRemoteLogWriter thread start");
+  ObDIActionGuard ag("LogService", "LogRestoreService", "RemoteLogWriter");
   lib::set_thread_name("RFLWorker");
 
   const int64_t THREAD_RUN_INTERVAL = 100 * 1000L;
@@ -134,7 +128,7 @@ void ObRemoteLogWriter::run1()
       int64_t end_tstamp = ObTimeUtility::current_time();
       int64_t wait_interval = THREAD_RUN_INTERVAL - (end_tstamp - begin_tstamp);
       if (wait_interval > 0) {
-        ob_usleep(wait_interval);
+        ob_usleep(wait_interval, true/*is_idle_sleep*/);
       }
     }
   }
@@ -238,6 +232,11 @@ int ObRemoteLogWriter::submit_entries_(ObFetchLogTask &task)
     } else if (OB_UNLIKELY(! entry.check_integrity())) {
       ret = OB_INVALID_DATA;
       LOG_WARN("entry is invalid", K(entry), K(lsn), K(task));
+    } else if (! entry.check_compatibility()) {
+      ret = OB_EAGAIN;
+      if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+        LOG_ERROR("data version is not new enough to recover clog", KR(ret));
+      }
     } else if (task.cur_lsn_ > lsn) {
       LOG_INFO("repeated log, just skip", K(lsn), K(entry), K(task));
     } else if (FALSE_IT(entry_size = entry.get_serialize_size())) {

@@ -11,10 +11,6 @@
  */
 
 #include <gtest/gtest.h>
-#include "lib/utility/ob_test_util.h"
-#include "lib/restore/ob_storage.h"
-#include "lib/restore/ob_storage_cos_base.h"
-#include "lib/allocator/page_arena.h"
 #include "share/backup/ob_backup_io_adapter.h"
 #include "test_backup_access_cos.h"
 
@@ -95,38 +91,44 @@ TEST_F(TestBackupIOAdapterAccessCos, test_basic_rw)
     const char *write_content = "123456789ABCDEF";
     ASSERT_EQ(OB_SUCCESS, databuff_printf(uri, sizeof(uri), "%s/0", dir_uri));
     ASSERT_EQ(OB_SUCCESS,
-        adapter.write_single_file(uri, &cos_base, write_content, strlen(write_content)));
+        adapter.write_single_file(uri, &cos_base, write_content, strlen(write_content),
+                                  ObStorageIdMod::get_default_id_mod()));
 
     // read
     char read_buf[100] = {0};
     int64_t read_size = 0;
     ASSERT_EQ(OB_SUCCESS,
-        adapter.read_single_file(uri, &cos_base, read_buf, sizeof(read_buf), read_size));
+        adapter.read_single_file(uri, &cos_base, read_buf, sizeof(read_buf), read_size,
+                                 ObStorageIdMod::get_default_id_mod()));
     ASSERT_STREQ(write_content, read_buf);
     ASSERT_EQ(strlen(write_content), read_size);
 
     ASSERT_EQ(OB_SUCCESS,
-        adapter.read_part_file(uri, &cos_base, read_buf, sizeof(read_buf), 0, read_size));
+        adapter.read_part_file(uri, &cos_base, read_buf, sizeof(read_buf), 0, read_size,
+                               ObStorageIdMod::get_default_id_mod()));
     ASSERT_STREQ(write_content, read_buf);
     ASSERT_EQ(strlen(write_content), read_size);
 
     int64_t offset = 5;
     ASSERT_EQ(OB_SUCCESS,
-        adapter.read_part_file(uri, &cos_base, read_buf, sizeof(read_buf), offset, read_size));
+        adapter.read_part_file(uri, &cos_base, read_buf, sizeof(read_buf), offset, read_size,
+                               ObStorageIdMod::get_default_id_mod()));
     ASSERT_EQ('6', read_buf[0]);
     ASSERT_EQ('F', read_buf[9]);
     ASSERT_EQ(strlen(write_content) - offset, read_size);
 
     offset = 6;
     ASSERT_EQ(OB_SUCCESS,
-        adapter.read_part_file(uri, &cos_base, read_buf, 5, offset, read_size));
+        adapter.read_part_file(uri, &cos_base, read_buf, 5, offset, read_size,
+                               ObStorageIdMod::get_default_id_mod()));
     ASSERT_EQ('7', read_buf[0]);
     ASSERT_EQ('B', read_buf[4]);
     ASSERT_EQ(5, read_size);
 
     offset = strlen(write_content);
-    ASSERT_EQ(OB_COS_ERROR,
-        adapter.read_part_file(uri, &cos_base, read_buf, sizeof(read_buf), offset, read_size));
+    ASSERT_EQ(OB_OBJECT_STORAGE_IO_ERROR,
+        adapter.read_part_file(uri, &cos_base, read_buf, sizeof(read_buf), offset, read_size,
+                               ObStorageIdMod::get_default_id_mod()));
 
     ASSERT_EQ(OB_SUCCESS, adapter.del_file(uri, &cos_base));
   }
@@ -149,7 +151,8 @@ TEST_F(TestBackupIOAdapterAccessCos, test_util)
 
     const char *write_content = "123456789ABCDEF";
     ASSERT_EQ(OB_SUCCESS,
-        adapter.write_single_file(uri, &cos_base, write_content, strlen(write_content)));
+        adapter.write_single_file(uri, &cos_base, write_content, strlen(write_content),
+                                  ObStorageIdMod::get_default_id_mod()));
     ASSERT_EQ(OB_SUCCESS, adapter.is_exist(uri, &cos_base, is_obj_exist));
     ASSERT_TRUE(is_obj_exist);
 
@@ -180,7 +183,8 @@ TEST_F(TestBackupIOAdapterAccessCos, test_list_files)
       ASSERT_EQ(OB_SUCCESS,
           databuff_printf(uri, sizeof(uri), format, dir_uri, object_prefix_len, file_idx, file_idx));
       ASSERT_EQ(OB_SUCCESS,
-          adapter.write_single_file(uri, &cos_base, write_content, strlen(write_content)));
+          adapter.write_single_file(uri, &cos_base, write_content, strlen(write_content),
+                                    ObStorageIdMod::get_default_id_mod()));
     }
 
     ObArenaAllocator allocator;
@@ -217,7 +221,8 @@ TEST_F(TestBackupIOAdapterAccessCos, test_list_directories)
       ASSERT_EQ(OB_SUCCESS,
           databuff_printf(uri, sizeof(uri), format, dir_uri, object_prefix_len, file_idx, file_idx));
       ASSERT_EQ(OB_SUCCESS,
-          adapter.write_single_file(uri, &cos_base, write_content, strlen(write_content)));
+          adapter.write_single_file(uri, &cos_base, write_content, strlen(write_content),
+                                    ObStorageIdMod::get_default_id_mod()));
     }
 
     ObArenaAllocator allocator;
@@ -275,12 +280,13 @@ TEST_F(TestBackupIOAdapterAccessCos, test_is_tagging)
 
     ASSERT_EQ(OB_SUCCESS, databuff_printf(uri, sizeof(uri), "%s/delete_mode", dir_uri));
     ASSERT_EQ(OB_SUCCESS,
-        adapter.write_single_file(uri, &tmp_cos_base, write_content, strlen(write_content)));
+        adapter.write_single_file(uri, &tmp_cos_base, write_content, strlen(write_content),
+                                  ObStorageIdMod::get_default_id_mod()));
     ASSERT_EQ(OB_SUCCESS, adapter.is_tagging(uri, &tmp_cos_base, is_tagging));
     ASSERT_FALSE(is_tagging);
 
     ASSERT_EQ(OB_SUCCESS, adapter.del_file(uri, &tmp_cos_base));
-    ASSERT_EQ(OB_BACKUP_FILE_NOT_EXIST, adapter.is_tagging(uri, &tmp_cos_base, is_tagging));
+    ASSERT_EQ(OB_OBJECT_NOT_EXIST, adapter.is_tagging(uri, &tmp_cos_base, is_tagging));
     tmp_cos_base.reset();
 
     // tagging mode
@@ -292,7 +298,8 @@ TEST_F(TestBackupIOAdapterAccessCos, test_is_tagging)
 
     ASSERT_EQ(OB_SUCCESS, databuff_printf(uri, sizeof(uri), "%s/tagging_mode", dir_uri));
     ASSERT_EQ(OB_SUCCESS,
-        adapter.write_single_file(uri, &tmp_cos_base, write_content, strlen(write_content)));
+        adapter.write_single_file(uri, &tmp_cos_base, write_content, strlen(write_content),
+                                  ObStorageIdMod::get_default_id_mod()));
 
     is_tagging = true;
     ASSERT_EQ(OB_SUCCESS, adapter.is_tagging(uri, &tmp_cos_base, is_tagging));
@@ -312,7 +319,7 @@ TEST_F(TestBackupIOAdapterAccessCos, test_is_tagging)
 
     ASSERT_EQ(OB_SUCCESS, databuff_printf(uri, sizeof(uri), "%s/tagging_mode", dir_uri));
     ASSERT_EQ(OB_SUCCESS, adapter.del_file(uri, &tmp_cos_base));
-    ASSERT_EQ(OB_BACKUP_FILE_NOT_EXIST, adapter.is_tagging(uri, &tmp_cos_base, is_tagging));
+    ASSERT_EQ(OB_OBJECT_NOT_EXIST, adapter.is_tagging(uri, &tmp_cos_base, is_tagging));
   }
 }
 

@@ -10,26 +10,13 @@
  * See the Mulan PubL v2 for more details.
  */
 
+#define USING_LOG_PREFIX PALF
 #include "palf_env_impl.h"
-#include <string.h>
-#include "lib/lock/ob_spin_lock.h"
-#include "lib/ob_define.h"
-#include "lib/ob_errno.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/time/ob_time_utility.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "lib/oblog/ob_log_module.h"
-#include "share/allocator/ob_tenant_mutil_allocator.h"
-#include "share/config/ob_server_config.h"
-#include "share/ob_errno.h"
-#include "share/ob_occam_thread_pool.h"
-#include "log_define.h"
-#include "palf_handle_impl_guard.h"             // IPalfHandleImplGuard
+#include "logservice/ipalf/ipalf_handle.h"
 #include "palf_handle.h"
-#include "log_loop_thread.h"
-#include "log_rpc.h"
-#include "log_block_pool_interface.h"
-#include "log_io_utils.h"
+#include "share/ob_local_device.h"                            // ObLocalDevice
+#include "share/resource_manager/ob_resource_manager.h"       // ObResourceManager
+#include "share/io/ob_io_manager.h"                           // ObIOManager
 
 namespace oceanbase
 {
@@ -195,7 +182,8 @@ PalfEnvImpl::PalfEnvImpl() : palf_meta_lock_(common::ObLatchIds::PALF_ENV_LOCK),
                              rebuild_replica_log_lag_threshold_(0),
                              enable_log_cache_(false),
                              diskspace_enough_(true),
-                             tenant_id_(0),
+                             tenant_id_(-1),
+                             io_adapter_(),
                              is_inited_(false),
                              is_running_(false)
 {
@@ -217,7 +205,10 @@ int PalfEnvImpl::init(
     obrpc::ObBatchRpc *batch_rpc,
     common::ObILogAllocator *log_alloc_mgr,
     ILogBlockPool *log_block_pool,
-    PalfMonitorCb *monitor)
+    PalfMonitorCb *monitor,
+    ObLocalDevice *log_local_device,
+    ObResourceManager *resource_manager,
+    ObIOManager *io_manager)
 {
   int ret = OB_SUCCESS;
   int pret = 0;
@@ -226,10 +217,11 @@ int PalfEnvImpl::init(
     ret = OB_INIT_TWICE;
     PALF_LOG(ERROR, "PalfEnvImpl is inited twiced", K(ret));
   } else if (OB_ISNULL(base_dir) || !self.is_valid() || NULL == transport || NULL == batch_rpc
-             || OB_ISNULL(log_alloc_mgr) || OB_ISNULL(log_block_pool) || OB_ISNULL(monitor)) {
+             || OB_ISNULL(log_alloc_mgr) || OB_ISNULL(log_block_pool) || OB_ISNULL(monitor)
+             || OB_ISNULL(log_local_device) || OB_ISNULL(resource_manager) || OB_ISNULL(io_manager)) {
     ret = OB_INVALID_ARGUMENT;
     PALF_LOG(ERROR, "invalid arguments", K(ret), KP(transport), KP(batch_rpc), K(base_dir), K(self), KP(transport),
-             KP(log_alloc_mgr), KP(log_block_pool), KP(monitor));
+             KP(log_alloc_mgr), KP(log_block_pool), KP(monitor), KP(log_local_device), KP(resource_manager), KP(io_manager));
   } else if (OB_FAIL(init_log_io_worker_config_(options.disk_options_.log_writer_parallelism_,
                                                 tenant_id,
                                                 log_io_worker_config_))) {
@@ -270,6 +262,8 @@ int PalfEnvImpl::init(
     PALF_LOG(ERROR, "disk_options_wrapper_ init failed", K(ret));
   } else if (OB_FAIL(log_updater_.init(this))) {
     PALF_LOG(ERROR, "LogUpdater init failed", K(ret));
+  } else if (OB_FAIL(io_adapter_.init(tenant_id, log_local_device, resource_manager, io_manager))) {
+    PALF_LOG(ERROR, "LogIOAdapter init failed", K(ret));
   } else {
     log_alloc_mgr_ = log_alloc_mgr;
     log_block_pool_ = log_block_pool;
@@ -369,6 +363,7 @@ void PalfEnvImpl::destroy()
   disk_options_wrapper_.reset();
   rebuild_replica_log_lag_threshold_ = 0;
   enable_log_cache_ = false;
+  io_adapter_.destroy();
 }
 
 // NB: not thread safe
@@ -431,7 +426,7 @@ int PalfEnvImpl::create_palf_handle_impl_(const int64_t palf_id,
   } else if (OB_FAIL(palf_handle_impl->init(palf_id, access_mode, palf_base_info, replica_type,
       &fetch_log_engine_, base_dir, log_alloc_mgr_, log_block_pool_, &log_rpc_,
       log_io_worker_wrapper_.get_log_io_worker(palf_id), &log_shared_queue_th_, this,
-      self_, &election_timer_, palf_epoch))) {
+      self_, &election_timer_, palf_epoch, &io_adapter_))) {
     PALF_LOG(ERROR, "IPalfHandleImpl init failed", K(ret), K(palf_id));
     // NB: always insert value into hash map finally.
   } else if (OB_FAIL(palf_handle_impl_map_.insert_and_get(hash_map_key, palf_handle_impl))) {
@@ -607,7 +602,7 @@ int PalfEnvImpl::remove_directory(const char *log_dir)
       }
       if (OB_FAIL(ret) && true == result) {
         PALF_LOG(WARN, "remove directory failed, may be physical disk full", K(ret), KPC(this));
-        usleep(100*1000);
+        ob_usleep(100*1000);
       }
     } while (OB_FAIL(ret));
   }
@@ -771,7 +766,21 @@ int PalfEnvImpl::try_recycle_blocks()
         const int64_t log_disk_usage_limit_size = disk_opts_for_stopping_writing.log_disk_usage_limit_size_;
         const int64_t log_disk_warn_percent = disk_opts_for_stopping_writing.log_disk_utilization_threshold_;
         const int64_t log_disk_limit_percent = disk_opts_for_stopping_writing.log_disk_utilization_limit_threshold_;
-        LOG_DBA_ERROR_V2(OB_LOG_DISK_SPACE_ALMOST_FULL, tmp_ret, "msg", "log disk space is almost full",
+        LOG_DBA_ERROR(OB_LOG_OUTOF_DISK_SPACE, "msg", "log disk space is almost full", "ret", tmp_ret,
+            "total_size(MB)", log_disk_usage_limit_size/MB,
+            "used_size(MB)", total_used_size_byte/MB,
+            "used_percent(%)", (total_used_size_byte*100) / (log_disk_usage_limit_size+1),
+            "warn_size(MB)", (log_disk_usage_limit_size*log_disk_warn_percent)/100/MB,
+            "warn_percent(%)", log_disk_warn_percent,
+            "limit_size(MB)", (log_disk_usage_limit_size*log_disk_limit_percent)/100/MB,
+            "limit_percent(%)", log_disk_limit_percent,
+            "total_unrecyclable_size_byte(MB)", total_unrecyclable_size_byte/MB,
+            "maximum_used_size(MB)", maximum_used_size/MB,
+            "maximum_log_stream", palf_id,
+            "oldest_log_stream", oldest_palf_id,
+            "oldest_scn", oldest_scn,
+            "in_shrinking", in_shrinking);
+        LOG_DBA_ERROR_(OB_LOG_DISK_SPACE_ALMOST_FULL, tmp_ret, "log disk space is almost full",
             ", total_size(MB)=", log_disk_usage_limit_size/MB,
             ", used_size(MB)=", total_used_size_byte/MB,
             ", used_percent(%)=", (total_used_size_byte*100) / (log_disk_usage_limit_size+1),
@@ -961,7 +970,10 @@ int PalfEnvImpl::for_each(const common::ObFunction<int (IPalfHandleImpl *)> &fun
     return bool_ret;
   };
   int ret = OB_SUCCESS;
-  if (OB_FAIL(palf_handle_impl_map_.for_each(func_impl))) {
+  if (!func.is_valid()) {
+    // ObFunction will be invalid when allocating memory failed.
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(palf_handle_impl_map_.for_each(func_impl))) {
     PALF_LOG(WARN, "iterate palf_handle_impl_map_ failed", K(ret));
   } else {
   }
@@ -985,7 +997,10 @@ int PalfEnvImpl::for_each(const common::ObFunction<int (const PalfHandle &)> &fu
     return bool_ret;
   };
   int ret = OB_SUCCESS;
-  if (OB_FAIL(palf_handle_impl_map_.for_each(func_impl))) {
+  if (!func.is_valid()) {
+    // ObFunction will be invalid when allocating memory failed.
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(palf_handle_impl_map_.for_each(func_impl))) {
     PALF_LOG(WARN, "iterate palf_handle_impl_map_ failed", K(ret));
   } else {
   }
@@ -1061,7 +1076,7 @@ int PalfEnvImpl::reload_palf_handle_impl_(const int64_t palf_id)
     PALF_LOG(WARN, "alloc ipalf_handle_impl failed", K(ret));
   } else if (OB_FAIL(tmp_palf_handle_impl->load(palf_id, &fetch_log_engine_, base_dir, log_alloc_mgr_,
           log_block_pool_, &log_rpc_, log_io_worker_wrapper_.get_log_io_worker(palf_id), &log_shared_queue_th_,
-          this, self_, &election_timer_, palf_epoch, is_integrity))) {
+          this, self_, &election_timer_, palf_epoch, &io_adapter_, is_integrity))) {
     PALF_LOG(ERROR, "PalfHandleImpl init failed", K(ret), K(palf_id));
   } else if (OB_FAIL(palf_handle_impl_map_.insert_and_get(hash_map_key, tmp_palf_handle_impl))) {
     PALF_LOG(WARN, "palf_handle_impl_map_ insert_and_get failed", K(ret), K(palf_id), K(tmp_palf_handle_impl));
@@ -1198,9 +1213,10 @@ bool PalfEnvImpl::check_can_create_palf_handle_impl_() const
 {
   bool bool_ret = true;
   int64_t count = palf_handle_impl_map_.count();
+  const int64_t per_palf_size = GCTX.is_shared_storage_mode() ? SHARED_STORAGE_MIN_DISK_SIZE_PER_PALF_INSTANCE : MIN_DISK_SIZE_PER_PALF_INSTANCE;
   // NB: avoid concurrent with expand and shrink, need guard by palf_meta_lock_.
   const PalfDiskOptions disk_opts = disk_options_wrapper_.get_disk_opts_for_recycling_blocks();
-  bool_ret = (count + 1) * MIN_DISK_SIZE_PER_PALF_INSTANCE <= disk_opts.log_disk_usage_limit_size_;
+  bool_ret = (count + 1) * per_palf_size <= disk_opts.log_disk_usage_limit_size_;
   return bool_ret;
 }
 
@@ -1345,7 +1361,15 @@ void PalfEnvImpl::period_calc_disk_usage()
       constexpr int64_t INTERVAL = 1*1000*1000;
       if (palf_reach_time_interval(INTERVAL, disk_not_enough_print_interval_in_loop_thread_)) {
         int tmp_ret = OB_LOG_OUTOF_DISK_SPACE;
-        LOG_DBA_ERROR_V2(OB_LOG_DISK_SPACE_ALMOST_FULL, tmp_ret, "msg", "log disk space is almost full",
+        LOG_DBA_ERROR(OB_LOG_OUTOF_DISK_SPACE, "msg", "log disk space is almost full", "ret", tmp_ret,
+            "total_size(MB)", log_disk_usage_limit_size/MB,
+            "used_size(MB)", used_size_byte/MB,
+            "used_percent(%)", (used_size_byte*100) / (log_disk_usage_limit_size + 1),
+            "warn_size(MB)", warn_siz/MB,
+            "warn_percent(%)", log_disk_warn_percent,
+            "limit_size(MB)", usable_disk_limit_size_to_stop_writing/MB,
+            "limit_percent(%)", log_disk_limit_percent);
+        LOG_DBA_ERROR_(OB_LOG_DISK_SPACE_ALMOST_FULL, tmp_ret, "log disk space is almost full",
             ", total_size(MB)=", log_disk_usage_limit_size/MB,
             ", used_size(MB)=", used_size_byte/MB,
             ", used_percent(%)=", (used_size_byte*100) / (log_disk_usage_limit_size + 1),
@@ -1398,7 +1422,8 @@ int PalfEnvImpl::check_can_update_log_disk_options_(const PalfDiskOptions &disk_
 {
   int ret = OB_SUCCESS;
   const int64_t curr_palf_instance_num = palf_handle_impl_map_.count();
-  const int64_t curr_min_log_disk_size = curr_palf_instance_num * MIN_DISK_SIZE_PER_PALF_INSTANCE;
+  const int64_t per_palf_size = GCTX.is_shared_storage_mode() ? SHARED_STORAGE_MIN_DISK_SIZE_PER_PALF_INSTANCE : MIN_DISK_SIZE_PER_PALF_INSTANCE;
+  const int64_t curr_min_log_disk_size = curr_palf_instance_num * per_palf_size;
   if (disk_opts.log_disk_usage_limit_size_ < curr_min_log_disk_size) {
     ret = OB_NOT_SUPPORTED;
     PALF_LOG(WARN, "can not hold current palf instance", K(curr_palf_instance_num),
@@ -1419,6 +1444,11 @@ int PalfEnvImpl::remove_directory_while_exist_(const char *log_dir)
     PALF_LOG(WARN, "remove_directory failed", K(log_dir), K(result));
   } else {}
   return ret;
+}
+
+LogSharedQueueTh *PalfEnvImpl::get_log_shared_queue_thread()
+{
+  return &log_shared_queue_th_;
 }
 
 } // end namespace palf

@@ -14,14 +14,10 @@
 #include <gtest/gtest.h>
 #define private public
 #define protected public
-#include "storage/compaction/ob_tablet_merge_ctx.h"
 #include "storage/compaction/ob_partition_rows_merger.h"
-#include "lib/container/ob_se_array.h"
-#include "storage/compaction/ob_tablet_merge_task.h"
 #include "storage/blocksstable/ob_multi_version_sstable_test.h"
-#include "storage/column_store/ob_column_oriented_sstable.h"
 #include "storage/test_tablet_helper.h"
-#include "mtlenv/storage/test_merge_basic.h"
+#include "mtlenv/storage/access/test_merge_basic.h"
 
 namespace oceanbase
 {
@@ -30,6 +26,20 @@ using namespace share::schema;
 using namespace blocksstable;
 using namespace compaction;
 using namespace unittest;
+namespace compaction
+{
+int ObBasicTabletMergeCtx::cal_major_merge_param(
+  const bool force_full_merge,
+  ObProgressiveMergeMgr &progressive_mgr)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(static_param_.cal_major_merge_param(force_full_merge,
+                                                  progressive_mgr))) {
+    LOG_WARN("failed to calc major param", KR(ret), K_(static_param));
+  }
+  return ret;
+}
+} // namespace compaction
 namespace storage
 {
 namespace mds
@@ -121,16 +131,17 @@ void ObMajorRowsMergerTest::prepare_merge_context(const ObMergeType &merge_type,
                                                   const ObVersionRange &trans_version_range,
                                                   ObTabletMergeCtx &merge_context)
 {
+  merge_context.merge_dag_ = &merge_dag_;
   TestMergeBasic::prepare_merge_context(merge_type, is_full_merge, trans_version_range, merge_context);
   ASSERT_EQ(OB_SUCCESS, merge_context.cal_merge_param());
   ASSERT_EQ(OB_SUCCESS, merge_context.init_parallel_merge_ctx());
-  ASSERT_EQ(OB_SUCCESS, merge_context.init_static_param_and_desc());
+  ASSERT_EQ(OB_SUCCESS, merge_context.static_param_.init_static_info(merge_context.tablet_handle_));
+  ASSERT_EQ(OB_SUCCESS, merge_context.init_static_desc());
   ASSERT_EQ(OB_SUCCESS, merge_context.init_read_info());
   ASSERT_EQ(OB_SUCCESS, merge_context.init_tablet_merge_info());
   ASSERT_EQ(OB_SUCCESS, merge_context.merge_info_.prepare_sstable_builder());
   ASSERT_EQ(OB_SUCCESS, merge_context.merge_info_.sstable_builder_.data_store_desc_.assign(index_desc_.get_desc()));
   ASSERT_EQ(OB_SUCCESS, merge_context.merge_info_.prepare_index_builder());
-  merge_context.merge_dag_ = &merge_dag_;
 }
 
 
@@ -378,7 +389,7 @@ TEST_F(ObMajorRowsMergerTest, two_iters)
   int ret = OB_SUCCESS;
   merge_type_ = MAJOR_MERGE;
   ObTabletMergeDagParam param;
-  ObTabletMergeCtx merge_context(param, allocator_);
+  ObTabletMajorMergeCtx merge_context(param, allocator_);
 
   ObTableHandleV2 handle1;
   const char *micro_data[1];
@@ -394,7 +405,7 @@ TEST_F(ObMajorRowsMergerTest, two_iters)
   scn_range.start_scn_.set_min();
   scn_range.end_scn_.convert_for_tx(10);
   prepare_table_schema(micro_data, schema_rowkey_cnt, scn_range, snapshot_version);
-  reset_writer(snapshot_version);
+  reset_writer(snapshot_version, MAJOR_MERGE);
   prepare_one_macro(micro_data, 1);
   prepare_data_end(handle1, storage::ObITable::MAJOR_SSTABLE);
   merge_context.static_param_.tables_handle_.add_table(handle1);
@@ -406,12 +417,12 @@ TEST_F(ObMajorRowsMergerTest, two_iters)
   const char *micro_data2[2];
   micro_data2[0] =
       "bigint   var   bigint   bigint   bigint bigint dml           flag    multi_version_row_flag\n"
-      "0        var1  -10       0        NOP     10   T_DML_UPDATE  DELETE   LF\n"
-      "1        var1  -10       0        NOP     12   T_DML_UPDATE  EXIST   LF\n";
+      "0        var1  -30       0        NOP     10   T_DML_UPDATE  DELETE   LF\n"
+      "1        var1  -30       0        NOP     12   T_DML_UPDATE  EXIST   LF\n";
 
   micro_data2[1] =
       "bigint   var   bigint   bigint   bigint bigint dml           flag    multi_version_row_flag\n"
-      "3        var1  -10       0        NOP     10   T_DML_UPDATE  EXIST   LF\n";
+      "3        var1  -30       0        NOP     10   T_DML_UPDATE  EXIST   LF\n";
   snapshot_version = 20;
   scn_range.start_scn_.convert_for_tx(10);
   scn_range.end_scn_.convert_for_tx(20);
@@ -491,7 +502,7 @@ int main(int argc, char **argv)
 {
   system("rm -rf test_major_rows_merger.log*");
   OB_LOGGER.set_log_level("INFO");
-  OB_LOGGER.set_file_name("test_major_rows_merger.log", true, false);
+  OB_LOGGER.set_file_name("test_major_rows_merger.log");
   oceanbase::common::ObLogger::get_logger().set_log_level("INFO");
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

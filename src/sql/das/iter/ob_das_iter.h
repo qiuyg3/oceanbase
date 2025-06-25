@@ -23,6 +23,7 @@ using namespace common;
 namespace sql
 {
 
+class ObDASDomainIdMergeIter;
 class ObEvalCtx;
 class ObExecContext;
 struct ObDASIterParam
@@ -58,9 +59,9 @@ public:
   int64_t max_size_;
   ObEvalCtx *eval_ctx_;
   ObExecContext *exec_ctx_;
-  const ObIArray<ObExpr*> *output_;
+  const ExprFixedArray *output_;
   const ObExpr *group_id_expr_;
-  TO_STRING_KV(K_(type), K_(max_size), K_(eval_ctx), K_(exec_ctx), KPC_(output), K_(group_id_expr));
+  VIRTUAL_TO_STRING_KV(K_(type), K_(max_size), K_(eval_ctx), K_(exec_ctx), KPC_(output), K_(group_id_expr));
 };
 
 class ObDASIter : public common::ObNewRowIterator
@@ -87,7 +88,7 @@ public:
   ObDASIter **&get_children() { return children_; }
   void set_children_cnt(uint32_t children_cnt) { children_cnt_ = children_cnt; }
   int64_t get_children_cnt() const { return children_cnt_; }
-  const ObIArray<ObExpr*> *get_output() { return output_; }
+  const ExprFixedArray *get_output() { return output_; }
 
   // The state of ObDASMergeIter may change many times during execution, e.g., the merge_type
   // changing from SEQUENTIAL_MERGE to SORT_MERGE, or the creation of a new batch of DAS tasks.
@@ -116,6 +117,8 @@ public:
   virtual void reset() override {}
   // for compatibility with ObNewRowIterator
 
+  int get_domain_id_merge_iter(ObDASDomainIdMergeIter *&domain_id_merge_iter);
+  virtual int get_diagnosis_info(ObDiagnosisManager* diagnosis_manager) override { return OB_SUCCESS; };
 protected:
   virtual int inner_init(ObDASIterParam &param) = 0;
   virtual int inner_reuse() = 0;
@@ -127,7 +130,7 @@ protected:
   int64_t max_size_;
   ObEvalCtx *eval_ctx_;
   ObExecContext *exec_ctx_;
-  const ObIArray<ObExpr*> *output_;
+  const ExprFixedArray *output_;
   const ObExpr *group_id_expr_;
   ObDASIter **children_;
   uint32_t children_cnt_;

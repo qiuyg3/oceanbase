@@ -11,12 +11,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_OPT
-#include "lib/oblog/ob_log.h"
-#include "lib/oblog/ob_log_module.h"
-#include "share/config/ob_server_config.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
-#include "storage/ob_tenant_tablet_stat_mgr.h"
-#include "share/stat/ob_opt_stat_monitor_manager.h"
+#include "src/share/interrupt/ob_interrupt_rpc_proxy.h"
 #include "ob_opt_stat_service.h"
 
 namespace oceanbase {
@@ -94,7 +89,7 @@ int ObOptStatService::get_column_stat(const uint64_t tenant_id,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret), K(handles.count()));
   } else {
-    handle = handles.at(0);
+    handle.move_from(handles.at(0));
   }
   return ret;
 }
@@ -168,7 +163,7 @@ int ObOptStatService::load_table_stat_and_put_cache(const uint64_t tenant_id,
       if (OB_FAIL(table_stat_cache_.put_and_fetch_value(tmp_key, all_part_stats.at(i), hd))) {
         LOG_WARN("failed to put and fetch table stat", K(ret));
       } else if (tmp_key == key) {
-        handle = hd;
+        handle.move_from(hd);
         added = true;
       }
     }

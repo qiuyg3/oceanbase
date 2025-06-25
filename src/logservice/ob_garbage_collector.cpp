@@ -11,32 +11,19 @@
  */
 
 #include "ob_garbage_collector.h"
-#include "palf_handle_guard.h"
-#include "ob_log_handler.h"
 #include "ob_log_service.h"
 #include "ob_switch_leader_adapter.h"
-#include "common_util/ob_log_time_utils.h"
 #include "archiveservice/ob_archive_service.h"
-#include "share/scn.h"
 #include "rpc/obrpc/ob_rpc_net_handler.h"
-#include "storage/high_availability/ob_storage_ha_struct.h"
-#include "storage/ls/ob_ls.h"
-#include "storage/slog/ob_storage_logger.h"
-#include "storage/tx/ob_trans_define.h"
 #include "storage/tx/ob_ts_mgr.h"
-#include "storage/tx_storage/ob_ls_service.h"
-#include "share/location_cache/ob_location_service.h"
-#include "share/ob_srv_rpc_proxy.h"
-#include "share/rc/ob_tenant_base.h"
 #include "share/ls/ob_ls_life_manager.h"
-#include "share/ob_debug_sync.h"
-#include "storage/tx_storage/ob_ls_handle.h"
-#include "rootserver/ob_ls_recovery_reportor.h"      // ObLSRecoveryReportor
 #include "rootserver/ob_tenant_info_loader.h" // ObTenantInfoLoader
-#include "share/ob_occam_time_guard.h"
-#include "storage/slog_ckpt/ob_server_checkpoint_slog_handler.h"
+#include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "storage/concurrency_control/ob_data_validation_service.h"
 #include "lib/wait_event/ob_wait_event.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "storage/incremental/ob_shared_meta_service.h"
+#endif
 
 namespace oceanbase
 {
@@ -293,7 +280,7 @@ ObGCLSLog::ObGCLSLog()
 
 //GC类型日志回放要求同类型内按序, 考虑到回放的性能, 使用前向barrier
 ObGCLSLog::ObGCLSLog(const int16_t log_type)
-    : header_(ObLogBaseType::GC_LS_LOG_BASE_TYPE, ObReplayBarrierType::PRE_BARRIER),
+    : header_(ObLogBaseType::GC_LS_LOG_BASE_TYPE, ObReplayBarrierType::STRICT_BARRIER),
       version_(GC_LOG_VERSION),
       log_type_(log_type)
 {
@@ -1159,16 +1146,43 @@ int ObGCHandler::offline_ls_(const SCN &offline_scn)
       }
     }
 #endif
+
     if (OB_FAIL(ret)) {
+#ifdef OB_BUILD_SHARED_STORAGE
+      // update ss_ls_meta first and then change the local meta.
+    } else if (GCTX.is_shared_storage_mode()
+               && OB_FAIL(update_ss_ls_meta_(ls_id, LSGCState::LS_OFFLINE, offline_scn))) {
+      CLOG_LOG(WARN, "update ss ls meta failed", K(ret), K(offline_scn));
+#endif
     } else if (OB_FAIL(ls_->set_gc_state(LSGCState::LS_OFFLINE, offline_scn))) {
       int ret_code = ret;
       ret = overwrite_set_gc_state_retcode_(ret_code, LSGCState::LS_OFFLINE, ls_id);
     } else {
-      CLOG_LOG(INFO, "offline_ls success",  K(ls_->get_ls_id()), K(offline_scn));
+      CLOG_LOG(INFO, "offline_ls success", K(ls_->get_ls_id()), K(offline_scn));
     }
   }
   return ret;
 }
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObGCHandler::update_ss_ls_meta_(const ObLSID &ls_id,
+                                    const logservice::LSGCState &gc_state,
+                                    const share::SCN &offline_scn)
+{
+  int ret = OB_SUCCESS;
+  SYNC_UPLOAD_INC_META_WITH_RET(SSIncMetaUploadType::GC_HANDLER_UPLOAD_TYPE,
+                                ret,
+                                ls_gc_state,
+                                (*MTL(ObSSMetaService *)),
+                                ls_id,
+                                gc_state,
+                                offline_scn);
+  if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "update ls gc state failed", K(ret), K(ls_id), K(offline_scn));
+  }
+  return ret;
+}
+#endif
 
 int ObGCHandler::overwrite_set_gc_state_retcode_(const int ret_code,
                                                  const LSGCState gc_state,
@@ -1461,7 +1475,7 @@ void ObGarbageCollector::run1()
 
   const int64_t gc_interval = GC_INTERVAL;
   while (!has_set_stop()) {
-    if (ObServerCheckpointSlogHandler::get_instance().is_started()) {
+    if (SERVER_STORAGE_META_SERVICE.is_started()) {
       if (!stop_create_new_gc_task_) {
         CLOG_LOG(INFO, "Garbage Collector is running", K(seq_), K(gc_interval));
         ObGCCandidateArray gc_candidates;
@@ -1480,7 +1494,7 @@ void ObGarbageCollector::run1()
     // safe destroy handler keep running even if ObServerCheckpointSlogHandler is not started,
     // because ls still need to be safe destroy when observer fail to start.
     (void) safe_destroy_handler_.handle();
-    ob_usleep(gc_interval);
+    ob_usleep(gc_interval, true/*is_idle_sleep*/);
   }
 }
 
@@ -1704,6 +1718,29 @@ int ObGarbageCollector::check_if_tenant_has_been_dropped_(const uint64_t tenant_
   return ret;
 }
 
+int ObGarbageCollector::check_if_tenant_is_creating_(const uint64_t tenant_id, bool &is_creating)
+{
+  int ret = OB_SUCCESS;
+  schema::ObMultiVersionSchemaService *schema_service = GCTX.schema_service_;
+  schema::ObSchemaGetterGuard guard;
+  const schema::ObTenantSchema *tenant_schema = NULL;
+  is_creating = false;
+  if (OB_ISNULL(schema_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG(WARN, "schema_service is null", KR(ret));
+  } else if (OB_FAIL(schema_service->get_tenant_schema_guard(OB_SYS_TENANT_ID, guard))) {
+    CLOG_LOG(WARN, "fail to get schema guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(guard.get_tenant_info(tenant_id, tenant_schema))) {
+    CLOG_LOG(WARN, "fail to get tenant schema", KR(ret), K(tenant_id));
+  } else if (OB_ISNULL(tenant_schema)) {
+    ret = OB_TENANT_NOT_EXIST;
+    CLOG_LOG(WARN, "tenant not exist", KR(ret), K(tenant_id));
+  } else {
+    is_creating = tenant_schema->is_creating();
+  }
+  return ret;
+}
+
 int ObGarbageCollector::gc_check_ls_status_(storage::ObLS &ls,
                                             ObGCCandidateArray &gc_candidates)
 {
@@ -1722,6 +1759,7 @@ int ObGarbageCollector::gc_check_ls_status_(storage::ObLS &ls,
   if (OB_FAIL(get_ls_status_from_table(ls_id, ls_status))) {
     int tmp_ret = OB_SUCCESS;
     bool is_tenant_dropped = false;
+    bool is_creating = false;
     if (OB_SUCCESS != (tmp_ret = check_if_tenant_has_been_dropped_(tenant_id, is_tenant_dropped))) {
       CLOG_LOG(WARN, "check_if_tenant_has_been_dropped_ failed", K(tmp_ret), K(tenant_id), K(ls_id));
     } else if (is_tenant_dropped) {
@@ -1729,7 +1767,21 @@ int ObGarbageCollector::gc_check_ls_status_(storage::ObLS &ls,
       candidate.gc_reason_ = GCReason::LS_STATUS_ENTRY_NOT_EXIST;
       ret = OB_SUCCESS;
     } else if (OB_ENTRY_NOT_EXIST == ret) {
-      if (OB_SUCCESS != (tmp_ret = ls.get_migration_status(migration_status))) {
+      if (is_user_tenant(tenant_id)) {
+        if (OB_TMP_FAIL(check_if_tenant_is_creating_(gen_meta_tenant_id(tenant_id), is_creating))
+            || is_creating) {
+          // tenant is creating, current observer may not refresh schema which will cause failure to get tenant schema
+          // when creating tenant, ls status may not exist, so treat it as normal
+          // after meta tenant is created, user ls should exists in __all_ls_status
+          if (REACH_TIME_INTERVAL(10_s)) {
+            CLOG_LOG(WARN, "failed to get ls status, tenant may be creating", KR(ret), KR(tmp_ret),
+                K(is_creating), K(ls_id));
+          }
+          ret = OB_SUCCESS;
+        }
+      }
+      if (OB_SUCC(ret)) {
+      } else if (OB_SUCCESS != (tmp_ret = ls.get_migration_status(migration_status))) {
         CLOG_LOG(WARN, "get_migration_status failed", K(tmp_ret), K(ls_id));
       } else if (OB_SUCCESS != (tmp_ret = ObMigrationStatusHelper::check_ls_allow_gc(
             ls.get_ls_id(), migration_status, allow_gc))) {

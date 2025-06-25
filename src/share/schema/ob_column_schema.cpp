@@ -11,12 +11,8 @@
  */
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
-#include "share/schema/ob_column_schema.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/utility/ob_fast_convert.h"
-#include "share/schema/ob_table_schema.h"
+#include "ob_column_schema.h"
 #include "share/schema/ob_schema_service.h"
-#include "share/ob_cluster_version.h"
 
 namespace oceanbase
 {
@@ -367,7 +363,7 @@ OB_DEF_DESERIALIZE(ObColumnSchemaV2)
 
   if (!OB_SUCC(ret)) {
     LOG_WARN("Fail to deserialize data, ", K(ret));
-  } else if (OB_FAIL(deserialize_string_array(buf, data_len, pos, extended_type_info_))) {
+  } else if (OB_FAIL(deserialize_string_array(buf, data_len, pos, extended_type_info_, get_allocator()))) {
     LOG_WARN("deserialize_string_array failed", K(ret));
   } else if (OB_FAIL(deep_copy_obj(orig_default_value, orig_default_value_))) {
     LOG_WARN("Fail to deep copy orig_default_value, ", K(ret), K_(orig_default_value));
@@ -548,7 +544,7 @@ int ObColumnSchemaV2::get_byte_length(
   } else if (ob_is_text_tc(meta_type_.get_type()) || ob_is_json(meta_type_.get_type())
              || ob_is_geometry(meta_type_.get_type()) || ob_is_roaringbitmap(meta_type_.get_type())) {
     if (for_check_length) {
-      // when check row length, a lob will occupy at most 2KB
+      // when check row length, a lob will occupy at most 512B
       length = min(get_data_length(), OB_MAX_LOB_HANDLE_LENGTH);
     } else {
       length = get_data_length();
@@ -727,7 +723,7 @@ int ObColumnSchemaV2::deserialize_extended_type_info(const char *buf,
                                                       int64_t &pos)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(deserialize_string_array(buf, data_len, pos, extended_type_info_))) {
+  if (OB_FAIL(deserialize_string_array(buf, data_len, pos, extended_type_info_, get_allocator()))) {
     LOG_WARN("fail to deserialize extended type info", K(ret));
   }
   return ret;
@@ -806,6 +802,22 @@ int ObColumnSchemaV2::get_each_column_group_name(ObString &cg_name) const {
     if (cg_name.write(tmp_cg_name, write_len) != write_len) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("fail to write column group name to str", K(ret), K(cg_name), K(write_len));
+    }
+  }
+  return ret;
+}
+
+int ObColumnSchemaV2::is_same_collection_column(const ObColumnSchemaV2 &other, bool &is_same) const
+{
+  int ret = OB_SUCCESS;
+  if (get_extended_type_info().count() == other.get_extended_type_info().count()) {
+    if (get_extended_type_info().count() != 1) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to check type info incremental change", K(ret));
+    } else {
+      ObString src_sub_name = get_extended_type_info().at(0);
+      ObString dst_sub_name = other.get_extended_type_info().at(0);
+      is_same = (src_sub_name.case_compare(dst_sub_name) == 0);
     }
   }
   return ret;

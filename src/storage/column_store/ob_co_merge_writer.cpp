@@ -36,7 +36,7 @@ int ObCOMergeProjector::init(const ObStorageColumnGroupSchema &cg_schema)
     project_row_.reset();
     const uint16_t column_cnt = cg_schema.column_cnt_;
     for (uint16_t i = 0; OB_SUCC(ret) && i < column_cnt; i++) {
-      const uint16_t project_idx = cg_schema.is_all_column_group() ? i : cg_schema.column_idxs_[i];
+      const uint16_t project_idx = cg_schema.get_column_idx(i);
       if (OB_FAIL(projector_.push_back(project_idx))) {
         STORAGE_LOG(WARN, "failed to push back project idx", K(ret), K(i), K(cg_schema), K(projector_));
       }
@@ -51,20 +51,6 @@ int ObCOMergeProjector::init(const ObStorageColumnGroupSchema &cg_schema)
   }
 
   return ret;
-}
-
-bool ObCOMergeProjector::is_all_nop(const blocksstable::ObDatumRow &row) const
-{
-  bool all_nop = true;
-
-  for (int64_t i = 0; i < projector_.count(); i++) {
-    const uint16_t idx = projector_.at(i);
-    if (idx < row.count_ && !row.storage_datums_[idx].is_nop()) {
-      all_nop = false;
-    }
-  }
-
-  return all_nop;
 }
 
 int ObCOMergeProjector::project(const blocksstable::ObDatumRow &row)
@@ -115,6 +101,7 @@ void ObCOMergeProjector::clean_project_row()
  * ---------------------------------------------------------ObWriteHelper--------------------------------------------------------------
  */
 int ObWriteHelper::init(
+    ObBasicTabletMergeCtx &ctx,
     const ObMergeParameter &merge_param,
     const int64_t parallel_idx,
     const int64_t cg_idx,
@@ -122,18 +109,31 @@ int ObWriteHelper::init(
     ObTabletMergeInfo &merge_info)
 {
   int ret = OB_SUCCESS;
-  ObMacroDataSeq macro_start_seq(0);
-
-  if (OB_FAIL(ObDataDescHelper::build(merge_param, merge_info, data_store_desc_, merge_info_))) {
-    STORAGE_LOG(WARN, "fail to build data desc", K(ret));
-  } else if (OB_FAIL(macro_start_seq.set_parallel_degree(parallel_idx))) {
-    STORAGE_LOG(WARN, "Failed to set parallel degree to macro start seq", K(ret), K(parallel_idx));
-  } else if (OB_FAIL(macro_writer_.open(data_store_desc_, macro_start_seq))) {
-    STORAGE_LOG(WARN, "Failed to open macro writer", K(ret));
+  int64_t macro_start_seq = 0;
+  ObMacroSeqParam macro_seq_param;
+  macro_seq_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
+  ObSSTablePrivateObjectCleaner *object_cleaner = nullptr;
+  if (OB_FAIL(ObDataDescHelper::build(merge_param, merge_info, data_store_desc_))) {
+    STORAGE_LOG(WARN, "fail to build data desc", K(ret), K(cg_schema));
+  } else if (OB_FAIL(ctx.generate_macro_seq_info(parallel_idx, macro_start_seq))) {
+    LOG_WARN("failed to generate macro seq info for cur merge task", K(ret), K(parallel_idx), K(ctx));
+  } else if (FALSE_IT(macro_seq_param.start_ = macro_start_seq)) {
+  } else if (OB_FAIL(ObSSTablePrivateObjectCleaner::get_cleaner_from_data_store_desc(
+                                                        data_store_desc_, object_cleaner))) {
+    LOG_WARN("failed to get cleaner from data store desc", K(ret), K(data_store_desc_), KP(object_cleaner));
+  } else if (OB_FAIL(macro_writer_.open(
+                 data_store_desc_, parallel_idx, macro_seq_param,
+                 ctx.get_pre_warm_param(),
+                 *object_cleaner))) {
+    STORAGE_LOG(WARN, "Failed to open macro writer",
+                K(ret), K(parallel_idx), K(data_store_desc_), KPC(object_cleaner));
   } else if (cg_schema.is_all_column_group()) {
     skip_project_ = true;
   } else if (OB_FAIL(projector_.init(cg_schema))) {
     STORAGE_LOG(WARN, "fail to init project", K(ret), K(cg_schema));
+  } else {
+    LOG_INFO("success to open macro writer with pre warmer", KR(ret), K(data_store_desc_),
+      K(macro_writer_), K(ctx.get_pre_warm_param()));
   }
 
   return ret;
@@ -162,11 +162,11 @@ int ObWriteHelper::end_write(ObTabletMergeInfo &merge_info)
 
   if (OB_FAIL(macro_writer_.close())) {
     STORAGE_LOG(WARN, "failed to close macro writer", K(ret), K(macro_writer_));
-  } else if (FALSE_IT(merge_info_.merge_finish_time_ = common::ObTimeUtility::fast_current_time())) {
-  } else if (OB_FAIL(merge_info.add_macro_blocks(merge_info_))) {
-    STORAGE_LOG(WARN, "Failed to add macro blocks", K(ret));
   } else {
-    merge_info_.dump_info("macro block builder close");
+    ObSSTableMergeHistory &merge_history = merge_info.get_merge_history();
+    if (OB_FAIL(merge_history.update_block_info(macro_writer_.get_merge_block_info(), false/*without_row_cnt*/))) {
+      STORAGE_LOG(WARN, "Failed to add macro blocks", K(ret));
+    }
   }
 
   return ret;
@@ -209,17 +209,24 @@ int ObCOMergeWriter::basic_init(const blocksstable::ObDatumRow &default_row,
     STORAGE_LOG(WARN, "failed to deep copy default row", K(ret));
   } else if (OB_FAIL(fuser_.init(column_cnt))) {
     STORAGE_LOG(WARN, "failed to init fuser", K(ret), K(column_cnt));
-  } else if (OB_ISNULL(table)) {
+  } else if (OB_ISNULL(table)) { // last major sstable is empty
     iter_ = nullptr;
   } else if (!table->is_major_sstable()) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "UNEXPECTED table type", K(ret), KPC(table));
   } else {
     const ObSSTable *sstable = static_cast<ObSSTable *>(table);
+    const uint64_t compat_version = merge_param.static_param_.data_version_;
     if (add_column) {
       iter_ = OB_NEWx(ObDefaultRowIter, (&allocator_), default_row_);
-    } else if (merge_param.is_full_merge() || sstable->is_small_sstable() || only_use_row_table) {
+    } else if (merge_param.is_full_merge() || only_use_row_table) {
       iter_ = OB_NEWx(ObPartitionRowMergeIter, (&allocator_), allocator_, iter_co_build_row_store_);
+    } else if (sstable->is_small_sstable()) {
+      if (compat_version >= DATA_VERSION_4_3_5_1 && MICRO_BLOCK_MERGE_LEVEL == merge_param.static_param_.merge_level_) {
+        iter_ = OB_NEWx(ObPartitionMicroMergeIter, (&allocator_), allocator_);
+      } else {
+        iter_ = OB_NEWx(ObPartitionRowMergeIter, (&allocator_), allocator_, iter_co_build_row_store_);
+      }
     } else if (MICRO_BLOCK_MERGE_LEVEL == merge_param.static_param_.merge_level_) {
       iter_ = OB_NEWx(ObPartitionMicroMergeIter, (&allocator_), allocator_);
     } else {
@@ -346,15 +353,20 @@ int ObCOMergeWriter::append_iter_curr_row_or_range()
     } else if (OB_FAIL(process(fuser_.get_result_row()))) {
       STORAGE_LOG(WARN, "failed to process iter curr row", K(ret), KPC(iter_), K(default_row_));
     }
+  } else if (iter_->is_small_sstable_iter()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ObPartitionMicroMergeIter for small sstable is unexpected not opened", K(ret));
   } else {
     const ObMacroBlockDesc *macro_desc = nullptr;
+    const ObMicroBlockData *micro_block_data = nullptr;
+    bool need_rewrite = false;
 
-    if (OB_FAIL(iter_->get_curr_macro_block(macro_desc))) {
+    if (OB_FAIL(iter_->get_curr_macro_block(macro_desc, micro_block_data))) {
       STORAGE_LOG(WARN, "Failed to get current micro block", K(ret), KPC(iter_));
     } else if (OB_ISNULL(macro_desc) || OB_UNLIKELY(!macro_desc->is_valid())) {
       ret = OB_ERR_UNEXPECTED;
       STORAGE_LOG(WARN, "Unexpected null macro block", K(ret), KP(macro_desc), KPC(iter_));
-    } else if (OB_FAIL(process(*macro_desc))) {
+    } else if (OB_FAIL(process(*macro_desc, micro_block_data))) {
       STORAGE_LOG(WARN, "Failed to append macro block", K(ret), KPC(macro_desc));
     }
   }
@@ -476,29 +488,19 @@ ObCOMergeRowWriter::~ObCOMergeRowWriter()
   }
 }
 
-int ObCOMergeRowWriter::init(const blocksstable::ObDatumRow &default_row,
-                          const ObMergeParameter &merge_param,
-                          const int64_t parallel_idx,
-                          const ObITableReadInfo *full_read_info,
-                          const ObStorageColumnGroupSchema &cg_schema,
-                          const int64_t cg_idx,
-                          ObTabletMergeInfo &merge_info,
-                          ObITable *table,
-                          const bool add_column)
+int ObCOMergeRowWriter::choose_read_info_for_old_major(
+   const ObMergeParameter &merge_param,
+   const ObITableReadInfo &full_read_info,
+   const ObStorageColumnGroupSchema &cg_schema,
+   const ObITableReadInfo *&read_info)
 {
   int ret = OB_SUCCESS;
-  bool is_all_nop = false;
-  const ObITableReadInfo *read_info = nullptr;
+  read_info = NULL;
 
-  if (OB_FAIL(write_helper_.init(merge_param, parallel_idx, cg_idx, cg_schema, merge_info))) {
-    STORAGE_LOG(WARN, "fail to init write helper", K(ret), K(parallel_idx), K(cg_idx), K(cg_schema));
-  } else if (OB_FAIL(row_.init(cg_schema.column_cnt_))) {
-    STORAGE_LOG(WARN, "fail to init row", K(ret), K(cg_schema));
-  } else if (add_column) {//skip init read info and progressive_merge_helper_
-  } else if (cg_schema.is_single_column_group()) {
+  if (cg_schema.is_single_column_group()) {
     single_read_info_.reset();
     if (OB_FAIL(ObTenantCGReadInfoMgr::construct_cg_read_info(allocator_,
-                                                              full_read_info->is_oracle_mode(),
+                                                              full_read_info.is_oracle_mode(),
                                                               write_helper_.get_col_desc_array().at(0),
                                                               nullptr,
                                                               single_read_info_))) {
@@ -507,7 +509,38 @@ int ObCOMergeRowWriter::init(const blocksstable::ObDatumRow &default_row,
       read_info = &single_read_info_;
     }
   } else {
-    read_info = full_read_info;
+    read_info = cg_schema.is_rowkey_column_group() ? merge_param.cg_rowkey_read_info_ : &full_read_info;
+  }
+  return ret;
+}
+
+int ObCOMergeRowWriter::init(ObBasicTabletMergeCtx &ctx,
+                          const blocksstable::ObDatumRow &default_row,
+                          const ObMergeParameter &merge_param,
+                          const int64_t parallel_idx,
+                          const ObITableReadInfo *full_read_info,
+                          const ObStorageColumnGroupSchema &cg_schema,
+                          const int64_t cg_idx,
+                          ObProgressiveMergeMgr &progressive_merge_mgr,
+                          ObTabletMergeInfo &merge_info,
+                          ObITable *table,
+                          const bool add_column)
+{
+  int ret = OB_SUCCESS;
+  bool is_all_nop = false;
+  const ObITableReadInfo *read_info = nullptr;
+  const int64_t cg_column_cnt = cg_schema.column_cnt_;
+
+  if (OB_FAIL(write_helper_.init(ctx, merge_param, parallel_idx, cg_idx, cg_schema, merge_info))) {
+    STORAGE_LOG(WARN, "fail to init write helper", K(ret), K(parallel_idx), K(cg_idx), K(cg_schema));
+  } else if (OB_FAIL(row_.init(cg_column_cnt))) {
+    STORAGE_LOG(WARN, "fail to init row", K(ret), K(cg_schema));
+  } else if (add_column) { //skip init read info and progressive_merge_helper_
+  } else if (OB_FAIL(choose_read_info_for_old_major(merge_param, *full_read_info, cg_schema, read_info))) {
+    LOG_WARN("Fail to choose read info", K(ret), K(cg_schema), K(read_info));
+  } else if (OB_ISNULL(read_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("read info is unexpected null", KR(ret), KP(read_info));
   }
 
   if (OB_SUCC(ret) && !merge_param.is_full_merge() && table != nullptr) {
@@ -516,7 +549,7 @@ int ObCOMergeRowWriter::init(const blocksstable::ObDatumRow &default_row,
     if (OB_ISNULL(progressive_merge_helper_)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       STORAGE_LOG(WARN, "Failed to allocate memory for progressive_merge_helper_", K(ret));
-    } else if (OB_FAIL(progressive_merge_helper_->init(*sstable, merge_param, allocator_))) {
+    } else if (OB_FAIL(progressive_merge_helper_->init(*sstable, merge_param, &progressive_merge_mgr))) {
       STORAGE_LOG(WARN, "failed to init progressive_merge_helper", K(ret), KPC(table));
     }
   }
@@ -525,29 +558,31 @@ int ObCOMergeRowWriter::init(const blocksstable::ObDatumRow &default_row,
   } else if (write_helper_.need_project()) {
     if (write_helper_.project(default_row, row_, is_all_nop)) {
       STORAGE_LOG(WARN, "fail to project", K(ret), K(default_row), K(row_));
-    } else if (OB_FAIL(basic_init(row_, merge_param, read_info, cg_schema.column_cnt_, table, add_column))) {
-      STORAGE_LOG(WARN, "Failed to init default row", K(ret), K(cg_schema.column_cnt_));
+    } else if (OB_FAIL(basic_init(row_ /*default_row*/, merge_param, read_info,
+                                  cg_column_cnt, table, add_column))) {
+      STORAGE_LOG(WARN, "Failed to init default row", K(ret), K(cg_column_cnt));
     }
-  } else if (OB_FAIL(basic_init(default_row, merge_param, read_info, cg_schema.column_cnt_, table, add_column))) {
-    STORAGE_LOG(WARN, "Failed to init default row", K(ret), K(cg_schema.column_cnt_));
+  } else if (OB_FAIL(basic_init(default_row, merge_param, read_info, cg_column_cnt, table, add_column))) {
+    STORAGE_LOG(WARN, "Failed to init default row", K(ret), K(cg_column_cnt));
   }
 
   return ret;
 }
 
-int ObCOMergeRowWriter::process(const ObMacroBlockDesc &macro_desc)
+int ObCOMergeRowWriter::process(
+    const ObMacroBlockDesc &macro_desc,
+    const ObMicroBlockData *micro_block_data)
 {
   int ret = OB_SUCCESS;
   ObMacroBlockOp block_op;
-  if (OB_NOT_NULL(progressive_merge_helper_) && progressive_merge_helper_->is_valid()) {
-    if (OB_FAIL(progressive_merge_helper_->check_macro_block_op(macro_desc, block_op))) {
-      STORAGE_LOG(WARN, "failed to check macro operation", K(ret), K(macro_desc));
-    }
+  if (OB_ISNULL(progressive_merge_helper_) || !progressive_merge_helper_->is_valid()) {
+    // do nothing
+  } else if (OB_FAIL(progressive_merge_helper_->check_macro_block_op(macro_desc, block_op))) {
+    STORAGE_LOG(WARN, "failed to check macro operation", K(ret), K(macro_desc));
   }
 
   if (OB_FAIL(ret)) {
   } else if (block_op.is_rewrite()) {
-    progressive_merge_helper_->inc_rewrite_block_cnt();
     if (OB_FAIL(process_macro_rewrite())) {
       STORAGE_LOG(WARN, "failed to process_macro_rewrite", K(ret));
     }
@@ -557,10 +592,10 @@ int ObCOMergeRowWriter::process(const ObMacroBlockDesc &macro_desc)
     } else if (OB_FAIL(append_iter_curr_row_or_range())) {
       STORAGE_LOG(WARN, "failed to append iter curr row or range", K(ret), KPC(iter_));
     }
-  } else if (OB_FAIL(write_helper_.append_macro_block(macro_desc))) {
+  } else if (OB_FAIL(write_helper_.append_macro_block(macro_desc, micro_block_data))) {
     STORAGE_LOG(WARN, "failed to append macro block", K(ret), K(macro_desc));
   }
-
+  STORAGE_LOG(DEBUG, "process micro data", K(ret), K(macro_desc), K(block_op), K(micro_block_data), KPC(this));
   return ret;
 }
 
@@ -594,17 +629,26 @@ int ObCOMergeRowWriter::replay_mergelog(const ObMergeLog &mergelog, const blocks
     STORAGE_LOG(WARN, "ObCOMergeRowWriter not init", K(ret));
   } else if (!write_helper_.need_project()) {
     if (OB_FAIL(ObCOMergeWriter::replay_mergelog(mergelog, row))) {
-      STORAGE_LOG(WARN, "fariled to replay_mergelog", K(ret), K(mergelog), K(row));
+      STORAGE_LOG(WARN, "failed to replay mergelog", K(ret), K(mergelog), K(row));
     }
   } else if (OB_FAIL(write_helper_.project(row, row_, is_all_nop))) {
     STORAGE_LOG(WARN, "fail to project", K(ret), K(write_helper_), K(row));
   } else if (mergelog.op_ == ObMergeLog::UPDATE && is_all_nop) { //skip replay
   } else if (OB_FAIL(ObCOMergeWriter::replay_mergelog(mergelog, row_))) {
-    STORAGE_LOG(WARN, "fariled to replay_mergelog", K(ret), K(mergelog), K(row));
+    STORAGE_LOG(WARN, "failed to replay mergelog", K(ret), K(mergelog), K(row));
   }
 
   return ret;
 }
+
+int ObCOMergeRowWriter::end_write(const int64_t task_idx, ObTabletMergeInfo &merge_info)
+{
+  if (OB_NOT_NULL(progressive_merge_helper_)) {
+    progressive_merge_helper_->end();
+  }
+  return write_helper_.end_write(merge_info);
+}
+
 
 /**
  * ---------------------------------------------------------ObCOMergeSingleWriter--------------------------------------------------------------
@@ -620,6 +664,7 @@ ObCOMergeSingleWriter::~ObCOMergeSingleWriter()
 }
 
 int ObCOMergeSingleWriter::init(
+    ObBasicTabletMergeCtx &ctx,
     const blocksstable::ObDatumRow &default_row,
     const ObMergeParameter &merge_param,
     const ObITableReadInfo *full_read_info,
@@ -650,7 +695,7 @@ int ObCOMergeSingleWriter::init(
       } else if (OB_ISNULL(merge_infos[idx])) {
         ret = OB_ERR_UNEXPECTED;
         STORAGE_LOG(WARN, "merge info should not be null", K(ret), K(idx));
-      } else if (OB_FAIL(write_helper->init(merge_param, parallel_idx, idx, cg_schema, *merge_infos[idx]))) {
+      } else if (OB_FAIL(write_helper->init(ctx, merge_param, parallel_idx, idx, cg_schema, *merge_infos[idx]))) {
         STORAGE_LOG(WARN, "fail to init write helper", K(ret));
       } else if (OB_FAIL(write_helpers_.push_back(write_helper))) {
         STORAGE_LOG(WARN, "fail to push back", K(ret), K(write_helpers_));
@@ -667,9 +712,13 @@ int ObCOMergeSingleWriter::init(
   }
 
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(basic_init(default_row, merge_param, full_read_info,
-      full_column_cnt + ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt(), row_table, false, true))) {
-    STORAGE_LOG(WARN, "fail to basic init", K(ret), K(merge_param), K(full_column_cnt), KPC(row_table));
+  } else if (OB_FAIL(basic_init(
+                 default_row, merge_param, full_read_info,
+                 full_column_cnt + ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt(),
+                 row_table, false /*add_column*/,
+                 true /*only_use_row_store*/))) {
+    STORAGE_LOG(WARN, "fail to basic init", K(ret), K(merge_param),
+                K(full_column_cnt), KPC(row_table));
   } else {
     FLOG_INFO("succ to init ObCOMergeSingleWriter", K(ret), K(parallel_idx), K(start_cg_idx), K(end_cg_idx), KPC(row_table));
   }
@@ -690,7 +739,7 @@ int ObCOMergeSingleWriter::process(const blocksstable::ObDatumRow &row)
         ret = OB_ERR_UNEXPECTED;
         STORAGE_LOG(WARN, "unexpected null write helper", K(ret), K(write_helper));
       } else if (OB_FAIL(write_helper->append(row))) {
-        STORAGE_LOG(WARN, "failed to project row", K(ret), K(i), K(row), KPC(write_helper));
+        STORAGE_LOG(WARN, "failed to project row", K(ret), K(i), K(row), K(write_helper));
       }
     }
   }
@@ -719,7 +768,7 @@ int ObCOMergeSingleWriter::end_write(
         ret = OB_ERR_UNEXPECTED;
         STORAGE_LOG(WARN, "unexpected null write helper", K(ret), K(write_helper), K(merge_infos[i + start]));
       } else if (OB_FAIL(write_helper->end_write(*merge_infos[i + start]))) {
-        STORAGE_LOG(WARN, "fail to close", K(ret), KPC(write_helper));
+        STORAGE_LOG(WARN, "fail to close", K(ret), K(i), K(write_helper));
       }
     }
   }

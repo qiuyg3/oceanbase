@@ -307,10 +307,12 @@ struct ObPCParamEqualInfo
   ObPCParamEqualInfo():use_abs_cmp_(false) {}
   inline bool operator==(const ObPCParamEqualInfo &other) const
   {
-    bool cmp_ret = first_param_idx_ == other.first_param_idx_ &&
-                   second_param_idx_ == other.second_param_idx_ &&
-                   use_abs_cmp_ == other.use_abs_cmp_;
-
+    bool cmp_ret = (first_param_idx_ == other.first_param_idx_ &&
+                    second_param_idx_ == other.second_param_idx_ &&
+                    use_abs_cmp_ == other.use_abs_cmp_) ||
+                   (second_param_idx_ == other.first_param_idx_ &&
+                    first_param_idx_ == other.second_param_idx_ &&
+                    use_abs_cmp_ == other.use_abs_cmp_);
     return cmp_ret;
   }
 };
@@ -491,10 +493,40 @@ struct ObTableRowCount
   OB_UNIS_VERSION(1);
 };
 
-
+struct AdaptivePCConf
+{
+  AdaptivePCConf() :
+    enable_adaptive_plan_cache_(false), pc_adaptive_min_exec_time_threshold_(0),
+    pc_adaptive_effectiveness_ratio_threshold_(0)
+  {}
+  TO_STRING_KV(K_(enable_adaptive_plan_cache), K_(pc_adaptive_min_exec_time_threshold),
+               K_(pc_adaptive_effectiveness_ratio_threshold));
+  bool enable_adaptive_plan_cache_;
+  int64_t pc_adaptive_min_exec_time_threshold_;
+  int64_t pc_adaptive_effectiveness_ratio_threshold_;
+};
 
 struct ObPlanStat
 {
+  enum PlanStatus
+  {
+    ACTIVE = 0,
+    INACTIVE = 1
+  };
+  struct AdaptivePCInfo
+  {
+    AdaptivePCInfo()
+      : positive_feedback_times_(0),
+        negative_feedback_times_(0),
+        status_(PlanStatus::ACTIVE)
+    {}
+    TO_STRING_KV(K_(positive_feedback_times),
+                 K_(negative_feedback_times),
+                 K_(status));
+    uint32_t positive_feedback_times_; // Continuous positive feedback times
+    uint32_t negative_feedback_times_; // Continuous negative feedback times
+    PlanStatus status_;
+  };
   static const int64_t DEFAULT_ADDR_NODE_NUM = 16;
   typedef common::hash::ObHashMap<ObAddr, int64_t,
         common::hash::LatchReadWriteDefendMode, common::hash::hash_func<ObAddr>,
@@ -509,6 +541,7 @@ struct ObPlanStat
   static const int64_t CACHE_ACCESS_THRESHOLD = 3000;
   static constexpr double ENABLE_BF_CACHE_THRESHOLD = 0.10;
   static constexpr double ENABLE_ROW_CACHE_THRESHOLD = 0.06;
+  static const int64_t ROW_CACHE_GROWTH_SLOPE = common::DEFAULT_MAX_MULTI_GET_CACHE_AWARE_ROW_NUM / ENABLE_ROW_CACHE_THRESHOLD;
 
   char exact_mode_sql_id_[common::OB_MAX_SQL_ID_LENGTH + 1]; // sql id for exact mode
   uint64_t plan_id_;              // plan id
@@ -610,6 +643,7 @@ struct ObPlanStat
   int64_t cache_stat_update_times_; // 表示cache统计信息更新的次数，用于控制更新cache访问策略的频率
   int64_t block_cache_hit_cnt_; // 表示block cache命中次数
   int64_t block_cache_miss_cnt_; // 表示block cache不命中次数
+  int64_t in_row_cache_threshold_; // 表示row cache上限
 
   // following fields will be used for plan set memory management
   PreCalcExprHandler* pre_cal_expr_handler_; //the handler that pre-calculable expression holds
@@ -619,6 +653,9 @@ struct ObPlanStat
   common::ObString outline_data_;
   common::ObString hints_info_;
   bool hints_all_worked_;
+  bool is_inner_;
+  bool is_use_auto_dop_;
+  AdaptivePCInfo adaptive_pc_info_;
 
 
   ObPlanStat()
@@ -673,6 +710,10 @@ struct ObPlanStat
       is_expired_(false),
       enable_plan_expiration_(false),
       first_exec_row_count_(-1),
+      first_exec_usec_(0),
+      sample_times_(0),
+      sample_exec_row_count_(0),
+      sample_exec_usec_(0),
       sessid_(0),
       plan_tmp_tbl_name_str_len_(0),
       is_use_jit_(false),
@@ -689,9 +730,13 @@ struct ObPlanStat
       cache_stat_update_times_(0),
       block_cache_hit_cnt_(0),
       block_cache_miss_cnt_(0),
+      in_row_cache_threshold_(common::DEFAULT_MAX_MULTI_GET_CACHE_AWARE_ROW_NUM),
       pre_cal_expr_handler_(NULL),
       plan_hash_value_(0),
-      hints_all_worked_(true)
+      hints_all_worked_(true),
+      is_inner_(false),
+      is_use_auto_dop_(false),
+      adaptive_pc_info_()
 {
   exact_mode_sql_id_[0] = '\0';
 }
@@ -747,6 +792,10 @@ struct ObPlanStat
       is_expired_(false),
       enable_plan_expiration_(rhs.enable_plan_expiration_),
       first_exec_row_count_(rhs.first_exec_row_count_),
+      first_exec_usec_(rhs.first_exec_usec_),
+      sample_times_(rhs.sample_times_),
+      sample_exec_row_count_(rhs.sample_exec_row_count_),
+      sample_exec_usec_(rhs.sample_exec_usec_),
       sessid_(rhs.sessid_),
       plan_tmp_tbl_name_str_len_(rhs.plan_tmp_tbl_name_str_len_),
       is_use_jit_(rhs.is_use_jit_),
@@ -763,9 +812,13 @@ struct ObPlanStat
       cache_stat_update_times_(rhs.cache_stat_update_times_),
       block_cache_hit_cnt_(rhs.block_cache_hit_cnt_),
       block_cache_miss_cnt_(rhs.block_cache_miss_cnt_),
+      in_row_cache_threshold_(rhs.in_row_cache_threshold_),
       pre_cal_expr_handler_(rhs.pre_cal_expr_handler_),
       plan_hash_value_(rhs.plan_hash_value_),
-      hints_all_worked_(rhs.hints_all_worked_)
+      hints_all_worked_(rhs.hints_all_worked_),
+      is_inner_(rhs.is_inner_),
+      is_use_auto_dop_(rhs.is_use_auto_dop_),
+      adaptive_pc_info_(rhs.adaptive_pc_info_)
   {
     exact_mode_sql_id_[0] = '\0';
     MEMCPY(plan_sel_info_str_, rhs.plan_sel_info_str_, rhs.plan_sel_info_str_len_);
@@ -819,6 +872,7 @@ struct ObPlanStat
       ATOMIC_AAF(&fuse_row_cache_miss_cnt_, stat.fuse_row_cache_miss_cnt_);
       ATOMIC_AAF(&row_cache_hit_cnt_, stat.row_cache_hit_cnt_);
       ATOMIC_AAF(&row_cache_miss_cnt_, stat.row_cache_miss_cnt_);
+      SQL_PC_LOG(DEBUG, "[ROW_CACHE_ADJUST] update cache stat", K(plan_id_), K(update_times), K(fuse_row_cache_hit_cnt_), K(fuse_row_cache_miss_cnt_), K(row_cache_hit_cnt_), K(row_cache_miss_cnt_));
       if (0 == (update_times & CACHE_POLICY_UDPATE_THRESHOLD)) {
         if (bf_access_cnt_ > CACHE_ACCESS_THRESHOLD) {
           if (static_cast<double>(bf_filter_cnt_) / static_cast<double>(bf_access_cnt_)
@@ -835,6 +889,8 @@ struct ObPlanStat
             enable_row_cache_ = false;
           } else {
             enable_row_cache_ = true;
+            // dynamically adjust the upper limit of Row Cache Put based on hit rate
+            in_row_cache_threshold_ = ROW_CACHE_GROWTH_SLOPE * row_cache_hit_cnt_ / row_cache_access_cnt;
           }
         }
         const int64_t fuse_row_cache_access_cnt = fuse_row_cache_hit_cnt_ + fuse_row_cache_miss_cnt_;
@@ -846,9 +902,9 @@ struct ObPlanStat
             enable_fuse_row_cache_ = true;
           }
         }
-        SQL_PC_LOG(DEBUG, "update cache policy", K(sql_id_), K(exact_mode_sql_id_),
+        SQL_PC_LOG(DEBUG, "[ROW_CACHE_ADJUST] update cache policy", K(sql_id_), K(exact_mode_sql_id_),
             K(enable_bf_cache_), K(enable_row_cache_), K(enable_fuse_row_cache_),
-            K(bf_filter_cnt_), K(bf_access_cnt_),
+            K(bf_filter_cnt_), K(bf_access_cnt_), K(in_row_cache_threshold_),
             K(row_cache_hit_cnt_), K(row_cache_access_cnt),
             K(fuse_row_cache_hit_cnt_), K(fuse_row_cache_access_cnt));
         row_cache_hit_cnt_ = 0;
@@ -1025,9 +1081,22 @@ public:
     min_cluster_version_(0),
     is_enable_px_fast_reclaim_(false),
     enable_spf_batch_rescan_(false),
+    enable_distributed_das_scan_(false),
+    enable_das_batch_rescan_flag_(0),
     enable_var_assign_use_das_(false),
     enable_das_keep_order_(false),
+    enable_nlj_spf_use_rich_format_(false),
+    enable_index_merge_(false),
     bloom_filter_ratio_(0),
+    enable_hyperscan_regexp_engine_(false),
+    realistic_runtime_bloom_filter_size_(false),
+    enable_parallel_das_dml_(false),
+    direct_load_allow_fallback_(false),
+    default_load_mode_(0),
+    hash_rollup_policy_(0),
+    ndv_runtime_bloom_filter_size_(false),
+    enable_topn_runtime_filter_(false),
+    min_const_integer_precision_(1),
     cluster_config_version_(-1),
     tenant_config_version_(-1),
     tenant_id_(0)
@@ -1070,9 +1139,22 @@ public:
   uint64_t min_cluster_version_;
   bool is_enable_px_fast_reclaim_;
   bool enable_spf_batch_rescan_;
+  bool enable_distributed_das_scan_;
+  int64_t enable_das_batch_rescan_flag_;
   bool enable_var_assign_use_das_;
   bool enable_das_keep_order_;
+  bool enable_nlj_spf_use_rich_format_;
+  bool enable_index_merge_;
   int bloom_filter_ratio_;
+  bool enable_hyperscan_regexp_engine_;
+  bool realistic_runtime_bloom_filter_size_;
+  bool enable_parallel_das_dml_;
+  bool direct_load_allow_fallback_;
+  int default_load_mode_;
+  int hash_rollup_policy_;
+  bool ndv_runtime_bloom_filter_size_;
+  bool enable_topn_runtime_filter_;
+  int8_t min_const_integer_precision_;
 
 private:
   // current cluster config version_

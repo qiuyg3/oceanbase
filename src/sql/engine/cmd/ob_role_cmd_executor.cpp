@@ -14,10 +14,6 @@
 #include "sql/engine/cmd/ob_role_cmd_executor.h"
 
 #include "lib/encrypt/ob_encrypted_helper.h"
-#include "lib/string/ob_sql_string.h"
-#include "share/schema/ob_schema_struct.h"
-#include "share/ob_rpc_struct.h"
-#include "share/ob_common_rpc_proxy.h"
 #include "sql/resolver/dcl/ob_create_role_stmt.h"
 #include "sql/resolver/dcl/ob_drop_role_stmt.h"
 #include "sql/resolver/dcl/ob_alter_role_stmt.h"
@@ -147,7 +143,7 @@ int ObDropRoleExecutor::execute(ObExecContext &ctx, ObDropRoleStmt &stmt)
       OZ (arg.users_.push_back(stmt.get_user_names().at(i)));
       OZ (arg.hosts_.push_back(stmt.get_host_names().at(i)));
     }
-    OZ (ObDropUserExecutor::drop_user(common_rpc_proxy, arg, false));
+    OZ (ObDropUserExecutor::drop_user(common_rpc_proxy, arg, stmt.get_if_exists()));
   }
 
   return ret;

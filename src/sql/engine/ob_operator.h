@@ -207,6 +207,7 @@ public:
   virtual ~ObDynamicParamSetter() {}
 
   int set_dynamic_param(ObEvalCtx &eval_ctx) const;
+  int set_dynamic_param_vec2(ObEvalCtx &eval_ctx, const sql::ObBitVector &skip_bit) const;
   int set_dynamic_param(ObEvalCtx &eval_ctx, common::ObObjParam *&param) const;
   int update_dynamic_param(ObEvalCtx &eval_ctx, common::ObDatum &datum) const;
 
@@ -301,7 +302,6 @@ private:
   int create_op_input_recursive(ObExecContext &exec_ctx) const;
   // assign spec ptr to ObOpKitStore
   int assign_spec_ptr_recursive(ObExecContext &exec_ctx) const;
-  int link_sql_plan_monitor_node_recursive(ObExecContext &exec_ctx, ObMonitorNode *&pre_node) const;
   int create_exec_feedback_node_recursive(ObExecContext &exec_ctx) const;
   // Data members are accessed in ObOperator class, exposed for convenience.
 public:
@@ -368,6 +368,7 @@ public:
   const static int64_t MONITOR_RUNNING_TIME_THRESHOLD = 5000000; //5s
   const static int64_t REAL_TIME_MONITOR_THRESHOLD = 1000000; //1s
   const static uint64_t REAL_TIME_MONITOR_TRY_TIMES = 256;
+  const static uint64_t SMART_CALL_CLOSE_RETRY_TIMES = 10;
 
 public:
   ObOperator(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOpInput *input);
@@ -485,10 +486,16 @@ public:
   // Drain exchange in data for PX, or producer DFO will be blocked.
   int drain_exch();
   void set_pushdown_param_null(const common::ObIArray<ObDynamicParamSetter> &rescan_params);
+  void set_pushdown_param_null_vec2(const ObIArray<ObDynamicParamSetter> &rescan_params);
   void set_feedback_node_idx(int64_t idx)
   { fb_node_idx_ = idx; }
 
   bool is_operator_end() { return batch_reach_end_ ||  row_reach_end_ ; }
+  TO_STRING_KV(K(spec_));
+
+  virtual int do_diagnosis(ObExecContext &exec_ctx, ObBitVector &skip)
+  { return OB_SUCCESS; };
+
 protected:
   virtual int do_drain_exch();
   int init_skip_vector();
@@ -535,6 +542,25 @@ protected:
       } else {
         SQL_ENG_LOG(WARN, "Failed to get_next_row", K(ret));
       }
+      /*
+        SORT (output: cast_expr, order_by: cast_expr)
+          TSC (output: cast_expr, filter: like(cast_expr, pattern_expr), access virtual table)
+      */
+      // output expr may have non-uniform format, and is shared and outputed in parent operator
+      // if parent is a vectorized operator which doesn't enable rich format
+      // cast_to_uniform is called when parent projecting expr and corresponding `datum.ptr_` becomes dangling pointer
+      // thus here we reset format to VEC_INVALID
+      if (OB_SUCC(ret)) {
+        FOREACH_CNT_X(e, spec_.output_, OB_SUCC(ret)) {
+          ObExpr *expr = *e;
+          // only non-uniform format need to set to vec_invalid
+          // if expr is a literal const expr, we can't set format_ to vec_invalid
+          // otherwise another thread using the same plan may read unexpected format
+          if (expr->enable_rich_format() && !is_uniform_format(expr->get_format(eval_ctx_))) {
+            expr->get_vector_header(eval_ctx_).format_ = VEC_INVALID;
+          }
+        }
+      }
     } else {
       brs_.size_ = 1;
       brs_.end_ = false;
@@ -570,11 +596,18 @@ private:
   int check_stack_once();
   int output_expr_sanity_check();
   int output_expr_sanity_check_batch();
+  int output_expr_sanity_check_batch_inner(const ObExpr &expr);
+  int output_nested_expr_sanity_check_batch(const ObExpr &expr);
   int output_expr_decint_datum_len_check();
   int output_expr_decint_datum_len_check_batch();
   int setup_op_feedback_info();
   // child can implement this interface, but can't call this directly
   virtual int inner_drain_exch() { return common::OB_SUCCESS; };
+
+  bool enable_get_next_row() const;
+  int try_push_stash_rows(const int64_t max_row_cnt);
+  int push_stash_rows(const int64_t max_row_cnt, const int64_t output_row_cnt);
+  int pop_stash_rows(const int64_t max_row_cnt);
 protected:
   const ObOpSpec &spec_;
   ObExecContext &ctx_;
@@ -615,34 +648,40 @@ protected:
   ObBatchRowIter *br_it_ = nullptr;
   ObBatchResultHolder *brs_checker_= nullptr;
 
+  // handling cases where inner_get_next_batch output row cnt more than max_row_cnt.
+  ObBatchRows stash_brs_;
+  int64_t stash_rows_cnt_ = 0;
+  int64_t stash_rows_idx_ = 0;
+
   inline void begin_cpu_time_counting()
   {
-    cpu_begin_time_ = rdtsc();
+    if (cpu_begin_level_ == 0) {
+      cpu_begin_time_ = rdtsc();
+    }
+    ++cpu_begin_level_;
   }
   inline void end_cpu_time_counting()
   {
-    total_time_ += (rdtsc() - cpu_begin_time_);
+    --cpu_begin_level_;
+    if (cpu_begin_level_ == 0) {
+      total_time_ += (rdtsc() - cpu_begin_time_);
+    }
   }
-  inline void begin_ash_line_id_reg()
+  inline void end_ash_line_id_reg(int ret)
   {
-    // begin with current operator
-    ObActiveSessionGuard::get_stat().plan_line_id_ = static_cast<int32_t>(spec_.id_);//TODO(xiaochu.yh): fix uint64 to int32
-  }
-  inline void end_ash_line_id_reg()
-  {
-    // move back to parent operator
-    // known issue: when switch from batch to row in same op,
-    // we shift line id to parent op un-intently. but we tolerate this inaccuracy
-    if (OB_LIKELY(spec_.get_parent())) {
-      common::ObActiveSessionGuard::get_stat().plan_line_id_ = static_cast<int32_t>(spec_.get_parent()->id_);//TODO(xiaochu.yh): fix uint64 to int32
-    } else {
-      common::ObActiveSessionGuard::get_stat().plan_line_id_ = -1;
+    ObDiagnosticInfo *di = common::ObLocalDiagnosticInfo::get();
+    if (OB_NOT_NULL(di)) {
+      if (OB_FAIL(ret) && -1 == di->get_ash_stat().retry_plan_line_id_) {
+        di->get_ash_stat().retry_plan_line_id_ = static_cast<int32_t>(spec_.id_);
+      }
     }
   }
   #ifdef ENABLE_DEBUG_LOG
   inline int init_dummy_mem_context(uint64_t tenant_id);
   #endif
+public:
   uint64_t cpu_begin_time_; // start of counting cpu time
+  uint64_t cpu_begin_level_; // level of counting cpu time
   uint64_t total_time_; //  total time cost on this op, including io & cpu time
 protected:
   bool batch_reach_end_;
@@ -749,6 +788,20 @@ inline int ObOperator::try_check_status_by_rows(const int64_t rows)
   if (try_check_tick_ > CHECK_STATUS_ROWS) {
     try_check_tick_ = 0;
     ret = check_status();
+  }
+  return ret;
+}
+
+inline int ObOperator::try_push_stash_rows(const int64_t max_row_cnt)
+{
+  int ret = common::OB_SUCCESS;
+  if (OB_UNLIKELY(brs_.size_ > max_row_cnt)) {
+    // When the number of unskipped rows in brs_ exceeds max_row_cnt,
+    // stash brs_.skip index to ensure emitted rows to the upper operator comply with the max_row_cnt limit.
+    int64_t output_row_cnt = brs_.size_ - brs_.skip_->accumulate_bit_cnt(brs_.size_);
+    if (output_row_cnt > max_row_cnt && OB_FAIL(push_stash_rows(max_row_cnt, output_row_cnt))) {
+      SQL_ENG_LOG(WARN, "try push stash rows failed", K(ret));
+    }
   }
   return ret;
 }

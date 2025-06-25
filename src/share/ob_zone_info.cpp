@@ -12,12 +12,9 @@
 
 #define USING_LOG_PREFIX SHARE
 #include "share/ob_zone_info.h"
-#include "share/ob_define.h"
-#include "lib/mysqlclient/ob_mysql_transaction.h"
 #include "share/ob_storage_format.h"
 #include "share/ob_zone_table_operation.h"
 #include "share/config/ob_server_config.h"
-#include "common/ob_zone_type.h"
 
 namespace oceanbase
 {
@@ -368,15 +365,15 @@ const char *ObZoneInfo::get_status_str() const
   return ObZoneStatus::get_status_str(static_cast<ObZoneStatus::Status>(status_.value_));
 }
 
+const char *recovery_status_str_array[] = {"NORMAL", "SUSPEND"};
 const char *ObZoneInfo::get_recovery_status_str(const RecoveryStatus status)
 {
   const char *str = nullptr;
-  const char *str_array[] = {"NORMAL", "SUSPEND"};
-  STATIC_ASSERT(RECOVERY_STATUS_MAX == ARRAYSIZEOF(str_array), "status count mismatch");
+  STATIC_ASSERT(RECOVERY_STATUS_MAX == ARRAYSIZEOF(recovery_status_str_array), "status count mismatch");
   if (status < RECOVERY_STATUS_NORMAL || status >= RECOVERY_STATUS_MAX) {
     str = nullptr;
   } else {
-    str = str_array[status];
+    str = recovery_status_str_array[status];
   }
   return str;
 }
@@ -384,25 +381,24 @@ const char *ObZoneInfo::get_recovery_status_str(const RecoveryStatus status)
 ObZoneInfo::RecoveryStatus ObZoneInfo::get_recovery_status(const char* status_str)
 {
   ObZoneInfo::RecoveryStatus status = RECOVERY_STATUS_MAX;
-  const char *str_array[] = {"NORMAL", "SUSPEND"};
-  STATIC_ASSERT(RECOVERY_STATUS_MAX == ARRAYSIZEOF(str_array), "status count mismatch");
-  for (int64_t i = 0; i < ARRAYSIZEOF(str_array); i++) {
-    if (0 == STRCMP(str_array[i], status_str)) {
+  STATIC_ASSERT(RECOVERY_STATUS_MAX == ARRAYSIZEOF(recovery_status_str_array), "status count mismatch");
+  for (int64_t i = 0; i < ARRAYSIZEOF(recovery_status_str_array); i++) {
+    if (0 == STRCMP(recovery_status_str_array[i], status_str)) {
       status = static_cast<RecoveryStatus>(i);
     }
   }
   return status;
 }
 
+const char *storage_type_str_array[] = {"LOCAL", "SHARED_STORAGE"};
 const char *ObZoneInfo::get_storage_type_str(const ObZoneInfo::StorageType storage_type)
 {
   const char *str = nullptr;
-  const char *str_array[] = {"LOCAL"};
-  STATIC_ASSERT(STORAGE_TYPE_MAX == ARRAYSIZEOF(str_array), "storage type count mismatch");
+  STATIC_ASSERT(STORAGE_TYPE_MAX == ARRAYSIZEOF(storage_type_str_array), "storage type count mismatch");
   if (storage_type < STORAGE_TYPE_LOCAL || storage_type >= STORAGE_TYPE_MAX) {
     str = nullptr;
   } else {
-    str = str_array[storage_type];
+    str = storage_type_str_array[storage_type];
   }
   return str;
 }
@@ -410,10 +406,9 @@ const char *ObZoneInfo::get_storage_type_str(const ObZoneInfo::StorageType stora
 ObZoneInfo::StorageType ObZoneInfo::get_storage_type(const char* storage_type_str)
 {
   ObZoneInfo::StorageType storage_type = STORAGE_TYPE_MAX;
-  const char *str_array[] = {"LOCAL"};
-  STATIC_ASSERT(STORAGE_TYPE_MAX == ARRAYSIZEOF(str_array), "storage type count mismatch");
-  for (int64_t i = 0; i < ARRAYSIZEOF(str_array); i++) {
-    if (0 == STRCMP(str_array[i], storage_type_str)) {
+  STATIC_ASSERT(STORAGE_TYPE_MAX == ARRAYSIZEOF(storage_type_str_array), "storage type count mismatch");
+  for (int64_t i = 0; i < ARRAYSIZEOF(storage_type_str_array); i++) {
+    if (0 == STRCMP(storage_type_str_array[i], storage_type_str)) {
       storage_type = static_cast<StorageType>(i);
     }
   }

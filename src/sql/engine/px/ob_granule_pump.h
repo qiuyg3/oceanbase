@@ -22,6 +22,9 @@
 #include "sql/engine/px/ob_px_dtl_msg.h"
 #include "sql/engine/px/ob_granule_util.h"
 #include "sql/engine/ob_engine_op_traits.h"
+#include "sql/engine/connector/ob_jni_scanner.h"
+#include "sql/engine/table/ob_odps_jni_table_row_iter.h"
+
 
 namespace oceanbase
 {
@@ -72,13 +75,16 @@ public :
       tablet_size_(0), gi_attri_flag_(0),
       lucky_one_(true),
       query_range_by_runtime_filter_(),
-      extract_finished_(false) {}
+      extract_finished_(false),
+      gi_op_id_(common::OB_INVALID_ID),
+      pump_version_(0) {}
   virtual ~ObGranulePumpArgs() { reset(); };
 
   TO_STRING_KV(K(partitions_info_),
                K(parallelism_),
                K(tablet_size_),
-               K(gi_attri_flag_))
+               K(gi_attri_flag_),
+               K_(gi_op_id))
 
   bool need_partition_granule();
   bool is_finish_pruning() { return pruning_status_ == FINISH_PRUNING; }
@@ -91,6 +97,7 @@ public :
     run_time_pruning_flags_.reset();
     external_table_files_.reset();
     query_range_by_runtime_filter_.reset();
+    locations_order_.reset();
   }
 
   int assign(const ObGranulePumpArgs &rhs);
@@ -115,6 +122,11 @@ public :
   bool lucky_one_; // atomic, indicatee which thread is luckly to do extract query range
   ObSEArray<ObNewRange, 16> query_range_by_runtime_filter_;
   bool extract_finished_;
+  ObSEArray<std::pair<int64_t, bool>, 18> locations_order_;
+  int64_t gi_op_id_;
+  // %task_version_ is increased when task regenerated.
+  // Used to help detecting taskset change in GI.
+  int64_t pump_version_;
   //-----end
 };
 
@@ -134,6 +146,7 @@ public:
                  int64_t idx) :
         tablet_loc_(tablet_loc), range_(range), ss_range_(ss_range), idx_(idx), hash_value_(0) {}
     TO_STRING_KV(KPC(tablet_loc_),
+                 KP(tablet_loc_),
                  K(range_),
                  K(ss_range_),
                  K(idx_),
@@ -152,15 +165,15 @@ public:
     GI_RANDOM_RANGE,    // a task have only one query range, it can get the best randomness, but it speed more in rescan
   };
 
-  ObGITaskSet() : gi_task_set_(), cur_pos_(0) {}
-  TO_STRING_KV(K(gi_task_set_), K(cur_pos_));
+  ObGITaskSet() : gi_task_set_(), cur_pos_(0), task_count_(0) {}
+  TO_STRING_KV(K(gi_task_set_), K(cur_pos_), K(task_count_));
   int get_task_at_pos(ObGranuleTaskInfo &info, const int64_t &pos) const;
   int get_task_tablet_id_at_pos(const int64_t &pos, uint64_t &tablet_id) const;
 
   int get_next_gi_task_pos(int64_t &pos);
   int get_next_gi_task(ObGranuleTaskInfo &info);
   int assign(const ObGITaskSet &other);
-  int set_pw_affi_partition_order(bool asc);
+  int set_pw_affi_partition_order(bool asc, bool force_reverse);
   int set_block_order(bool asc);
   int construct_taskset(common::ObIArray<ObDASTabletLoc*> &taskset_tablets,
                         common::ObIArray<ObNewRange> &taskset_ranges,
@@ -170,6 +183,7 @@ public:
 public:
   common::ObArray<ObGITaskInfo> gi_task_set_;
   int64_t cur_pos_;
+  int64_t task_count_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObGITaskSet);
 };
@@ -180,12 +194,18 @@ typedef common::ObIArray<ObGITaskSet> GITaskIArray;
 
 struct GITaskArrayItem
 {
+  GITaskArrayItem() :
+    tsc_op_id_(common::OB_INVALID_ID),
+    no_more_task_from_shared_pool_(false)
+  {}
+
   TO_STRING_KV(K(tsc_op_id_), K(taskset_array_));
   // table scan operator id or insert op id
   // TODO: jiangting.lk 先不修改变量名字，后期统一调整
   uint64_t tsc_op_id_;
   // gi task set array
   ObGITaskArray taskset_array_;
+  volatile bool no_more_task_from_shared_pool_;
 };
 
 typedef common::ObArray<GITaskArrayItem> GITaskArrayMap;
@@ -208,7 +228,7 @@ public :
   virtual ~ObGranuleSplitter() = default;
 
   static int get_query_range(ObExecContext &ctx,
-                             const ObQueryRange &tsc_pre_query_range,
+                             const ObQueryRangeProvider &tsc_pre_query_range,
                              ObIArray<ObNewRange> &ranges,
                              ObIArray<ObNewRange> &ss_ranges,
                              int64_t table_id,
@@ -238,6 +258,7 @@ public :
   int split_granule(ObGranulePumpArgs &args,
                     common::ObIArray<const ObTableScanSpec *> &scan_ops,
                     GITaskArrayMap &gi_task_array_result,
+                    bool check_task_exist,
                     ObGITaskSet::ObGIRandomType random_type,
                     bool partition_granule = true);
 private:
@@ -251,6 +272,7 @@ public :
   int split_granule(ObGranulePumpArgs &args,
                     common::ObIArray<const ObTableScanSpec *> &scan_ops,
                     GITaskArrayMap &gi_task_array_result,
+                    bool check_task_exist,
                     ObGITaskSet::ObGIRandomType random_type,
                     bool partition_granule = true);
 private :
@@ -291,6 +313,7 @@ int split_tsc_gi_task(ObGranulePumpArgs &args,
                       common::ObIArray<const ObTableScanSpec *> &scan_ops,
                       const common::ObIArray<DASTabletLocArray> &tablet_arrays,
                       int64_t tsc_begin_idx,
+                      int64_t task_begin_idxm,
                       GITaskArrayMap &gi_task_array_result,
                       bool partition_granule,
                       ObGITaskSet::ObGIRandomType random_type);
@@ -331,7 +354,8 @@ public:
                     GITaskArrayMap &gi_task_array_result,
                     ObGITaskSet::ObGIRandomType random_type,
                     bool partition_granule = true);
-  int adjust_task_order(bool asc, ObGITaskArray &taskset_array);
+  int adjust_task_order(bool asc, ObGITaskArray &taskset_array, int64_t tsc_op_id,
+                        const ObIArray<std::pair<int64_t, bool>> &locations_order);
 };
 
 //A task will be send to many DFO and we use many threads to execute the DFO.
@@ -344,158 +368,20 @@ class ObGranulePump
 private:
   static const int64_t OB_GRANULE_SHARED_POOL_POS = 0;
 
-  //
-  // 《PX的GI详细实现》
-  enum ObGranuleSplitterType
-  {
-    GIT_UNINITIALIZED,
-
-    /**
-     *           [Hash Join]
-     *                |
-     *        ----------------
-     *        |              |
-     *        EX(PKEY)      GI (GIT_AFFINITY)
-     *        |              |
-     *        GI            TSC2
-     *        |
-     *       TSC1
-     */
-    /*
-     * Here is an example of "partition + affinitized" within table B
-     * for each row from C, it can only flow to certain workers dealing
-     * with coresponding partitions of B.
-     *
-     * |   PX COORDINATOR                |          |
-     * |    EXCHANGE OUT DISTR           |:EX20001  |
-     * |      NESTED-LOOP JOIN           |          |
-     * |       EXCHANGE IN DISTR         |          |
-     * |        EXCHANGE OUT DISTR (PKEY)|:EX20000  |
-     * |         PX PARTITION ITERATOR   |          |
-     * |          TABLE SCAN             |C         |
-     * |       PX PARTITION ITERATOR     |          |
-     * |        TABLE SCAN               |B         |
-     */
-    GIT_AFFINITY,
-
-    /**
-     *        [Nested Loop Join]
-     *                |
-     *        ----------------
-     *        |              |
-     *        EX(BC2HOST)    GI (GIT_ACCESS_ALL)
-     *        |              |
-     *        GI            TSC2
-     *        |
-     *       TSC1
-     */
-    /*
-     * Each worker must have full access with table B's data
-     *
-     * |   PX COORDINATOR                     |          |
-     * |    EXCHANGE OUT DISTR                |:EX20001  |
-     * |      NESTED-LOOP JOIN                |          |
-     * |       EXCHANGE IN DISTR              |          |
-     * |        EXCHANGE OUT DISTR (B2HOST)   |:EX20000  |
-     * |         PX PARTITION ITERATOR        |          |
-     * |          TABLE SCAN                  |C         |
-     * |       PX PARTITION ITERATOR          |          |
-     * |        TABLE SCAN                    |B         |
-     */
-    GIT_ACCESS_ALL,
-
-    /**
-     *                GI (GIT_PARTITION_WISE)
-     *                |
-     *            [Hash Join]
-     *                |
-     *        ----------------
-     *        |              |
-     *        TSC1           TSC2
-     */
-    /*
-     * If two tables can do join in full partition wise way, it will
-     * be the most efficient way.
-     *
-     * |      PX PARTITION ITERATOR      |          |
-     * |       HASH JOIN                 |          |
-     * |        TABLE SCAN               |A         |
-     * |        TABLE SCAN               |B         |
-     */
-    GIT_FULL_PARTITION_WISE,
-
-    /* consist of full/partial partition wise affinity
-     *
-     *                      [Hash Join]
-     *                           |
-     *                ---------------------
-     *                |                   |
-     *           [Hash Join]              GI(partial partition wise with affinity)
-     *                |                   |
-     *        ----------------            TSC3
-     *        |              |
-     *        EX(PKEY)      GI(partial partition wise with affinity)
-     *        |              |
-     *        GI            TSC2
-     *        |
-     *       TSC
-     */
-    /*
-     * Here is an example of "pwj_gi + affinitized" within table B and A
-     *
-     * |   PX COORDINATOR                |          |
-     * |    EXCHANGE OUT DISTR           |:EX20001  |
-     * |     NESTED-LOOP JOIN            |          |
-     * |      NESTED-LOOP JOIN           |          |
-     * |       EXCHANGE IN DISTR         |          |
-     * |        EXCHANGE OUT DISTR (PKEY)|:EX20000  |
-     * |         PX PARTITION ITERATOR   |          |
-     * |          TABLE SCAN             |C         |
-     * |       PX PARTITION ITERATOR     |          |
-     * |        TABLE GET                |B         |
-     * |      PX PARTITION ITERATOR      |          |
-     * |       TABLE GET                 |A         |
-
-     *
-     *                      [Hash Join]
-     *                           |
-     *                ---------------------
-     *                |                   |
-     *             EX(PKEY)              GI(full partition wise with affinity)
-     *                |                   |
-     *               TSC             [Hash Join]
-     *                                    |
-     *                             ----------------
-     *                             |              |
-     *                            TSC2           TSC3
-     */
-    GIT_PARTITION_WISE_WITH_AFFINITY,
-    /*
-     * This is the most commonly used GI
-     *
-     * |      PX BLOCK ITERATOR          |          |
-     * |       TABLE SCAN                |A         |
-     * or
-     * |      PX PARTITION ITERATOR      |          |
-     * |       TABLE SCAN                |A         |
-     */
-    GIT_RANDOM,
-  };
 public:
   ObGranulePump() :
   lock_(common::ObLatchIds::SQL_GI_SHARE_POOL_LOCK),
   parallelism_(-1),
   tablet_size_(common::OB_DEFAULT_TABLET_SIZE),
   partition_wise_join_(false),
-  no_more_task_from_shared_pool_(false),
   gi_task_array_map_(),
   splitter_type_(GIT_UNINITIALIZED),
   pump_args_(),
   need_partition_pruning_(false),
   pruning_table_locations_(),
-  pump_version_(0),
   is_taskset_reset_(false),
-  fetch_task_ret_(OB_SUCCESS)
+  fetch_task_ret_(OB_SUCCESS),
+  finished_cnt_(0)
   {
   }
 
@@ -511,7 +397,9 @@ public:
                            const ObTableModifySpec* modify_op,
                            int64_t parallelism,
                            int64_t tablet_size,
-                           uint64_t gi_attri_flag);
+                           uint64_t gi_attri_flag,
+                           const ObIArray<std::pair<int64_t, bool>> &locations_order,
+                           int64_t gi_op_id);
 
    int init_pump_args(ObExecContext *ctx,
                       ObIArray<const ObTableScanSpec*> &scan_ops,
@@ -521,9 +409,11 @@ public:
                       const ObTableModifySpec* modify_op,
                       int64_t parallelism,
                       int64_t tablet_size,
-                      uint64_t gi_attri_flag);
-
-  int add_new_gi_task(ObGranulePumpArgs &args);
+                      uint64_t gi_attri_flag,
+                      const ObIArray<std::pair<int64_t, bool>> &locations_order,
+                      int64_t gi_op_id);
+  ObGranulePumpArgs *get_granule_pump_arg(const int64_t gi_op_id);
+  int add_new_gi_task(ObGranulePumpArgs &args, bool check_task_exist);
 
   void destroy();
 
@@ -532,22 +422,28 @@ public:
   int fetch_granule_task(const ObGITaskSet *&task_set,
                          int64_t &pos,
                          int64_t worker_id,
-                         uint64_t tsc_op_id);
+                         uint64_t tsc_op_id,
+                         uint64_t fetched_task_cnt,
+                         ObGranuleSplitterType splitter_type);
   // 通过phy op ids获得其对应的gi tasks
   int try_fetch_pwj_tasks(ObIArray<ObGranuleTaskInfo> &infos,
                           const ObIArray<int64_t> &op_ids,
-                          int64_t worker_id);
+                          int64_t worker_id,
+                          ObGranuleSplitterType splitter_type);
 
-  int64_t get_pump_version() const { return pump_version_; }
   bool is_taskset_reset() const { return is_taskset_reset_; }
+  void set_fetch_task_ret(int ret) { ATOMIC_STORE(&fetch_task_ret_, ret); }
+  int get_fetch_task_ret() const { return ATOMIC_LOAD(&fetch_task_ret_); }
   DECLARE_TO_STRING;
 public:
 
   int regenerate_gi_task();
+  int regenerate_gi_task(ObGranulePumpArgs &args);
 
   int reset_gi_task();
 
   common::ObIArray<ObGranulePumpArgs> &get_pump_args() { return pump_args_; }
+  void set_parallelism(int64_t parallelism) { parallelism_ = parallelism; }
 
   inline void set_need_partition_pruning(bool flag) { need_partition_pruning_ = flag; };
   inline bool need_partition_pruning() { return need_partition_pruning_; }
@@ -556,7 +452,36 @@ public:
   common::ObIArray<ObTableLocation> *get_pruning_table_location() { return &pruning_table_locations_; }
   int get_first_tsc_range_cnt(int64_t &cnt);
   const GITaskArrayMap &get_task_array_map() const { return gi_task_array_map_; }
+  static int find_task_array_item(GITaskArrayMap &gi_task_map,
+                              common::ObIArray<const ObTableScanSpec *> &scan_ops,
+                              const bool check_task_exist, int64_t &idx);
+
+#ifdef OB_BUILD_CPP_ODPS
+  inline int get_odps_downloader(int64_t part_id, apsara::odps::sdk::IDownloadPtr &downloader) {
+    int ret = OB_SUCCESS;
+    downloader = NULL;
+    ret = odps_partition_downloader_mgr_.get_odps_downloader(part_id, downloader);
+    return ret;
+  }
+  inline ObOdpsPartitionDownloaderMgr::OdpsMgrMap& get_odps_map() {
+    return odps_partition_downloader_mgr_.get_odps_map();
+  }
+  inline bool is_odps_downloader_inited() {  return odps_partition_downloader_mgr_.is_download_mgr_inited(); }
+  ObOdpsPartitionDownloaderMgr &get_odps_mgr() { return odps_partition_downloader_mgr_; }
+#endif
+#ifdef OB_BUILD_JNI_ODPS
+  inline bool is_odps_scanner_mgr_inited() {
+    return odps_partition_jni_scanner_mgr_.is_jni_scanner_mgr_inited();
+  }
+  ObOdpsPartitionJNIScannerMgr &get_odps_jni_scanner_mgr() {
+    return odps_partition_jni_scanner_mgr_;
+  }
+  ObOdpsJniUploaderMgr &get_odps_jni_uploader_mgr() {
+    return odps_jni_uploader_mgr_;
+  }
+#endif
 private:
+  int init_external_odps_table_downloader(ObGranulePumpArgs &args);
   int fetch_granule_by_worker_id(const ObGITaskSet *&task_set,
                                  int64_t &pos,
                                  int64_t thread_id,
@@ -564,17 +489,20 @@ private:
 
   int fetch_granule_from_shared_pool(const ObGITaskSet *&task_set,
                                      int64_t &pos,
-                                     uint64_t tsc_op_id);
+                                     uint64_t tsc_op_id,
+                                     uint64_t fetched_task_cnt);
 
   int fetch_pw_granule_by_worker_id(ObIArray<ObGranuleTaskInfo> &infos,
                                     const ObIArray<int64_t> &op_ids,
-                                    int64_t thread_id);
+                                    int64_t thread_id,
+                                    ObGranuleSplitterType splitter_type);
 
   int fetch_pw_granule_from_shared_pool(ObIArray<ObGranuleTaskInfo> &infos,
-                                        const ObIArray<int64_t> &op_ids);
+                                        const ObIArray<int64_t> &op_ids,
+                                        ObGranuleSplitterType splitter_type);
   int check_pw_end(int64_t end_tsc_count, int64_t op_count, int64_t task_count);
 
-  int find_taskset_by_tsc_id(uint64_t op_id, ObGITaskArray *&taskset_array);
+  int find_taskset_by_tsc_id(uint64_t op_id, GITaskArrayItem *&taskset_array_item);
 
   int init_arg(ObGranulePumpArgs &arg,
                ObExecContext *ctx,
@@ -585,31 +513,36 @@ private:
                const ObTableModifySpec* modify_op,
                int64_t parallelism,
                int64_t tablet_size,
-               uint64_t gi_attri_flag);
+               uint64_t gi_attri_flag,
+               const ObIArray<std::pair<int64_t, bool>> &locations_order,
+               int64_t gi_op_id);
 
   int check_can_randomize(ObGranulePumpArgs &args, bool &can_randomize);
-
 private:
   //TODO::muhang 自旋锁还是阻塞锁，又或者按静态划分任务避免锁竞争？
   common::ObSpinLock lock_;
   int64_t parallelism_;
   int64_t tablet_size_;
   bool partition_wise_join_;
-  volatile bool no_more_task_from_shared_pool_; // try notify worker exit earlier
   GITaskArrayMap gi_task_array_map_;
+#ifdef OB_BUILD_CPP_ODPS
+  ObOdpsPartitionDownloaderMgr odps_partition_downloader_mgr_;
+#endif
+#ifdef OB_BUILD_JNI_ODPS
+  ObOdpsPartitionJNIScannerMgr odps_partition_jni_scanner_mgr_;
+  ObOdpsJniUploaderMgr         odps_jni_uploader_mgr_;
+#endif
   ObGranuleSplitterType splitter_type_;
   common::ObArray<ObGranulePumpArgs> pump_args_;
   bool need_partition_pruning_;
   common::ObArray<ObTableLocation> pruning_table_locations_;
 
-  // %pump_version_ is increased when pump changed (task regenerated).
-  // Used to help detecting taskset change in GI.
-  int64_t pump_version_;
 
   bool is_taskset_reset_;
   // when granule tasks are fetched concurrently, if one thread failed to fetch task,
   // others should not fetch tasks any more.
   int fetch_task_ret_;
+  uint64_t finished_cnt_;
 };
 
 }//sql

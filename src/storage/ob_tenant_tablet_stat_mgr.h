@@ -169,7 +169,7 @@ public:
   ~ObTenantSysStat() = default;
   void reset();
   bool is_small_tenant() const;
-  int refresh(const uint64_t tenant_id);
+  int refresh(const uint64_t tenant_id, const bool force_refresh = false);
   TO_STRING_KV(K_(min_cpu_cnt), K_(max_cpu_cnt), K_(memory_hold), K_(memory_limit));
 
 public:
@@ -366,6 +366,7 @@ public:
   static const int64_t CPU_TIME_SAMPLING_INTERVAL = 20_s; //20 * 1000 * 1000 us
   static constexpr double CPU_TIME_THRESHOLD = 0.8; // 80%
   static const int64_t SHEDDER_EXPIRE_TIME = 2_min;
+  static const int64_t SHEDDER_CPU_CNT_THRESHOLD = 8; // 8c
 private:
   int64_t effect_time_;
   int64_t last_sample_time_;
@@ -427,6 +428,7 @@ public:
   bool is_high_tenant_cpu_load() const { return get_load_shedding_factor() >= ObTenantSysLoadShedder::DEFAULT_LOAD_SHEDDING_FACTOR; }
   int64_t get_load_shedding_factor() const { return load_shedder_.get_load_shedding_factor(); }
   void refresh_sys_stat();
+  bool contain_extreme_tablet() const { return extreme_tablet_cnt_ > 0; }
 private:
   class TabletStatUpdater : public common::ObTimerTask
   {
@@ -474,6 +476,7 @@ private:
   uint64_t report_cursor_;
   uint64_t pending_cursor_;
   int report_tg_id_;
+  int64_t extreme_tablet_cnt_;
   bool is_inited_;
 };
 

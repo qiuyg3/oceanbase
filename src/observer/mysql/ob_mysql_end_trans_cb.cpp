@@ -13,20 +13,6 @@
 #define USING_LOG_PREFIX SERVER
 
 #include "ob_mysql_end_trans_cb.h"
-#include "lib/allocator/ob_malloc.h"
-#include "common/data_buffer.h"
-#include "rpc/ob_request.h"
-#include "rpc/obmysql/packet/ompk_eof.h"
-#include "rpc/obmysql/ob_mysql_request_utils.h"
-#include "rpc/obmysql/packet/ompk_ok.h"
-#include "rpc/obmysql/packet/ompk_error.h"
-#include "observer/mysql/ob_mysql_result_set.h"
-#include "observer/mysql/obmp_base.h"
-#include "observer/mysql/obmp_utils.h"
-#include "rpc/obmysql/obsm_struct.h"
-#include "observer/mysql/ob_mysql_end_trans_cb.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "sql/session/ob_sql_session_mgr.h"
 #include "obmp_stmt_send_piece_data.h"
 using namespace oceanbase::common;
 using namespace oceanbase::obmysql;
@@ -91,7 +77,7 @@ void ObSqlEndTransCb::callback(int cb_param)
       || OB_TRANS_COMMITED == cb_param
       || OB_TRANS_ROLLBACKED == cb_param;
       ObSqlTransControl::reset_session_tx_state(session_info, reuse_tx);
-    sessid = session_info->get_sessid();
+    sessid = session_info->get_server_sid();
     proxy_sessid = session_info->get_proxy_sessid();
     // 临界区内检查这些变量，预防并发callback造成的不良影响
     if (OB_UNLIKELY(!pkt_param_.is_valid())) {
@@ -153,8 +139,10 @@ void ObSqlEndTransCb::callback(int cb_param)
       }
     }
 
-    ObActiveSessionGuard::get_stat().in_sql_execution_ = false;
-    ObActiveSessionGuard::setup_default_ash();
+    GET_DIAGNOSTIC_INFO->get_ash_stat().in_sql_execution_ = false;
+    session_info->reset_cur_sql_id();
+    session_info->reset_current_plan_hash();
+    session_info->reset_current_plan_id();
     session_info->set_session_sleep();
     if (OB_SUCCESS == ret) {
       if (need_disconnect_) {

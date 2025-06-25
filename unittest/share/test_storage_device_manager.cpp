@@ -11,10 +11,7 @@
  */
 
 #include <gtest/gtest.h>
-#include "lib/utility/ob_test_util.h"
-#include "lib/restore/ob_storage.h"
-#include "lib/allocator/page_arena.h"
-#include "share/backup/ob_backup_io_adapter.h"
+#include "share/io/ob_io_manager.h"
 #include "common/storage/ob_fd_simulator.h"
 #define private public
 #include "share/ob_device_manager.h"
@@ -143,6 +140,7 @@ public:
   }
   static void SetUpTestCase()
   {
+    ASSERT_EQ(OB_SUCCESS, ObDeviceManager::get_instance().init_devices_env());
   }
   static void TearDownTestCase()
   {
@@ -153,27 +151,46 @@ private:
   DISALLOW_COPY_AND_ASSIGN(TestDeviceManager);
 };
 
+class ObClusterEnableObdalConfigFalse: public ObClusterEnableObdalConfigBase
+{
+public:
+  ObClusterEnableObdalConfigFalse() {};
+  virtual ~ObClusterEnableObdalConfigFalse() {};
+  virtual bool is_enable_obdal() const { return false; }
+  static ObClusterEnableObdalConfigFalse &get_instance() {
+    static ObClusterEnableObdalConfigFalse instance;
+    return instance;
+  }
+};
+
 TEST_F(TestDeviceManager, test_device_manager)
 {
+  ASSERT_EQ(OB_SUCCESS, ObIOManager::get_instance().init());
   ObDeviceManager &manager = ObDeviceManager::get_instance();
-  int max_dev_num = 20;
+  int max_dev_num = ObDeviceManager::MAX_DEVICE_INSTANCE;
   ObIODevice* device_handle[2*max_dev_num];
-  char storage_info_buf[OB_MAX_URI_LENGTH];
-  ObString storage_info_local(OB_LOCAL_PREFIX);
+  ObString storage_prefix_local(OB_LOCAL_PREFIX);
+  ObString storage_prefix_oss(OB_OSS_PREFIX);
   manager.destroy();
+  ASSERT_EQ(OB_SUCCESS, manager.init_devices_env());
   
   int32_t device_num = 0;
   int32_t device_map_cnt = 0;
   ObIODevice* tmp_dev_handle = NULL;
   MEMSET(device_handle, 0 , sizeof(ObIODevice*)*2*max_dev_num);
+  const ObStorageIdMod storage_id_mode(0, ObStorageUsedMod::STORAGE_USED_DATA);
 
   //all the device is same
   for (int i = 0; i < max_dev_num; i++ ) {
-    ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_info_local, storage_info_local, device_handle[i]));
+    ASSERT_EQ(OB_SUCCESS, ObDeviceManager::get_local_device(storage_prefix_local, storage_id_mode, device_handle[i]));
     if (0 != i) {
       ASSERT_EQ(tmp_dev_handle, device_handle[i]);
     } else {
       tmp_dev_handle = device_handle[i];
+      ASSERT_EQ(OB_SUCCESS, ObIOManager::get_instance().add_device_channel(device_handle[i],
+                                                                           16/*async_channel_count*/,
+                                                                           2/*sync_channel_count*/,
+                                                                           1024/*max_io_depth*/));
     }
   }
   device_num = manager.get_device_cnt();
@@ -185,12 +202,16 @@ TEST_F(TestDeviceManager, test_device_manager)
   device_num = manager.get_device_cnt();
   ASSERT_EQ(1, device_num); //since we do not release automatic
 
-  //MAX_DEVICE_INSTANCE different deivce
+ //MAX_DEVICE_INSTANCE different deivce
   for (int i = 0; i < max_dev_num; i++ ) {
-    ASSERT_EQ(OB_SUCCESS, databuff_printf(storage_info_buf, sizeof(storage_info_buf), 
-                  "%s_%d", OB_LOCAL_PREFIX, i));
-    ObString storage_info(storage_info_buf);
-    ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_info, storage_info, device_handle[i]));
+    ObObjectStorageInfo tmp_storage_info;
+    tmp_storage_info.device_type_ = ObStorageType::OB_STORAGE_OSS;
+    ASSERT_EQ(OB_SUCCESS, databuff_printf(tmp_storage_info.access_id_,
+                                          sizeof(tmp_storage_info.access_id_),
+                                          "%d", i));
+    ObStorageIdMod tmp_storage_id_mod(i, ObStorageUsedMod::STORAGE_USED_DATA);
+    ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, tmp_storage_info,
+                                             tmp_storage_id_mod, device_handle[i]));
     //all the device is not same 
     if (NULL != tmp_dev_handle) {
       ASSERT_TRUE(device_handle[i] != tmp_dev_handle);
@@ -200,13 +221,26 @@ TEST_F(TestDeviceManager, test_device_manager)
   device_num = manager.get_device_cnt();
   ASSERT_EQ(max_dev_num, device_num);
    
-  ObString storage_info_tmp("local://_x");
   //exceed MAX_DEVICE_INSTANCE device, should fail
-  ASSERT_EQ(OB_OUT_OF_ELEMENT, manager.get_device(storage_info_tmp, storage_info_tmp, tmp_dev_handle));
+  ObObjectStorageInfo max_storage_info;
+  max_storage_info.device_type_ = ObStorageType::OB_STORAGE_OSS;
+  ASSERT_EQ(OB_SUCCESS, databuff_printf(max_storage_info.access_id_,
+                                        sizeof(max_storage_info.access_id_),
+                                        "%d", max_dev_num));
+  ObStorageIdMod max_storage_id_mod(max_dev_num, ObStorageUsedMod::STORAGE_USED_DATA);
+  ASSERT_EQ(OB_OUT_OF_ELEMENT, manager.get_device(storage_prefix_oss, max_storage_info,
+                                                  max_storage_id_mod, tmp_dev_handle));
   //release some and get again, should suc(this device ref should be 0)
   ASSERT_EQ(OB_SUCCESS, manager.release_device(device_handle[0]));
   //get this device again
-  ASSERT_EQ(OB_SUCCESS, manager.get_device("local://_0", "local://_0", device_handle[0]));
+  ObObjectStorageInfo min_storage_info;
+  min_storage_info.device_type_ = ObStorageType::OB_STORAGE_OSS;
+  ASSERT_EQ(OB_SUCCESS, databuff_printf(max_storage_info.access_id_,
+                                        sizeof(max_storage_info.access_id_),
+                                        "%d", 0));
+  ObStorageIdMod min_storage_id_mod(0, ObStorageUsedMod::STORAGE_USED_DATA);
+  ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, min_storage_info,
+                                           min_storage_id_mod, device_handle[0]));
   //copy device handle, test double release scenario
   tmp_dev_handle = device_handle[0];
   ASSERT_EQ(OB_SUCCESS, manager.release_device(device_handle[0]));
@@ -214,26 +248,77 @@ TEST_F(TestDeviceManager, test_device_manager)
   ASSERT_EQ(OB_INVALID_ARGUMENT, manager.release_device(tmp_dev_handle));
   //the device handle has been reset, so will be a null pointer error
   ASSERT_EQ(OB_INVALID_ARGUMENT, manager.release_device(device_handle[0]));               
-  ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_info_tmp, storage_info_tmp, device_handle[0]));
+  ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, max_storage_info,
+                                           max_storage_id_mod, device_handle[0]));
   device_num = manager.get_device_cnt();
   ASSERT_EQ(max_dev_num, device_num);
   manager.destroy();
   device_num = manager.get_device_cnt();
   ASSERT_EQ(0, device_num);
+  ASSERT_EQ(OB_SUCCESS, manager.init_devices_env());
 
   //get again
   for (int i = 0; i < max_dev_num; i++ ) {
-    ObString storage_info("local://_x");
+    uint64_t storage_id = 0;
     if ( i >= max_dev_num/2) {
-      ASSERT_EQ(OB_SUCCESS, databuff_printf(storage_info_buf, sizeof(storage_info_buf), 
-                  "%s_%d", OB_LOCAL_PREFIX, i));
-      storage_info.assign_ptr(storage_info_buf, strlen(storage_info_buf));
+      storage_id = i;
     }
     
-    ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_info, storage_info, device_handle[i]));
+    ObObjectStorageInfo tmp_storage_info;
+    tmp_storage_info.device_type_ = ObStorageType::OB_STORAGE_OSS;
+    ASSERT_EQ(OB_SUCCESS, databuff_printf(tmp_storage_info.access_id_,
+                                          sizeof(tmp_storage_info.access_id_),
+                                          "%lu", storage_id));
+    ObStorageIdMod tmp_storage_id_mod(storage_id, ObStorageUsedMod::STORAGE_USED_DATA);
+    ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, tmp_storage_info,
+                                             tmp_storage_id_mod, device_handle[i]));
   }
   device_num = manager.get_device_cnt();
   ASSERT_EQ(max_dev_num/2 + 1, device_num);
+
+
+  manager.destroy();
+  ASSERT_EQ(0, manager.get_device_cnt());
+  ASSERT_EQ(OB_SUCCESS, manager.init_devices_env());
+  // same storage_id_mod, different storage_info, expect different device
+  ObStorageIdMod default_storage_id_mod;
+  for (int i = 0; i < max_dev_num / 2; i++) {
+    ObObjectStorageInfo tmp_storage_info;
+    tmp_storage_info.device_type_ = ObStorageType::OB_STORAGE_OSS;
+    ASSERT_EQ(OB_SUCCESS, databuff_printf(tmp_storage_info.access_id_,
+                                          sizeof(tmp_storage_info.access_id_),
+                                          "%d", i));
+    ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, tmp_storage_info,
+                                             default_storage_id_mod, device_handle[i]));
+    if (0 != i) {
+      ASSERT_NE(tmp_dev_handle, device_handle[i]);
+    } else {
+      tmp_dev_handle = device_handle[i];
+    }
+  }
+
+  // same storage_id_mod, same storage_info, use obdal or not, expect different device
+  manager.destroy();
+  ASSERT_EQ(0, manager.get_device_cnt());
+  ASSERT_EQ(OB_SUCCESS, manager.init_devices_env());
+  {
+    ObStorageIdMod default_storage_id_mod;
+    ObObjectStorageInfo tmp_storage_info;
+    tmp_storage_info.device_type_ = ObStorageType::OB_STORAGE_OSS;
+    ASSERT_EQ(OB_SUCCESS, databuff_printf(tmp_storage_info.access_id_,
+                                          sizeof(tmp_storage_info.access_id_),
+                                          "%d", 0));
+    cluster_enable_obdal_config = &ObClusterEnableObdalConfigFalse::get_instance();
+    ObIODevice *device_handle = nullptr;
+    ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, tmp_storage_info,
+                                             default_storage_id_mod, device_handle));
+    cluster_enable_obdal_config = &ObClusterEnableObdalConfigBase::get_instance();
+    ObIODevice *device_handle2 = nullptr;
+    ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, tmp_storage_info,
+                                             default_storage_id_mod, device_handle2));
+    ASSERT_NE(device_handle, device_handle2);
+    cluster_enable_obdal_config = &ObClusterEnableObdalConfig::get_instance();
+  }
 }
 
 int main(int argc, char **argv)

@@ -116,8 +116,13 @@ public:
 
   inline void set_sub_data_type(const uint64_t sub_data_type) { sub_type_ = sub_data_type; }
   inline uint64_t get_sub_data_type() const { return sub_type_; }
-  inline bool is_udt_hidden_column() const { return is_udt_column() && is_hidden(); }
-  inline bool is_udt_main_column() const { return is_udt_column() && ! is_hidden(); }
+
+  // When fast column deletion occurs, the xml is marked as a hidden column instead of a true many deletion,
+  // and it is not possible to determine whether it is a udt main column based on is_hidden
+  // and currently, only xmltype is a udt type
+  // so it must be the udt main column when it is xmltype, whether it's a hidden column or not
+  // and there is no other udt type, so only need to determine whether it is a main column based on xmltype
+  inline bool is_udt_main_column() const { return is_xmltype(); }
   inline bool is_xmltype() const {
     return is_udt_column()
         && (((meta_type_.is_ext() || meta_type_.is_user_defined_sql_type()) && sub_type_ == T_OBJ_XML)
@@ -264,7 +269,7 @@ public:
 
   common::ObIAllocator &get_allocator() { return allocator_; }
 
-  inline bool is_heap_table() const { return is_heap_table_; }
+  inline bool is_table_with_hidden_pk_column() const { return is_table_with_hidden_pk_column_; }
 
   inline uint64_t get_aux_lob_meta_tid() const { return aux_lob_meta_tid_; }
 
@@ -328,7 +333,7 @@ public:
 
 public:
   TO_STRING_KV(K_(rowkey_info),
-      K_(is_heap_table),
+      K_(is_table_with_hidden_pk_column),
       K_(user_column_idx_array),
       K_(user_column_idx_array_cnt),
       K_(column_schema_array),
@@ -346,7 +351,7 @@ private:
   {
     return OB_INVALID_ID != column_id
         && (OB_APP_MIN_COLUMN_ID <= column_id
-            || (is_heap_table_ && OB_HIDDEN_PK_INCREMENT_COLUMN_ID == column_id));
+            || (is_table_with_hidden_pk_column_ && OB_HIDDEN_PK_INCREMENT_COLUMN_ID == column_id));
   }
   int set_column_schema_info_for_column_id_(
       const uint64_t column_id,
@@ -376,7 +381,7 @@ private:
   bool                 is_inited_;
   common::ObIAllocator &allocator_;
 
-  bool               is_heap_table_;
+  bool               is_table_with_hidden_pk_column_;
   uint64_t           aux_lob_meta_tid_;
   ObLogRowkeyInfo    rowkey_info_;
 

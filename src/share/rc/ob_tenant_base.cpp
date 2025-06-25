@@ -11,13 +11,12 @@
  */
 
 #define USING_LOG_PREFIX SHARE
-#include "lib/thread/thread_mgr.h"
-#include "lib/thread/threads.h"
-#include "share/rc/ob_tenant_base.h"
+#include "ob_tenant_base.h"
 #include "share/resource_manager/ob_cgroup_ctrl.h"
-#include "storage/ob_file_system_router.h"
-#include "share/rc/ob_tenant_module_init_ctx.h"
+#include "src/share/schema/ob_schema_struct.h"
 #include "observer/omt/ob_tenant_mtl_helper.h"
+#include "share/ob_tenant_info_proxy.h"
+#include "lib/resource/ob_affinity_ctrl.h"
 
 namespace oceanbase
 {
@@ -29,6 +28,57 @@ bool mtl_is_mini_mode()
 }
 }
 
+namespace common
+{
+uint64_t mtl_get_id()
+{
+  return MTL_ID();
+}
+}
+
+namespace common
+{
+
+void __attribute__((used)) lib_release_tenant(void *ptr)
+{
+  share::ObTenantSwitchGuard *g = reinterpret_cast<share::ObTenantSwitchGuard *>(ptr);
+  g->share::ObTenantSwitchGuard::~ObTenantSwitchGuard();
+  ob_free(ptr);
+}
+
+int64_t __attribute__((used)) get_mtl_id()
+{
+  return MTL_ID();
+}
+
+ObDiagnosticInfoContainer *__attribute__((used)) get_di_container()
+{
+  return MTL(ObDiagnosticInfoContainer *);
+}
+
+void __attribute__((used)) lib_mtl_switch(int64_t tenant_id, std::function<void(int)> fn)
+{
+  int ret = OB_SUCCESS;
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(guard);
+  if (tenant_id != MTL_ID()) {
+    if (OB_FAIL(guard.switch_to(tenant_id))) {
+      LOG_WARN("failed to switch to tenant", K(ret), K(tenant_id));
+    }
+  }
+  fn(ret);
+}
+
+int64_t __attribute__((used)) lib_mtl_cpu_count()
+{
+  return share::ObTenantEnv::get_tenant()->unit_max_cpu();
+}
+
+bool __attribute__((used)) lib_enable_diagnostic_info_cache()
+{
+  return GCONF._enable_diagnostic_info_cache;
+}
+
+}
 namespace share
 {
 using namespace oceanbase::common;
@@ -44,9 +94,10 @@ using namespace oceanbase::common;
 LST_DO2(INIT_BIND_FUNC, (), MTL_MEMBERS);
 
 #define CONSTRUCT_MEMBER(T, IDX) m##IDX##_()
-ObTenantBase::ObTenantBase(const uint64_t id, bool enable_tenant_ctx_check)
+ObTenantBase::ObTenantBase(const uint64_t id, const int64_t epoch, bool enable_tenant_ctx_check)
     : LST_DO2(CONSTRUCT_MEMBER, (,), MTL_MEMBERS),
     id_(id),
+    epoch_(epoch),
     inited_(false),
     created_(false),
     mtl_init_ctx_(nullptr),
@@ -54,10 +105,12 @@ ObTenantBase::ObTenantBase(const uint64_t id, bool enable_tenant_ctx_check)
     unit_max_cpu_(0),
     unit_min_cpu_(0),
     unit_memory_size_(0),
+    switchover_epoch_(ObAllTenantInfo::INITIAL_SWITCHOVER_EPOCH),
     cgroups_(nullptr),
     enable_tenant_ctx_check_(enable_tenant_ctx_check),
     thread_count_(0),
-    mini_mode_(false)
+    mini_mode_(false),
+    marked_prepare_gc_ts_(0)
 {
 }
 #undef CONSTRUCT_MEMBER
@@ -68,8 +121,10 @@ ObTenantBase &ObTenantBase::operator=(const ObTenantBase &ctx)
     return *this;
   }
   id_ = ctx.id_;
+  epoch_ = ctx.epoch_;
   mtl_init_ctx_ = ctx.mtl_init_ctx_;
   tenant_role_value_ = ctx.tenant_role_value_;
+  switchover_epoch_ = ctx.switchover_epoch_;
 #define CONSTRUCT_MEMBER_TMP2(IDX) \
   m##IDX##_ = ctx.m##IDX##_;
 #define CONSTRUCT_MEMBER2(UNUSED, IDX) CONSTRUCT_MEMBER_TMP2(IDX)
@@ -120,7 +175,7 @@ int ObTenantBase::init(ObCgroupCtrl *cgroup)
 int ObTenantBase::create_mtl_module()
 {
   int ret = OB_SUCCESS;
-
+  lib::ObDisableDiagnoseGuard disable_guard;
   if (created_) {
     ret = OB_INIT_TWICE;
     LOG_WARN("create twice error", K(ret));
@@ -298,10 +353,6 @@ int ObTenantBase::pre_run()
 {
   int ret = OB_SUCCESS;
   ObTenantEnv::set_tenant(this);
-  ObCgroupCtrl *cgroup_ctrl = get_cgroup();
-  if (cgroup_ctrl != nullptr && cgroup_ctrl->is_valid()) {
-    ret = cgroup_ctrl->add_self_to_cgroup(id_);
-  }
   {
     ThreadListNode *node = lib::Thread::current().get_thread_list_node();
     lib::ObMutexGuard guard(thread_list_lock_);
@@ -311,7 +362,17 @@ int ObTenantBase::pre_run()
     }
   }
   ATOMIC_INC(&thread_count_);
-  LOG_INFO("tenant thread pre_run", K(MTL_ID()), K(ret), K(thread_count_));
+  if (GCONF._enable_numa_aware && OB_NUMA_SHARED_INDEX == AFFINITY_CTRL.get_tls_node()) {
+    AFFINITY_CTRL.thread_bind_to_node(thread_count_);
+  }
+  // register in tenant cgroup without modifying group_id
+  ObCgroupCtrl *cgroup_ctrl = get_cgroup();
+  if (OB_NOT_NULL(cgroup_ctrl) && cgroup_ctrl->is_valid()) {
+    // add thread to tenant OBCG_DEFAULT cgroup
+    ret = cgroup_ctrl->add_self_to_cgroup_(id_);
+  }
+
+  LOG_INFO("tenant thread pre_run", K(ret), K(thread_count_), K(id_), K(GET_GROUP_ID()));
   return ret;
 }
 
@@ -319,17 +380,13 @@ int ObTenantBase::end_run()
 {
   int ret = OB_SUCCESS;
   ObTenantEnv::set_tenant(nullptr);
-  ObCgroupCtrl *cgroup_ctrl = get_cgroup();
-  if (cgroup_ctrl != nullptr && cgroup_ctrl->is_valid()) {
-    ret = cgroup_ctrl->remove_self_from_cgroup(id_);
-  }
   {
     ThreadListNode *node = lib::Thread::current().get_thread_list_node();
     lib::ObMutexGuard guard(thread_list_lock_);
     thread_list_.remove(node);
   }
   ATOMIC_DEC(&thread_count_);
-  LOG_INFO("tenant thread end_run", K(id_), K(ret), K(thread_count_));
+  LOG_INFO("tenant thread end_run", K(ret), K(thread_count_), K(id_), K(GET_GROUP_ID()));
   return ret;
 }
 
@@ -449,7 +506,7 @@ void ObTenantEnv::set_tenant(ObTenantBase *ctx)
   }
   get_tenant() = ctx;
   if (ctx == nullptr) {
-    ObTenantBase ctx_tmp(OB_INVALID_TENANT_ID);
+    ObTenantBase ctx_tmp(OB_INVALID_TENANT_ID, 0/*epoch*/);
     *get_tenant_local() = ctx_tmp;
     ob_get_tenant_id() = 0;
   } else {

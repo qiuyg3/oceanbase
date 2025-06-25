@@ -32,24 +32,34 @@ struct DistinctObjMeta
   ObObjType obj_type_;
   ObCollationType coll_type_;
   ObCollationLevel coll_level_;
+  ObScale scale_;
 
-  DistinctObjMeta(ObObjType obj_type, ObCollationType coll_type, ObCollationLevel coll_level)
-    : obj_type_(obj_type), coll_type_(coll_type), coll_level_(coll_level)
+  DistinctObjMeta(ObObjType obj_type, ObCollationType coll_type,
+                  ObCollationLevel coll_level, ObScale scale)
+    : obj_type_(obj_type), coll_type_(coll_type),
+      coll_level_(coll_level), scale_(scale)
   {
-    if (!ObDatumFuncs::is_string_type(obj_type_)) {
+    if (!ObDatumFuncs::is_string_type(obj_type_) && !ob_is_enum_or_set_type(obj_type_)) {
       coll_type_ = CS_TYPE_MAX;
       coll_level_ = CS_LEVEL_INVALID;
     }
   }
   DistinctObjMeta()
-    : obj_type_(common::ObMaxType), coll_type_(common::CS_TYPE_MAX) , coll_level_(CS_LEVEL_INVALID){}
+    : obj_type_(common::ObMaxType), coll_type_(common::CS_TYPE_MAX) ,
+      coll_level_(CS_LEVEL_INVALID), scale_(-1) {}
 
   bool operator==(const DistinctObjMeta &other) const
   {
     bool cs_level_equal = lib::is_oracle_mode() ? true : (coll_level_ == other.coll_level_);
-    return obj_type_ == other.obj_type_ && coll_type_ == other.coll_type_ && cs_level_equal;
+    bool res = obj_type_ == other.obj_type_ && coll_type_ == other.coll_type_ && cs_level_equal;
+    if (res && ob_is_double_type(obj_type_)) {
+      bool is_fixed_double_1 = SCALE_UNKNOWN_YET < scale_ && OB_MAX_DOUBLE_FLOAT_SCALE >= scale_;
+      bool is_fixed_double_2 = SCALE_UNKNOWN_YET < other.scale_ && OB_MAX_DOUBLE_FLOAT_SCALE >= other.scale_;
+      res = is_fixed_double_1 == is_fixed_double_2;
+    }
+    return res;
   }
-  TO_STRING_KV(K_(obj_type), K_(coll_type), K_(coll_level));
+  TO_STRING_KV(K_(obj_type), K_(coll_type), K_(coll_level), K_(scale));
 };
 
 class ObTransformPreProcess: public ObTransformRule
@@ -396,6 +406,7 @@ private:
                                                  bool &trans_happened);
 
   static int create_partial_expr(ObRawExprFactory &expr_factory,
+                                 const ObSQLSessionInfo &session,
                                  ObRawExpr *left_expr,
                                  ObIArray<ObRawExpr*> &same_type_exprs,
                                  const bool is_in_expr,
@@ -416,7 +427,7 @@ private:
                                              const ObSQLSessionInfo &session,
                                              ObRawExpr *arg_expr,
                                              ObRawExpr *when_expr,
-                                             const ObExprResType &case_res_type,
+                                             const ObCollationType cmp_cs_type,
                                              ObOpRawExpr *&equal_expr);
   static int add_row_type_to_array_no_dup(common::ObIArray<ObSEArray<DistinctObjMeta, 4>> &row_type_array,
                                           const ObSEArray<DistinctObjMeta, 4> &row_type);
@@ -441,16 +452,20 @@ private:
                                              bool &trans_happened);
   static ObItemType reverse_cmp_type_of_align_date4cmp(const ObItemType &cmp_type);
   static int replace_cast_expr_align_date4cmp(ObRawExprFactory &expr_factory,
+                                              const ObSQLSessionInfo &session,
                                               const ObItemType &cmp_type,
                                               ObRawExpr *&expr);
   static int replace_op_row_expr_align_date4cmp(ObRawExprFactory &expr_factory,
+                                                const ObSQLSessionInfo &session,
                                                 const ObItemType &cmp_type,
                                                 ObRawExpr *&left_row_expr,
                                                 ObRawExpr *&right_row_expr);
   static int check_and_transform_align_date4cmp(ObRawExprFactory &expr_factory,
+                                                const ObSQLSessionInfo &session,
                                                 ObRawExpr *&in_expr,
                                                 const ObItemType &cmp_type);
   static int replace_align_date4cmp_recursively(ObRawExprFactory &expr_factory,
+                                                const ObSQLSessionInfo &session,
                                                 ObRawExpr *&root_expr);
   static int replace_inner_row_cmp_val_recursively(ObRawExprFactory &expr_factory,
                                                    const ObSQLSessionInfo &session,
@@ -523,9 +538,14 @@ private:
   int create_inner_view_stmt(ObDMLStmt *batch_stmt, ObSelectStmt*& inner_view_stmt);
 
   int transform_for_ins_batch_stmt(ObDMLStmt *batch_stmt, bool &trans_happened);
+
+  int transform_for_insertup_batch_stmt(ObDMLStmt *batch_stmt, bool &trans_happened);
+
   int transform_for_batch_stmt(ObDMLStmt *batch_stmt, bool &trans_happened);
 
   int check_insert_can_batch(ObInsertStmt *insert_stmt, bool &can_batch);
+
+  bool check_insertup_support_batch_opt(ObInsertStmt *insert_stmt, bool &can_batch);
 
   int formalize_batch_stmt(ObDMLStmt *batch_stmt,
                           ObSelectStmt* inner_view_stmt,
@@ -556,10 +576,10 @@ private:
 
   int remove_shared_expr(ObDMLStmt *stmt,
                          JoinedTable *joined_table,
-                         hash::ObHashSet<uint64_t> &expr_set,
+                         hash::ObHashSet<uint64_t, hash::NoPthreadDefendMode> &expr_set,
                          bool is_nullside);
 
-  int do_remove_shared_expr(hash::ObHashSet<uint64_t> &expr_set,
+  int do_remove_shared_expr(hash::ObHashSet<uint64_t, hash::NoPthreadDefendMode> &expr_set,
                             ObIArray<ObRawExpr *> &padnull_exprs,
                             bool is_nullside,
                             ObRawExpr *&expr,
@@ -668,7 +688,11 @@ private:
   int get_rowkey_for_single_table(ObSelectStmt* stmt,
                                   ObIArray<ObRawExpr*> &unique_keys,
                                   bool &is_valid);
-  int disable_complex_dml_for_fulltext_index(ObDMLStmt *stmt);
+
+  int preserve_order_for_gby(ObDMLStmt *stmt,
+                             bool &trans_happened);
+  int add_order_by_gby_for_stmt(ObSelectStmt* stmt, bool &trans_happened);
+
   int try_gen_straight_join_leading(ObDMLStmt *stmt, bool &trans_happened);
   int get_flattened_tables_of_pure_straight_join(ObDMLStmt* stmt,
                                                  ObIArray<TableItem*> &flattened_tables);
@@ -682,6 +706,7 @@ private:
                               ObIArray<TableItem*> &flattened_tables,
                               ObLeadingTable &leading_table);
   int construct_leaf_leading_table(ObDMLStmt *stmt, TableItem *table, ObLeadingTable *&leading_table);
+  int reset_view_base_and_transpose_item(ObDMLStmt *stmt);
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTransformPreProcess);

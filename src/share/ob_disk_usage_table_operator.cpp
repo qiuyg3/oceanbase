@@ -10,13 +10,11 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "share/ob_disk_usage_table_operator.h"
-#include "lib/number/ob_number_v2.h"
+#include "ob_disk_usage_table_operator.h"
 #include "lib/mysqlclient/ob_mysql_proxy.h"
 #include "share/ob_dml_sql_splicer.h"
 #include "share/inner_table/ob_inner_table_schema.h"
-#include "storage/ob_disk_usage_reporter.h"
-#include "lib/container/ob_iarray.h"
+#include "src/observer/report/ob_i_disk_report.h"
 
 namespace oceanbase
 {
@@ -98,6 +96,9 @@ int ObDiskUsageTableOperator::update_tenant_space_usage(const uint64_t tenant_id
       case ObDiskReportFileType::TENANT_MAJOR_LOCAL_DATA:
         file_type_str = "tenant local data";
         break;
+      case ObDiskReportFileType::TENANT_BACKUP_DATA:
+        file_type_str = "tenant backup data";
+        break;
       default:
         ret = OB_ERR_UNEXPECTED;
         SHARE_LOG(WARN, "unexpected", K(ret), K(file_type));
@@ -120,7 +121,7 @@ int ObDiskUsageTableOperator::update_tenant_space_usage(const uint64_t tenant_id
       SHARE_LOG(WARN, "affected rows unexpected", K(ret), K(affected_rows), K(tenant_id),
                                                   K(file_type), K(data_size));
     } else {
-      SHARE_LOG(INFO, "insert successful ", K(ret), K(tenant_id), K(file_type), K(data_size));
+      SHARE_LOG(INFO, "insert successful ", K(ret), K(tenant_id), K(file_type), K(data_size), K(used_size));
     }
   }
   return ret;
@@ -170,6 +171,9 @@ int ObDiskUsageTableOperator::delete_tenant_space_usage(const uint64_t tenant_id
         break;
       case ObDiskReportFileType::TENANT_MAJOR_LOCAL_DATA:
         file_type_str = "tenant local data";
+        break;
+      case ObDiskReportFileType::TENANT_BACKUP_DATA:
+        file_type_str = "tenant backup data";
         break;
       default:
         ret = OB_ERR_UNEXPECTED;

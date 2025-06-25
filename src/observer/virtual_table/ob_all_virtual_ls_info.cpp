@@ -51,7 +51,9 @@ int ObAllVirtualLSInfo::inner_get_next_row(ObNewRow *&row)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(execute(row))) {
-    SERVER_LOG(WARN, "execute fail", K(ret));
+    if (OB_ITER_END != ret) {
+      SERVER_LOG(WARN, "execute fail", KR(ret));
+    }
   }
   return ret;
 }
@@ -130,15 +132,8 @@ int ObAllVirtualLSInfo::process_curr_tenant(ObNewRow *&row)
           break;
         case OB_APP_MIN_COLUMN_ID + 4: {
           // replica_type
-          if (OB_FAIL(replica_type_to_string(ls_info.replica_type_,
-                                             replica_type_name_,
-                                             sizeof(replica_type_name_)))) {
-            SERVER_LOG(WARN, "get replica type name failed", K(ret), K(ls_info.replica_type_));
-          } else {
-            replica_type_name_[MAX_REPLICA_TYPE_LENGTH - 1] = '\0';
-            cur_row_.cells_[i].set_varchar(replica_type_name_);
-            cur_row_.cells_[i].set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset()));
-          }
+          cur_row_.cells_[i].set_varchar(ObShareUtil::replica_type_to_string(ls_info.replica_type_));
+          cur_row_.cells_[i].set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset()));
           break;
         }
         case OB_APP_MIN_COLUMN_ID + 5: {
@@ -196,6 +191,22 @@ int ObAllVirtualLSInfo::process_curr_tenant(ObNewRow *&row)
         case OB_APP_MIN_COLUMN_ID + 15:
           // tx blocked
           cur_row_.cells_[i].set_int(ls_info.tx_blocked_);
+          break;
+        case  OB_APP_MIN_COLUMN_ID + 16:
+          // required_data_disk_size
+          cur_row_.cells_[i].set_int(ls_info.required_data_disk_size_);
+          break;
+        case OB_APP_MIN_COLUMN_ID + 17:
+          // mv_major_merge_scn
+          cur_row_.cells_[i].set_uint64(!ls_info.mv_major_merge_scn_.is_valid() ? 0 : ls_info.mv_major_merge_scn_.get_val_for_inner_table_field());
+          break;
+        case OB_APP_MIN_COLUMN_ID + 18:
+          // mv_publish_scn
+          cur_row_.cells_[i].set_uint64(!ls_info.mv_publish_scn_.is_valid() ? 0 : ls_info.mv_publish_scn_.get_val_for_inner_table_field());
+          break;
+        case OB_APP_MIN_COLUMN_ID + 19:
+          // mv_publish_scn
+          cur_row_.cells_[i].set_uint64(!ls_info.mv_safe_scn_.is_valid() ? 0 : ls_info.mv_safe_scn_.get_val_for_inner_table_field());
           break;
         default:
           ret = OB_ERR_UNEXPECTED;

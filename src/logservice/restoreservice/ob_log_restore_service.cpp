@@ -11,17 +11,10 @@
  */
 
 #define USING_LOG_PREFIX CLOG
-#include "share/restore/ob_log_restore_source.h"    //TODO delete
 
 #include "ob_log_restore_service.h"
-#include "lib/ob_errno.h"
-#include "lib/ob_define.h"                    // is_user_tenant
-#include "lib/utility/ob_macro_utils.h"       // K*
-#include "share/ob_ls_id.h"                   // ObLSID
-#include "storage/tx_storage/ob_ls_service.h" // ObLSService
 #include "logservice/ob_log_service.h"        // ObLogService
-#include "ob_log_restore_handler.h"           // ObTenantRole
-#include "observer/ob_server_struct.h"        // GCTX
+#include "lib/ash/ob_active_session_guard.h"
 
 namespace oceanbase
 {
@@ -155,6 +148,7 @@ void ObLogRestoreService::signal()
 void ObLogRestoreService::run1()
 {
   LOG_INFO("ObLogRestoreService thread run", "tenant_id", MTL_ID());
+  ObDIActionGuard ag("LogService", "LogRestoreService", "loop task");
   lib::set_thread_name("LogRessvr");
   ObCurTraceId::init(GCONF.self_addr_);
 
@@ -169,6 +163,7 @@ void ObLogRestoreService::run1()
       int64_t end_tstamp = ObTimeUtility::fast_current_time();
       int64_t wait_interval = thread_interval - (end_tstamp - begin_stamp);
       if (wait_interval > 0) {
+        common::ObBKGDSessInActiveGuard inactive_guard;
         cond_.timedwait(wait_interval);
       }
     }
@@ -186,6 +181,8 @@ void ObLogRestoreService::do_thread_task_()
     if (OB_FAIL(update_upstream_(source, source_exist))) {
       LOG_WARN("update_upstream_ failed");
     } else if (source_exist) {
+      ObDIActionGuard(ObDIActionGuard::NS_ACTION, "SourceType[%s]", ObLogRestoreSourceItem::get_source_type_str(source.type_));
+
       // log restore source exist, do schedule
       // source_exist means tenant_role is standby or restore and log_restore_source exists
       schedule_fetch_log_(source);
@@ -194,7 +191,10 @@ void ObLogRestoreService::do_thread_task_()
       clean_resource_();
     }
 
-    schedule_resource_(source.type_);
+    {
+      ObDIActionGuard(ObDIActionGuard::NS_ACTION, "SourceType[%s]", ObLogRestoreSourceItem::get_source_type_str(source.type_));
+      schedule_resource_(source.type_);
+    }
     report_error_();
     update_restore_upper_limit_();
     refresh_error_context_();

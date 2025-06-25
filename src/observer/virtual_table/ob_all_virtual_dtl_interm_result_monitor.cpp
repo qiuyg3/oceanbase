@@ -10,13 +10,8 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "observer/omt/ob_tenant.h"
-#include "observer/omt/ob_multi_tenant.h"
 #include "observer/virtual_table/ob_all_virtual_dtl_interm_result_monitor.h"
 #include "observer/ob_server_utils.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "lib/hash/ob_hashmap.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/dtl/ob_dtl_interm_result_manager.h"
 
 namespace oceanbase
@@ -63,8 +58,8 @@ int ObDTLIntermResultMonitorInfoGetter::operator() (common::hash::HashMapPair<Ob
     const char *owner = NULL;
     ObObj *cells = cur_row_.cells_;
     if (info.is_store_valid()) {
-      if (info.use_rich_format_) {
-        GET_CHUNK_STORE_INFO(info.col_store_);
+      if (info.is_rich_format()) {
+        GET_CHUNK_STORE_INFO(info.block_store_);
       } else {
         GET_CHUNK_STORE_INFO(info.datum_store_);
       }

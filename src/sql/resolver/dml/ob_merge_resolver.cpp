@@ -12,18 +12,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_merge_resolver.h"
-#include "share/ob_define.h"
-#include "share/schema/ob_schema_struct.h"
-#include "share/schema/ob_column_schema.h"
-#include "share/ob_autoincrement_param.h"
-#include "common/sql_mode/ob_sql_mode_utils.h"
-#include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
-#include "sql/resolver/expr/ob_raw_expr_info_extractor.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "sql/resolver/ob_resolver_utils.h"
-#include "sql/resolver/dml/ob_insert_stmt.h"
-#include "sql/resolver/dml/ob_default_value_utils.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 namespace oceanbase
 {
@@ -380,6 +369,14 @@ int ObMergeResolver::resolve_table(const ParseNode &parse_tree, TableItem *&tabl
           LOG_WARN("invalid argument", K(ret));
         }
         OZ (resolve_json_table_item(*table_node, table_item));
+        break;
+      }
+      case T_RB_ITERATE_EXPRESSION: {
+        OZ (resolve_rb_iterate_item(*table_node, table_item));
+        break;
+      }
+      case T_UNNEST_EXPRESSION: {
+        OZ (resolve_unnest_item(*table_node, table_item));
         break;
       }
       default: {
@@ -766,8 +763,9 @@ int ObMergeResolver::add_assignment(ObIArray<ObTableAssignment> &assigns,
         // skip
       } else if (other.column_expr_ == assign.column_expr_) {
         ret = OB_ERR_FIELD_SPECIFIED_TWICE;
+        ObCStringHelper helper;
         LOG_USER_ERROR(OB_ERR_FIELD_SPECIFIED_TWICE,
-                       to_cstring(assign.column_expr_->get_column_name()));
+                       helper.convert(assign.column_expr_->get_column_name()));
       }
     }
   }

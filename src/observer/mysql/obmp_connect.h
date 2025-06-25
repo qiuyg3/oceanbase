@@ -15,6 +15,7 @@
 
 #include "rpc/obmysql/packet/ompk_handshake_response.h"
 #include "observer/mysql/obmp_base.h"
+#include "rpc/obmysql/ob_i_cs_mem_pool.h"
 
 namespace oceanbase
 {
@@ -30,6 +31,24 @@ struct ObSMConnection;
 ObString extract_user_name(const ObString &in);
 int extract_user_tenant(const ObString &in, ObString &user_name, ObString &tenant_name);
 int extract_tenant_id(const ObString &tenant_name, uint64_t &tenant_id);
+
+class AuthSwitchResonseMemPool : public obmysql::ObICSMemPool
+{
+public:
+  explicit AuthSwitchResonseMemPool(ObIAllocator *allocator)
+      : allocator_(allocator)
+  {}
+
+  virtual ~AuthSwitchResonseMemPool() {}
+
+  void *alloc(int64_t size) override
+  {
+    return allocator_->alloc(size);
+  }
+private:
+  ObIAllocator *allocator_;
+};
+
 class ObMPConnect
     : public ObMPBase
 {
@@ -65,6 +84,7 @@ private:
   int check_client_property(ObSMConnection &conn);
   int check_common_property(ObSMConnection &conn, obmysql::ObMySQLCapabilityFlags &client_cap);
   int check_update_proxy_capability(ObSMConnection &conn) const;
+  int check_update_client_capability(uint64_t &cap) const;
   int check_user_cluster(const ObString &server_cluster, const int64_t server_cluster_id) const;
   int init_process_single_stmt(const sql::ObMultiStmtItem &multi_stmt_item,
                                sql::ObSQLSessionInfo &session,
@@ -123,10 +143,18 @@ private:
 #ifdef OB_BUILD_AUDIT_SECURITY
   int check_audit_user(const uint64_t tenant_id, ObString &user_name);
 #endif
-
+  int load_audit_log_filter(const uint64_t tenant_id,
+                            ObString &user_name,
+                            ObString &client_ip,
+                            sql::ObSQLSessionInfo &session);
   int set_proxy_version(ObSMConnection &conn);
   int set_client_version(ObSMConnection &conn);
+  int extract_service_name(ObSMConnection &conn, ObString &service_name, bool &failover_mode);
+  int set_service_name(const uint64_t tenant_id, sql::ObSQLSessionInfo &session,
+      const ObString &service_name, const bool failover_mode);
   int get_proxy_user_name(ObString &real_user);
+  int execute_trigger(const uint64_t tenant_id,
+                      sql::ObSQLSessionInfo &session);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMPConnect);
   obmysql::OMPKHandshakeResponse hsr_;
@@ -140,6 +168,8 @@ private:
   char proxied_user_name_var_[OB_MAX_USER_NAME_BUF_LENGTH];
   char db_name_var_[OB_MAX_DATABASE_NAME_BUF_LENGTH];
   int deser_ret_;
+  ObArenaAllocator allocator_;
+  AuthSwitchResonseMemPool asr_mem_pool_;
   int32_t client_port_;
 }; // end of class ObMPConnect
 

@@ -12,14 +12,7 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_user_sql_service.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/mysqlclient/ob_mysql_proxy.h"
 #include "share/ob_dml_sql_splicer.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
-#include "share/schema/ob_priv_type.h"
-#include "share/schema/ob_schema_struct.h"
-#include "share/schema/ob_schema_getter_guard.h"
 #include "sql/ob_sql_utils.h"
 
 namespace oceanbase
@@ -1070,18 +1063,38 @@ int ObUserSqlService::gen_user_dml(
   }
   int64_t priv_others = 0;
   if (OB_SUCC(ret)) {
-    if ((user.get_priv_set() & OB_PRIV_EXECUTE) != 0) { priv_others |= 1; }
-    if ((user.get_priv_set() & OB_PRIV_ALTER_ROUTINE) != 0) { priv_others |= 2; }
-    if ((user.get_priv_set() & OB_PRIV_CREATE_ROUTINE) != 0) { priv_others |= 4; }
-    if ((user.get_priv_set() & OB_PRIV_CREATE_TABLESPACE) != 0) { priv_others |= 8; }
-    if ((user.get_priv_set() & OB_PRIV_SHUTDOWN) != 0) { priv_others |= 16; }
-    if ((user.get_priv_set() & OB_PRIV_RELOAD) != 0) { priv_others |= 32; }
+    if ((user.get_priv_set() & OB_PRIV_EXECUTE) != 0) { priv_others |= OB_PRIV_OTHERS_EXECUTE; }
+    if ((user.get_priv_set() & OB_PRIV_ALTER_ROUTINE) != 0) { priv_others |= OB_PRIV_OTHERS_ALTER_ROUTINE; }
+    if ((user.get_priv_set() & OB_PRIV_CREATE_ROUTINE) != 0) { priv_others |= OB_PRIV_OTHERS_CREATE_ROUTINE; }
+    if ((user.get_priv_set() & OB_PRIV_CREATE_TABLESPACE) != 0) { priv_others |= OB_PRIV_OTHERS_CREATE_TABLESPACE; }
+    if ((user.get_priv_set() & OB_PRIV_SHUTDOWN) != 0) { priv_others |= OB_PRIV_OTHERS_SHUTDOWN; }
+    if ((user.get_priv_set() & OB_PRIV_RELOAD) != 0) { priv_others |= OB_PRIV_OTHERS_RELOAD; }
+    if ((user.get_priv_set() & OB_PRIV_REFERENCES) != 0) { priv_others |= OB_PRIV_OTHERS_REFERENCES; }
+    if ((user.get_priv_set() & OB_PRIV_CREATE_ROLE) != 0) { priv_others |= OB_PRIV_OTHERS_CREATE_ROLE; }
+    if ((user.get_priv_set() & OB_PRIV_DROP_ROLE) != 0) { priv_others |= OB_PRIV_OTHERS_DROP_ROLE; }
+    if ((user.get_priv_set() & OB_PRIV_TRIGGER) != 0) { priv_others |= OB_PRIV_OTHERS_TRIGGER; }
+    if ((user.get_priv_set() & OB_PRIV_LOCK_TABLE) != 0) { priv_others |= OB_PRIV_OTHERS_LOCK_TABLE; }
+    if ((user.get_priv_set() & OB_PRIV_ENCRYPT) != 0) { priv_others |= OB_PRIV_OTHERS_ENCRYPT; }
+    if ((user.get_priv_set() & OB_PRIV_DECRYPT) != 0) { priv_others |= OB_PRIV_OTHERS_DECRYPT; }
+    if ((user.get_priv_set() & OB_PRIV_EVENT) != 0) { priv_others |= OB_PRIV_OTHERS_EVENT; }
+    if ((user.get_priv_set() & OB_PRIV_CREATE_CATALOG) != 0) { priv_others |= OB_PRIV_OTHERS_CREATE_CATALOG; }
+    if ((user.get_priv_set() & OB_PRIV_USE_CATALOG) != 0) { priv_others |= OB_PRIV_OTHERS_USE_CATALOG; }
   }
   if (OB_FAIL(ret)) {
   } else if (!sql::ObSQLUtils::is_data_version_ge_422_or_431(compat_version)) {
     if (priv_others != 0) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below DATA_VERSION_4_3_1_0 or DATA_VERSION_4_2_2_0", K(ret), K(user.get_priv(OB_PRIV_EXECUTE)), K(user.get_priv(OB_PRIV_ALTER_ROUTINE)), K(user.get_priv(OB_PRIV_CREATE_ROUTINE)));
+    }
+  } else if (!((MOCK_DATA_VERSION_4_2_5_1 <= compat_version && compat_version < DATA_VERSION_4_3_0_0) || compat_version >= DATA_VERSION_4_3_5_1)) {
+    if ((priv_others & OB_PRIV_OTHERS_ENCRYPT) != 0 || (priv_others & OB_PRIV_OTHERS_DECRYPT) != 0) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below MOCK_DATA_VERSION_4_2_5_1 or DATA_VERSION_4_3_5_1", K(ret), K(user.get_priv(OB_PRIV_ENCRYPT)), K(user.get_priv(OB_PRIV_DECRYPT)));
+    }
+  } else if (!((MOCK_DATA_VERSION_4_2_5_2 <= compat_version && compat_version < DATA_VERSION_4_3_0_0) || compat_version >= DATA_VERSION_4_3_5_2)) {
+    if ((priv_others & OB_PRIV_EVENT) != 0) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below DATA_VERSION_4_2_5_2 or 4_3_5_2", K(ret), K(user.get_priv(OB_PRIV_EVENT)));
     }
   } else if (OB_FAIL(dml.add_column("PRIV_OTHERS", priv_others))) {
     LOG_WARN("add PRIV_OTHERS column failed", K(priv_others), K(ret));
@@ -1166,7 +1179,6 @@ int ObUserSqlService::update_user_schema_version(
   return ret;
 }
 
-
-} //end of schema
-} //end of share
-} //end of oceanbase
+} // end of schema
+} // end of share
+} // end of oceanbase

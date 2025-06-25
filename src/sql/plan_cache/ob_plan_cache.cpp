@@ -11,36 +11,16 @@
  */
 
 #define USING_LOG_PREFIX SQL_PC
-#include "sql/plan_cache/ob_plan_cache.h"
-#include "lib/container/ob_se_array_iterator.h"
-#include "lib/profile/ob_perf_event.h"
-#include "lib/json/ob_json_print_utils.h"
-#include "lib/allocator/ob_mod_define.h"
-#include "lib/alloc/alloc_func.h"
-#include "lib/utility/ob_tracepoint.h"
-#include "lib/allocator/page_arena.h"
-#include "share/config/ob_server_config.h"
-#include "share/ob_rpc_struct.h"
+#include "ob_plan_cache.h"
 #include "share/ob_truncated_string.h"
-#include "share/schema/ob_schema_getter_guard.h"
 #include "lib/rc/ob_rc.h"
-#include "observer/ob_server_struct.h"
-#include "sql/plan_cache/ob_ps_cache_callback.h"
-#include "sql/plan_cache/ob_ps_sql_utils.h"
-#include "sql/ob_sql_context.h"
-#include "sql/engine/ob_exec_context.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "sql/engine/ob_physical_plan.h"
 #include "sql/plan_cache/ob_plan_cache_callback.h"
-#include "sql/plan_cache/ob_cache_object_factory.h"
 #include "sql/udr/ob_udr_mgr.h"
-#include "pl/ob_pl.h"
-#include "pl/ob_pl_package.h"
-#include "observer/ob_req_time_service.h"
 #ifdef OB_BUILD_SPM
 #include "sql/spm/ob_spm_define.h"
 #include "sql/spm/ob_spm_controller.h"
 #include "sql/spm/ob_spm_evolution_plan.h"
+#include "sql/spm/ob_plan_baseline_mgr.h"
 #endif
 #include "pl/pl_cache/ob_pl_cache_mgr.h"
 #include "sql/plan_cache/ob_values_table_compression.h"
@@ -55,13 +35,14 @@ namespace oceanbase
 {
 namespace sql
 {
-struct ObGetPlanIdBySqlIdOp
+struct ObGetCandiBaselinePlanIdOp
 {
-  explicit ObGetPlanIdBySqlIdOp(common::ObIArray<uint64_t> *key_array,
+  explicit ObGetCandiBaselinePlanIdOp(common::ObIArray<uint64_t> *key_array,
+                                uint64_t db_id,
                                 const common::ObString &sql_id,
                                 const bool with_plan_hash,
                                 const uint64_t &plan_hash_value)
-    : key_array_(key_array), sql_id_(sql_id), with_plan_hash_(with_plan_hash), plan_hash_value_(plan_hash_value)
+    : key_array_(key_array), db_id_(db_id), sql_id_(sql_id), with_plan_hash_(with_plan_hash), plan_hash_value_(plan_hash_value)
   {
   }
   int operator()(common::hash::HashMapPair<ObCacheObjID, ObILibCacheObject *> &entry)
@@ -77,7 +58,9 @@ struct ObGetPlanIdBySqlIdOp
     } else if (OB_ISNULL(plan = dynamic_cast<ObPhysicalPlan *>(entry.second))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null plan", K(ret), K(plan));
-    } else if (sql_id_ != plan->stat_.sql_id_) {
+    } else if (!plan->should_add_baseline() || plan->stat_.constructed_sql_.empty()) {
+      // do nothing
+    } else if (!sql_id_.empty() && (db_id_ != plan->stat_.db_id_ || sql_id_ != plan->stat_.sql_id_)) {
       // do nothing
     } else if (with_plan_hash_ && plan->stat_.plan_hash_value_ != plan_hash_value_) {
       // do nothing
@@ -89,6 +72,7 @@ struct ObGetPlanIdBySqlIdOp
   }
 
   common::ObIArray<uint64_t> *key_array_;
+  uint64_t db_id_;
   common::ObString sql_id_;
   bool with_plan_hash_;
   uint64_t plan_hash_value_;
@@ -160,12 +144,12 @@ struct ObGetKVEntryBySQLIDOp : public ObKVEntryTraverseOp
 };
 
 #ifdef OB_BUILD_SPM
-struct ObGetPlanBaselineBySQLIDOp : public ObKVEntryTraverseOp
+struct ObGetPlanBaselineOp : public ObKVEntryTraverseOp
 {
-  explicit ObGetPlanBaselineBySQLIDOp(uint64_t db_id,
-                                      common::ObString sql_id,
-                                      LCKeyValueArray *key_val_list,
-                                      const CacheRefHandleID ref_handle)
+  explicit ObGetPlanBaselineOp(uint64_t db_id,
+                               common::ObString sql_id,
+                               LCKeyValueArray *key_val_list,
+                               const CacheRefHandleID ref_handle)
     : ObKVEntryTraverseOp(key_val_list, ref_handle),
       db_id_(db_id),
       sql_id_(sql_id)
@@ -177,7 +161,9 @@ struct ObGetPlanBaselineBySQLIDOp : public ObKVEntryTraverseOp
     is_match = false;
     if (ObLibCacheNameSpace::NS_SPM == entry.first->namespace_) {
       ObBaselineKey *key = static_cast<ObBaselineKey*>(entry.first);
-      if (db_id_ != common::OB_INVALID_ID && db_id_ != key->db_id_) {
+      if (sql_id_.empty()) {
+        is_match = true;
+      } else if (db_id_ != common::OB_INVALID_ID && db_id_ != key->db_id_) {
         // skip entry that has non-matched db_id
       } else if (sql_id_ == key->sql_id_) {
         is_match = true;
@@ -542,6 +528,37 @@ int ObPlanCache::check_after_get_plan(int tmp_ret,
   return ret;
 }
 
+int ObPlanCache::try_get_plan(common::ObIAllocator &allocator, ObPlanCacheCtx &pc_ctx,
+                              ObCacheObjGuard &guard)
+{
+  int ret = OB_SUCCESS;
+  pc_ctx.has_inactive_plan_ = false;
+  if (OB_ISNULL(pc_ctx.compare_plan_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(pc_ctx.compare_plan_));
+  } else if (OB_FAIL(get_plan(allocator, pc_ctx, guard))) {
+    SQL_PC_LOG(TRACE, "failed to try get plan", K(ret), K(pc_ctx.fp_result_.pc_key_));
+  }
+  return ret;
+}
+
+int ObPlanCache::try_get_ps_plan(ObCacheObjGuard &guard, const ObPsStmtId stmt_id,
+                                 ObPlanCacheCtx &pc_ctx)
+{
+  int ret = OB_SUCCESS;
+  pc_ctx.has_inactive_plan_ = false;
+  ObPhysicalPlanCtx *pctx = pc_ctx.exec_ctx_.get_physical_plan_ctx();
+  int64_t original_param_cnt = pctx->get_param_store().count();
+  if (OB_ISNULL(pc_ctx.compare_plan_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(pc_ctx.compare_plan_));
+  } else if (OB_FAIL(get_ps_plan(guard, stmt_id, pc_ctx))) {
+    SQL_PC_LOG(TRACE, "failed to try get ps plan", K(ret), K(pc_ctx.fp_result_.pc_key_));
+  }
+  pctx->restore_param_store(original_param_cnt);
+  return ret;
+}
+
 //plan cache获取plan入口
 //1.fast parser获取param sql及raw params
 //2.根据param sql获得pcv set
@@ -591,6 +608,9 @@ int ObPlanCache::get_plan(common::ObIAllocator &allocator,
         MEMCPY(pc_ctx.sql_ctx_.sql_id_,
                plan->stat_.sql_id_.ptr(),
                plan->stat_.sql_id_.length());
+        MEMCPY(pc_ctx.sql_ctx_.format_sql_id_,
+               plan->stat_.format_sql_id_.ptr(),
+               plan->stat_.format_sql_id_.length());
         if (GCONF.enable_perf_event) {
           uint64_t tenant_id = pc_ctx.sql_ctx_.session_info_->get_effective_tenant_id();
           bool read_only = false;
@@ -716,42 +736,44 @@ int ObPlanCache::construct_fast_parser_result(common::ObIAllocator &allocator,
                                                     raw_sql,
                                                     fp_result))) {
         LOG_WARN("failed to fast parser", K(ret), K(sql_mode), K(pc_ctx.raw_sql_));
-      } else if (OB_FAIL(check_can_do_insert_opt(allocator,
-                                                 pc_ctx,
-                                                 fp_result,
-                                                 can_do_batch_insert,
-                                                 batch_count,
-                                                 first_truncated_sql,
-                                                 is_insert_values))) {
-        LOG_WARN("fail to do insert optimization", K(ret));
-      } else if (can_do_batch_insert) {
-        if (OB_FAIL(rebuild_raw_params(allocator,
-                                       pc_ctx,
-                                       fp_result,
-                                       batch_count))) {
-          LOG_WARN("fail to rebuild raw_param", K(ret), K(batch_count));
-        } else if (pc_ctx.insert_batch_opt_info_.multi_raw_params_.empty()) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected multi_raw_params, can't do batch insert opt, but not need to return error",
-              K(batch_count), K(first_truncated_sql), K(pc_ctx.raw_sql_), K(fp_result));
-        } else if (OB_ISNULL(pc_ctx.insert_batch_opt_info_.multi_raw_params_.at(0))) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected null ptr, can't do batch insert opt, but not need to return error",
-              K(batch_count), K(first_truncated_sql), K(pc_ctx.raw_sql_), K(fp_result));
-        } else {
-          fp_result.raw_params_.reset();
-          if (OB_FAIL(fp_result.raw_params_.assign(*pc_ctx.insert_batch_opt_info_.multi_raw_params_.at(0)))) {
-            LOG_WARN("fail to assign raw_param", K(ret));
+      } else if (!pc_ctx.try_get_plan_) {
+        if (OB_FAIL(check_can_do_insert_opt(allocator,
+                                                  pc_ctx,
+                                                  fp_result,
+                                                  can_do_batch_insert,
+                                                  batch_count,
+                                                  first_truncated_sql,
+                                                  is_insert_values))) {
+          LOG_WARN("fail to do insert optimization", K(ret));
+        } else if (can_do_batch_insert) {
+          if (OB_FAIL(rebuild_raw_params(allocator,
+                                        pc_ctx,
+                                        fp_result,
+                                        batch_count))) {
+            LOG_WARN("fail to rebuild raw_param", K(ret), K(batch_count));
+          } else if (pc_ctx.insert_batch_opt_info_.multi_raw_params_.empty()) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected multi_raw_params, can't do batch insert opt, but not need to return error",
+                K(batch_count), K(first_truncated_sql), K(pc_ctx.raw_sql_), K(fp_result));
+          } else if (OB_ISNULL(pc_ctx.insert_batch_opt_info_.multi_raw_params_.at(0))) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected null ptr, can't do batch insert opt, but not need to return error",
+                K(batch_count), K(first_truncated_sql), K(pc_ctx.raw_sql_), K(fp_result));
           } else {
-            pc_ctx.sql_ctx_.set_is_do_insert_batch_opt(batch_count);
-            fp_result.pc_key_.name_.assign_ptr(first_truncated_sql.ptr(), first_truncated_sql.length());
-            LOG_DEBUG("print new fp_result.pc_key_.name_", K(fp_result.pc_key_.name_));
+            fp_result.raw_params_.reset();
+            if (OB_FAIL(fp_result.raw_params_.assign(*pc_ctx.insert_batch_opt_info_.multi_raw_params_.at(0)))) {
+              LOG_WARN("fail to assign raw_param", K(ret));
+            } else {
+              pc_ctx.sql_ctx_.set_is_do_insert_batch_opt(batch_count);
+              fp_result.pc_key_.name_.assign_ptr(first_truncated_sql.ptr(), first_truncated_sql.length());
+              LOG_DEBUG("print new fp_result.pc_key_.name_", K(fp_result.pc_key_.name_));
+            }
           }
+        } else if (!is_insert_values &&
+                  OB_FAIL(ObValuesTableCompression::try_batch_exec_params(allocator, pc_ctx,
+                                                        *pc_ctx.sql_ctx_.session_info_, fp_result))) {
+          LOG_WARN("failed to check fold params valid", K(ret));
         }
-      } else if (!is_insert_values &&
-                 OB_FAIL(ObValuesTableCompression::try_batch_exec_params(allocator, pc_ctx,
-                                                      *pc_ctx.sql_ctx_.session_info_, fp_result))) {
-        LOG_WARN("failed to check fold params valid", K(ret));
       }
     }
   }
@@ -965,6 +987,7 @@ int ObPlanCache::check_can_do_insert_opt(common::ObIAllocator &allocator,
   int ret = OB_SUCCESS;
   can_do_batch = false;
   batch_count = 0;
+  pc_ctx.is_batch_insert_opt_ = false;
   if (fp_result.values_token_pos_ != 0 &&
       can_do_insert_batch_opt(pc_ctx)) {
     char *new_param_sql = nullptr;
@@ -992,7 +1015,7 @@ int ObPlanCache::check_can_do_insert_opt(common::ObIAllocator &allocator,
     } else if (!can_do_batch || ins_params_count <= 0) {
       can_do_batch = false;
       // Only the insert ... values ​​... statement will print this,after trying to do insert batch optimization failure
-      LOG_INFO("can not do batch insert opt", K(ret), K(can_do_batch), K(upd_params_count),
+      LOG_TRACE("can not do batch insert opt", K(ret), K(can_do_batch), K(upd_params_count),
                 K(ins_params_count), K(batch_count), K(pc_ctx.raw_sql_));
     } else if (batch_count <= 1) {
       can_do_batch = false;
@@ -1000,11 +1023,12 @@ int ObPlanCache::check_can_do_insert_opt(common::ObIAllocator &allocator,
       // Only the insert ... values ​​... on duplicate key update ... statement will print this log
       // after trying to do insert batch optimization failure
       can_do_batch = false;
-      LOG_INFO("can not do batch insert opt", K(ret), K(can_do_batch), K(ins_params_count), K(batch_count), K(pc_ctx.raw_sql_));
+      LOG_TRACE("can not do batch insert opt", K(ret), K(can_do_batch), K(ins_params_count), K(batch_count), K(pc_ctx.raw_sql_));
     } else {
       pc_ctx.insert_batch_opt_info_.insert_params_count_ = ins_params_count;
       pc_ctx.insert_batch_opt_info_.update_params_count_ = upd_params_count;
       pc_ctx.insert_batch_opt_info_.sql_delta_length_ = delta_length;
+      pc_ctx.is_batch_insert_opt_ = true;
     }
     // if batch_count >= 1, then sql is a insert into .. values ()...;
     if (batch_count >= 1) {
@@ -1057,6 +1081,15 @@ int ObPlanCache::add_plan(ObPhysicalPlan *plan, ObPlanCacheCtx &pc_ctx)
   return ret;
 }
 
+bool ObPlanCache::is_contains_external_object(const DependenyTableStore &dep_schema_objs)
+{
+  bool is_contains = false;
+  for (int i = 0; i < dep_schema_objs.count() && !is_contains; i++) {
+    is_contains = is_external_object_id(dep_schema_objs.at(i).get_object_id());
+  }
+  return is_contains;
+}
+
 int ObPlanCache::add_plan_cache(ObILibCacheCtx &ctx,
                                 ObILibCacheObject *cache_obj)
 {
@@ -1070,7 +1103,10 @@ int ObPlanCache::add_plan_cache(ObILibCacheCtx &ctx,
     do {
       if (OB_FAIL(add_cache_obj(ctx, pc_ctx.key_, cache_obj)) && OB_OLD_SCHEMA_VERSION == ret) {
         SQL_PC_LOG(INFO, "table or view in plan cache value is old", K(ret));
+      }
+      if (ctx.need_destroy_node_) {
         int tmp_ret = OB_SUCCESS;
+        SQL_PC_LOG(INFO, "The cache node needs to be evict due to an invalid state", K(ret));
         if (OB_SUCCESS != (tmp_ret = remove_cache_node(pc_ctx.key_))) {
           ret = tmp_ret;
           SQL_PC_LOG(WARN, "fail to remove lib cache node", K(ret));
@@ -1107,6 +1143,7 @@ int ObPlanCache::add_cache_obj(ObILibCacheCtx &ctx,
                                ObILibCacheObject *cache_obj)
 {
   int ret = OB_SUCCESS;
+  ctx.need_destroy_node_ = false;
   ObLibCacheWlockAndRef w_ref_lock(LC_NODE_WR_HANDLE);
   ObILibCacheNode *cache_node = NULL;
   if (OB_ISNULL(key) || OB_ISNULL(cache_obj)) {
@@ -1116,7 +1153,6 @@ int ObPlanCache::add_cache_obj(ObILibCacheCtx &ctx,
     ret = OB_ERR_UNEXPECTED;
     SQL_PC_LOG(ERROR, "unmatched tenant_id", K(ret), K(get_tenant_id()), K(cache_obj->get_tenant_id()));
   } else if (OB_FAIL(get_value(key, cache_node, w_ref_lock /*write locked*/))) {
-    ret = OB_ERR_UNEXPECTED;
     SQL_PC_LOG(TRACE, "failed to get cache node from lib cache by key", K(ret));
   } else if (NULL == cache_node) {
     ObILibCacheKey *cache_key = NULL;
@@ -1194,15 +1230,26 @@ int ObPlanCache::add_cache_obj(ObILibCacheCtx &ctx,
         cache_node->dec_ref_count(LC_NODE_HANDLE); //cache node dec ref in block
         cache_node->dec_ref_count(LC_NODE_HANDLE); //cache node dec ref in alloc
       }
+    } else {
+      if (!ctx.need_destroy_node_ && ret != OB_SQL_PC_PLAN_DUPLICATE) {
+        ctx.need_destroy_node_ = true;
+      }
     }
   } else {  /* node exist, add cache obj to it */
     LOG_TRACE("inner add cache obj", K(key), K(cache_node));
-    if (OB_FAIL(cache_node->add_cache_obj(ctx, key, cache_obj))) {
+    if (cache_node->is_invalid()) {
+      ctx.need_destroy_node_ = true;
+    } else if (OB_FAIL(cache_node->add_cache_obj(ctx, key, cache_obj))) {
       SQL_PC_LOG(TRACE, "failed to add cache obj to lib cache node", K(ret));
     } else if (OB_FAIL(cache_node->update_node_stat(ctx))) {
       SQL_PC_LOG(WARN, "failed to update node stat", K(ret));
     } else if (OB_FAIL(add_stat_for_cache_obj(ctx, cache_obj))) {
       LOG_WARN("failed to add stat", K(ret), K(ctx));
+    }
+    if (OB_FAIL(ret)) {
+      if (!ctx.need_destroy_node_ && ret != OB_SQL_PC_PLAN_DUPLICATE) {
+        ctx.need_destroy_node_ = true;
+      }
     }
     // release wlock whatever
     cache_node->unlock();
@@ -1224,14 +1271,15 @@ int ObPlanCache::get_cache_obj(ObILibCacheCtx &ctx,
     ret = OB_INVALID_ARGUMENT;
     SQL_PC_LOG(WARN, "invalid null argument", K(ret), K(key));
   } else if (OB_FAIL(get_value(key, cache_node, r_ref_lock /*read locked*/))) {
-    ret = OB_ERR_UNEXPECTED;
     SQL_PC_LOG(TRACE, "failed to get cache node from lib cache by key", K(ret));
   } else if (OB_UNLIKELY(NULL == cache_node)) {
     ret = OB_SQL_PC_NOT_EXIST;
     SQL_PC_LOG(DEBUG, "cache obj does not exist!", K(key));
   } else {
     LOG_DEBUG("inner_get_cache_obj", K(key), K(cache_node));
-    if (OB_FAIL(cache_node->update_node_stat(ctx))) {
+    if (cache_node->is_invalid()) {
+      ret = OB_SQL_PC_NOT_EXIST;
+    } else if (OB_FAIL(cache_node->update_node_stat(ctx))) {
       SQL_PC_LOG(WARN, "failed to update node stat",  K(ret));
     } else if (OB_FAIL(cache_node->get_cache_obj(ctx, key, cache_obj))) {
       if (OB_SQL_PC_NOT_EXIST != ret) {
@@ -1343,6 +1391,7 @@ int ObPlanCache::foreach_cache_evict(CallBack &cb)
 template int ObPlanCache::foreach_cache_evict<pl::ObGetPLKVEntryOp>(pl::ObGetPLKVEntryOp &);
 template int ObPlanCache::foreach_cache_evict<pl::ObGetPLKVEntryBySchemaIdOp>(pl::ObGetPLKVEntryBySchemaIdOp &);
 template int ObPlanCache::foreach_cache_evict<pl::ObGetPLKVEntryBySQLIDOp>(pl::ObGetPLKVEntryBySQLIDOp &);
+template int ObPlanCache::foreach_cache_evict<pl::ObGetPLKVEntryByDbIdOp>(pl::ObGetPLKVEntryByDbIdOp &);
 
 // Remove all cache object in the lib cache
 int ObPlanCache::cache_evict_all_obj()
@@ -1396,12 +1445,12 @@ int ObPlanCache::cache_evict_plan_by_sql_id(uint64_t db_id, common::ObString sql
 }
 
 #ifdef OB_BUILD_SPM
-int ObPlanCache::cache_evict_baseline_by_sql_id(uint64_t db_id, common::ObString sql_id)
+int ObPlanCache::cache_evict_baseline(uint64_t db_id, common::ObString sql_id)
 {
   int ret = OB_SUCCESS;
   SQL_PC_LOG(TRACE, "cache evict plan baseline by sql id start");
   LCKeyValueArray to_evict_keys;
-  ObGetPlanBaselineBySQLIDOp get_ids_op(db_id, sql_id, &to_evict_keys, PLAN_BASELINE_HANDLE);
+  ObGetPlanBaselineOp get_ids_op(db_id, sql_id, &to_evict_keys, PLAN_BASELINE_HANDLE);
   if (OB_FAIL(foreach_cache_evict(get_ids_op))) {
     SQL_PC_LOG(WARN, "failed to foreach cache evict", K(ret));
   }
@@ -1583,32 +1632,71 @@ int ObPlanCache::cache_evict_by_glitch_node()
 int ObPlanCache::load_plan_baseline(const obrpc::ObLoadPlanBaselineArg &arg, uint64_t &load_count)
 {
   int ret = OB_SUCCESS;
-  common::ObSEArray<uint64_t, 4> plan_ids;
   ObGlobalReqTimeService::check_req_timeinfo();
-  ObGetPlanIdBySqlIdOp plan_id_op(&plan_ids, arg.sql_id_, arg.with_plan_hash_, arg.plan_hash_value_);
   load_count = 0;
-  if (OB_FAIL(co_mgr_.foreach_cache_obj(plan_id_op))) {
-    LOG_WARN("fail to traverse id2stat_map", K(ret));
-  } else {
-    ObPhysicalPlan *plan = NULL;
-    LOG_INFO("load plan baseline by sql ids", K(arg), K(plan_ids));
-    for (int64_t i = 0; i < plan_ids.count(); i++) {
-      uint64_t plan_id= plan_ids.at(i);
-      ObCacheObjGuard guard(LOAD_BASELINE_HANDLE);
-      int tmp_ret = ref_plan(plan_id, guard); //plan引用计数加1
-      plan = static_cast<ObPhysicalPlan*>(guard.cache_obj_);
-      if (OB_HASH_NOT_EXIST == tmp_ret) {
-        //do nothing;
-      } else if (OB_SUCCESS != tmp_ret || NULL == plan) {
-        LOG_WARN("get plan failed", K(tmp_ret), KP(plan));
-      } else {
-        LOG_INFO("load plan baseline by sql id", K(arg));
-        if (OB_FAIL(ObSpmController::load_baseline(arg, plan))) {
-          LOG_WARN("failed to load baseline", K(ret));
+  SMART_VAR(PlanIdArray, plan_ids) {
+    int64_t batch_exec_cnt = 0;
+    ObGetCandiBaselinePlanIdOp plan_id_op(&plan_ids, arg.database_id_, arg.sql_id_, arg.with_plan_hash_, arg.plan_hash_value_);
+    if (OB_FAIL(co_mgr_.foreach_cache_obj(plan_id_op))) {
+      SERVER_LOG(WARN, "fail to traverse id2stat_map");
+    } else {
+      int64_t pos = 0;
+      while (OB_SUCC(ret) && pos < plan_ids.count()) {
+        uint64_t tmp_load_count = 0;
+        if (OB_FAIL(batch_load_plan_baseline(arg, plan_ids, pos, tmp_load_count))) {
+          LOG_WARN("failed to batch load plan baseline", K(ret));
         } else {
-          ++load_count;
+          load_count += tmp_load_count;
+          ++batch_exec_cnt;
         }
       }
+    }
+    if (arg.sql_id_.empty()) {
+      LOG_INFO("batch load plan baseline", K(load_count), K(batch_exec_cnt), K(plan_ids.count()), K(arg));
+    } else {
+      LOG_INFO("load plan baseline by sql ids", K(load_count), K(batch_exec_cnt), K(plan_ids), K(arg));
+    }
+  }
+  return ret;
+}
+
+int ObPlanCache::batch_load_plan_baseline(const obrpc::ObLoadPlanBaselineArg &arg,
+                                          const PlanIdArray &plan_ids,
+                                          int64_t &pos,
+                                          uint64_t &load_count)
+{
+  int ret = OB_SUCCESS;
+  load_count = 0;
+  ObSpmBaselineLoader baseline_loader;
+  if (OB_UNLIKELY(pos < 0 || pos >= plan_ids.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected pos", K(ret), K(pos), K(plan_ids.count()));
+  } else if (OB_FAIL(baseline_loader.init_baseline_loader(arg))) {
+    LOG_WARN("failed to init baseline loader", K(ret));
+  } else {
+    bool need_add_next = true;
+    while (OB_SUCC(ret) && pos < plan_ids.count() && need_add_next) {
+      ObCacheObjGuard guard(LOAD_BASELINE_HANDLE);
+      int tmp_ret = ref_plan(plan_ids.at(pos), guard); //plan引用计数加1
+      ObPhysicalPlan *plan = static_cast<ObPhysicalPlan*>(guard.cache_obj_);
+      if (OB_HASH_NOT_EXIST == tmp_ret) {
+        ++pos;
+      } else if (OB_SUCCESS != tmp_ret || NULL == plan) {
+        ++pos;
+        LOG_WARN("get plan failed", K(tmp_ret), KP(plan));
+      } else if (OB_FAIL(baseline_loader.add_one_plan_baseline(*plan, need_add_next))) {
+        LOG_WARN("failed to add one plan baseline", K(ret));
+      } else if (need_add_next) {
+        ++pos;
+      }
+    }
+
+    if (OB_FAIL(ret) || 0 >= baseline_loader.get_baseline_count()) {
+    } else if (OB_FAIL(ObSpmController::load_baseline(baseline_loader))) {
+      LOG_WARN("failed to load baseline", K(ret));
+    } else {
+      load_count = baseline_loader.get_baseline_count();
+
     }
   }
   return ret;
@@ -2047,28 +2135,44 @@ int ObPlanCache::deal_add_ps_plan_result(int add_plan_ret,
                                          const ObILibCacheObject &cache_object)
 {
   int ret = add_plan_ret;
-  if (OB_SQL_PC_PLAN_DUPLICATE == ret) {
-    ret = OB_SUCCESS;
-    LOG_TRACE("this plan has been added by others, need not add again", K(cache_object));
-  } else if (OB_REACH_MEMORY_LIMIT == ret || OB_SQL_PC_PLAN_SIZE_LIMIT == ret) {
-    if (REACH_TIME_INTERVAL(1000000)) { //1s, 当内存达到上限时, 该日志打印会比较频繁, 所以以1s为间隔打印
-      ObTruncatedString trunc_sql(pc_ctx.raw_sql_);
-      LOG_INFO("can't add plan to plan cache",
-               K(ret), K(cache_object.get_mem_size()), K(trunc_sql),
-               K(get_mem_used()));
-    }
-    ret = OB_SUCCESS;
-  } else if (is_not_supported_err(ret)) {
-    ret = OB_SUCCESS;
-    LOG_TRACE("plan cache don't support add this kind of plan now",  K(cache_object));
-  } else if (OB_FAIL(ret)) {
-    if (OB_REACH_MAX_CONCURRENT_NUM != ret) { //如果是达到限流上限, 则将错误码抛出去
-      ret = OB_SUCCESS; //add plan出错, 覆盖错误码, 确保因plan cache失败不影响正常执行路径
-      LOG_WARN("Failed to add plan to ObPlanCache", K(ret));
+
+  if (pc_ctx.sql_ctx_.is_batch_params_execute()) {
+    // for batch_dml optimization, only can cover the error OB_SQL_PC_PLAN_DUPLICATE
+    // others error occur during add plan to plan_cache, we must stop batch_dml optimization
+    if (OB_SQL_PC_PLAN_DUPLICATE == ret) {
+      ret = OB_SUCCESS;
+      LOG_TRACE("this plan has been added by others, need not add again", K(cache_object));
+    } else if (OB_FAIL(ret)) {
+      ret = OB_BATCHED_MULTI_STMT_ROLLBACK;
+      LOG_WARN("some unexpected error occured, change ret_code to 5787", K(ret));
+    } else {
+      pc_ctx.sql_ctx_.self_add_plan_ = true;
+      LOG_TRACE("Successed to add batch plan to ObPlanCache", K(cache_object));
     }
   } else {
-    pc_ctx.sql_ctx_.self_add_plan_ = true;
-    LOG_TRACE("Succeed to add plan to ObPlanCache", K(cache_object));
+    if (OB_SQL_PC_PLAN_DUPLICATE == ret) {
+      ret = OB_SUCCESS;
+      LOG_TRACE("this plan has been added by others, need not add again", K(cache_object));
+    } else if (OB_REACH_MEMORY_LIMIT == ret || OB_SQL_PC_PLAN_SIZE_LIMIT == ret) {
+      if (REACH_TIME_INTERVAL(1000000)) { //1s, 当内存达到上限时, 该日志打印会比较频繁, 所以以1s为间隔打印
+        ObTruncatedString trunc_sql(pc_ctx.raw_sql_);
+        LOG_INFO("can't add plan to plan cache",
+                 K(ret), K(cache_object.get_mem_size()), K(trunc_sql),
+                 K(get_mem_used()));
+      }
+      ret = OB_SUCCESS;
+    } else if (is_not_supported_err(ret)) {
+      ret = OB_SUCCESS;
+      LOG_TRACE("plan cache don't support add this kind of plan now",  K(cache_object));
+    } else if (OB_FAIL(ret)) {
+      if (OB_REACH_MAX_CONCURRENT_NUM != ret) { //如果是达到限流上限, 则将错误码抛出去
+        ret = OB_SUCCESS; //add plan出错, 覆盖错误码, 确保因plan cache失败不影响正常执行路径
+        LOG_WARN("Failed to add plan to ObPlanCache", K(ret));
+      }
+    } else {
+      pc_ctx.sql_ctx_.self_add_plan_ = true;
+      LOG_TRACE("Succeed to add plan to ObPlanCache", K(cache_object));
+    }
   }
 
   return ret;
@@ -2260,6 +2364,10 @@ int ObPlanCache::get_ps_plan(ObCacheObjGuard& guard,
     MEMCPY(pc_ctx.sql_ctx_.sql_id_,
            sql_plan->stat_.sql_id_.ptr(),
            sql_plan->stat_.sql_id_.length());
+    MEMCPY(pc_ctx.sql_ctx_.format_sql_id_,
+           sql_plan->stat_.format_sql_id_.ptr(),
+           sql_plan->stat_.format_sql_id_.length());
+
   }
   //check read only privilege
   if (OB_SUCC(ret) && GCONF.enable_perf_event) {
@@ -2325,6 +2433,7 @@ OB_INLINE int ObPlanCache::construct_plan_cache_key(ObSQLSessionInfo &session,
   pc_key.config_use_rich_format_ = session.config_use_rich_format();
   pc_key.sys_var_config_hash_val_ = session.get_sys_var_config_hash_val();
   pc_key.is_weak_read_ = is_weak;
+  pc_key.enable_mysql_compatible_dates_ = session.enable_mysql_compatible_dates();
   return ret;
 }
 
@@ -2616,6 +2725,7 @@ int ObPlanCache::flush_pl_cache_single_cache_obj(uint64_t db_id, EvictAttr &attr
 }
 
 template int ObPlanCache::flush_pl_cache_single_cache_obj<ObGetPLKVEntryBySchemaIdOp, uint64_t>(uint64_t db_id, uint64_t &schema_id);
+template int ObPlanCache::flush_pl_cache_single_cache_obj<ObGetPLKVEntryByDbIdOp, uint64_t>(uint64_t db_id, uint64_t &schema_id);
 template int ObPlanCache::flush_pl_cache_single_cache_obj<ObGetPLKVEntryBySQLIDOp, common::ObString>(uint64_t db_id, common::ObString &sql_id);
 
 int ObPlanCache::flush_pl_cache()

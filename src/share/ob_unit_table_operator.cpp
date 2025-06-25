@@ -12,16 +12,11 @@
 
 #define USING_LOG_PREFIX SHARE
 
-#include "share/ob_unit_table_operator.h"
 
-#include "share/inner_table/ob_inner_table_schema.h"
-#include "share/ob_dml_sql_splicer.h"
-#include "share/config/ob_server_config.h"
-#include "share/ob_unit_getter.h"
-#include "observer/ob_server_struct.h"
+#include "ob_unit_table_operator.h"
 #include "observer/ob_sql_client_decorator.h"
-#include "common/ob_timeout_ctx.h"
-#include "rootserver/ob_root_utils.h"
+#include "share/ob_all_server_tracer.h" // for SVR_TRACER
+#include "src/share/ob_common_rpc_proxy.h"
 #include "rootserver/tenant_snapshot/ob_tenant_snapshot_util.h" // ObTenantSnapshotUtil
 
 namespace oceanbase
@@ -169,7 +164,7 @@ int ObUnitTableOperator::check_server_empty(const common::ObAddr &server, bool &
     LOG_WARN("fail to get units", KR(ret), K(server));
   } else if (units.count() > 0) {
     is_empty = false;
-    LOG_DEBUG("server exists in the server list or migrate_from_server list", K(server), K(units));
+    LOG_TRACE("server exists in the server list or migrate_from_server list", K(server), K(units));
   }
   return ret;
 }
@@ -568,9 +563,7 @@ int ObUnitTableOperator::get_unit_configs(common::ObIArray<ObUnitConfig> &config
     ObTimeoutCtx ctx;
     if (OB_FAIL(rootserver::ObRootUtils::get_rs_default_timeout_ctx(ctx))) {
       LOG_WARN("fail to get timeout ctx", K(ret), K(ctx));
-    } else if (OB_FAIL(sql.append_fmt("select unit_config_id, name, "
-        "max_cpu, min_cpu, memory_size, log_disk_size, "
-        "max_iops, min_iops, iops_weight from %s ", OB_ALL_UNIT_CONFIG_TNAME))) {
+    } else if (OB_FAIL(sql.append_fmt("select * from %s ", OB_ALL_UNIT_CONFIG_TNAME))) {
       LOG_WARN("append_fmt failed", K(ret));
     } else if (OB_FAIL(read_unit_configs(sql, configs))) {
       LOG_WARN("read_unit_configs failed", K(sql), K(ret));
@@ -594,9 +587,7 @@ int ObUnitTableOperator::get_unit_configs(const common::ObIArray<uint64_t> &conf
     ObTimeoutCtx ctx;
     if (OB_FAIL(rootserver::ObRootUtils::get_rs_default_timeout_ctx(ctx))) {
       LOG_WARN("fail to get timeout ctx", K(ret), K(ctx));
-    } else if (OB_FAIL(sql.append_fmt("select unit_config_id, name, "
-        "max_cpu, min_cpu, memory_size, log_disk_size, "
-        "max_iops, min_iops, iops_weight from %s "
+    } else if (OB_FAIL(sql.append_fmt("select * from %s "
         "where unit_config_id in (", OB_ALL_UNIT_CONFIG_TNAME))) {
       LOG_WARN("append_fmt failed", K(ret));
     } else {
@@ -670,15 +661,36 @@ int ObUnitTableOperator::update_unit_config(common::ObISQLClient &client,
   } else {
     ObDMLSqlSplicer dml;
     ObString unit_name(config.name().size(), config.name().ptr());
-    if (OB_FAIL(dml.add_pk_column("unit_config_id", config.unit_config_id()))
+    uint64_t data_version = 0;
+    if (OB_FAIL(GET_MIN_DATA_VERSION(OB_SYS_TENANT_ID, data_version))) {
+      LOG_WARN("failed to get sys tenant min data version", KR(ret));
+    } else if (data_version < DATA_VERSION_4_3_3_0
+               && ObUnitResource::DEFAULT_DATA_DISK_SIZE != config.data_disk_size()) {
+      // during upgrade, should be default value 0.
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("during upgrade, data_disk_size is expected to be 0", KR(ret), K(config));
+    } else if (data_version < DATA_VERSION_4_3_3_0
+               && (ObUnitResource::DEFAULT_NET_BANDWIDTH != config.max_net_bandwidth()
+                   || ObUnitResource::DEFAULT_NET_BANDWIDTH_WEIGHT != config.net_bandwidth_weight())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("max_net_bandwidth_ and net_bandwidth_weight_ are expected to be default value",
+               KR(ret), K(config));
+    } else if (
+        OB_FAIL(dml.add_pk_column("unit_config_id", config.unit_config_id()))
         || OB_FAIL(dml.add_column("name", ObHexEscapeSqlStr(unit_name)))
         || OB_FAIL(dml.add_column("max_cpu", config.max_cpu()))
         || OB_FAIL(dml.add_column("min_cpu", config.min_cpu()))
         || OB_FAIL(dml.add_column("memory_size", config.memory_size()))
         || OB_FAIL(dml.add_column("log_disk_size", config.log_disk_size()))
+        || (data_version >= DATA_VERSION_4_3_3_0
+            && OB_FAIL(dml.add_column("data_disk_size", config.data_disk_size())))
         || OB_FAIL(dml.add_column("max_iops", config.max_iops()))
         || OB_FAIL(dml.add_column("min_iops", config.min_iops()))
         || OB_FAIL(dml.add_column("iops_weight", config.iops_weight()))
+        || (data_version >= DATA_VERSION_4_3_3_0
+            && OB_FAIL(dml.add_column("max_net_bandwidth", config.max_net_bandwidth())))
+        || (data_version >= DATA_VERSION_4_3_3_0
+            && OB_FAIL(dml.add_column("net_bandwidth_weight", config.net_bandwidth_weight())))
         || OB_FAIL(dml.add_gmt_modified())) {
       LOG_WARN("add column failed", KR(ret), K(config), K(unit_name));
     } else {
@@ -814,6 +826,49 @@ int ObUnitTableOperator::get_units_by_resource_pools(
   return ret;
 }
 
+int ObUnitTableOperator::get_alive_servers_by_tenant(
+    const uint64_t tenant_id,
+    common::ObIArray<common::ObAddr> &server_array) const
+{
+  int ret = OB_SUCCESS;
+  server_array.reset();
+  common::ObArray<ObUnit> units;
+  if (OB_UNLIKELY(!inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", KR(ret));
+  } else if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(get_units_by_tenant(tenant_id, units))) {
+    LOG_WARN("fail to get units", KR(ret), K(tenant_id));
+  } else {
+    for (int64_t index = 0; OB_SUCC(ret) && index < units.count(); ++index) {
+      const common::ObAddr &unit_addr = units.at(index).server_;
+      const common::ObAddr &unit_migrate_from_server_addr = units.at(index).migrate_from_server_;
+      bool is_alive = false;
+      if (OB_FAIL(SVR_TRACER.check_server_alive(unit_addr, is_alive))) {
+        LOG_WARN("check_server_alive failed", KR(ret), K(unit_addr));
+      } else if (is_alive) {
+        if (OB_FAIL(server_array.push_back(unit_addr))) {
+          LOG_WARN("push_back failed", KR(ret), K(unit_addr));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (unit_migrate_from_server_addr.is_valid()) {
+          if (OB_FAIL(SVR_TRACER.check_server_alive(unit_migrate_from_server_addr, is_alive))) {
+            LOG_WARN("check_server_alive failed", KR(ret), K(unit_migrate_from_server_addr));
+          } else if (is_alive) {
+            if (OB_FAIL(server_array.push_back(unit_migrate_from_server_addr))) {
+              LOG_WARN("push_back failed", KR(ret), K(unit_migrate_from_server_addr));
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObUnitTableOperator::get_unit_groups_by_tenant(const uint64_t tenant_id,
                           common::ObIArray<ObSimpleUnitGroup> &unit_groups) const
 {
@@ -901,6 +956,39 @@ int ObUnitTableOperator::get_unit_stats(common::ObIArray<ObUnitStat> &unit_stats
       LOG_WARN("append_fmt failed", KR(ret));
     } else if (OB_FAIL(read_unit_stats(sql, unit_stats))) {
       LOG_WARN("read_unit_stats failed", KR(ret), K(sql));
+    }
+  }
+  return ret;
+}
+
+int ObUnitTableOperator::get_tenant_servers(
+    common::ObIArray<ObTenantServers> &all_tenant_servers,
+    const uint64_t tenant_id /* = OB_INVALID_TENANT_ID */) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", KR(ret));
+  } else {
+    ObSqlString sql;
+    ObTimeoutCtx ctx;
+    if (OB_FAIL(rootserver::ObRootUtils::get_rs_default_timeout_ctx(ctx))) {
+      LOG_WARN("fail to get timeout ctx", KR(ret), K(ctx));
+    } else if (OB_FAIL(sql.append_fmt("SELECT "
+              "tenant_id, svr_ip, svr_port, migrate_from_svr_ip, migrate_from_svr_port "
+              "from %s unit join %s pool "
+              "on unit.resource_pool_id = pool.resource_pool_id ",
+              OB_ALL_UNIT_TNAME, OB_ALL_RESOURCE_POOL_TNAME))) {
+      LOG_WARN("append_fmt failed", KR(ret));
+    } else if (is_valid_tenant_id(tenant_id)) {
+      if (OB_FAIL(sql.append_fmt("where tenant_id = %lu", tenant_id))) {
+        LOG_WARN("sql append_fmt failed", KR(ret));
+      }
+    } else if (OB_FAIL(sql.append_fmt("where tenant_id != -1 order by tenant_id"))) {
+      LOG_WARN("sql append_fmt failed", KR(ret));
+    }
+    if (FAILEDx(read_tenant_servers(sql, all_tenant_servers))) {
+      LOG_WARN("read_tenant_servers failed", KR(ret), K(sql));
     }
   }
   return ret;
@@ -1053,9 +1141,12 @@ int ObUnitTableOperator::read_unit_config(const ObMySQLResult &result,
   double min_cpu = 0;
   int64_t memory_size = 0;
   int64_t log_disk_size = 0;
+  int64_t data_disk_size = 0;
   int64_t max_iops = 0;
   int64_t min_iops = 0;
   int64_t iops_weight = ObUnitResource::INVALID_IOPS_WEIGHT;
+  int64_t max_net_bandwidth = ObUnitResource::INVALID_NET_BANDWIDTH;
+  int64_t net_bandwidth_weight = ObUnitResource::INVALID_NET_BANDWIDTH_WEIGHT;
 
   if (!inited_) {
     ret = OB_NOT_INIT;
@@ -1069,9 +1160,20 @@ int ObUnitTableOperator::read_unit_config(const ObMySQLResult &result,
     EXTRACT_DOUBLE_FIELD_MYSQL(result, "min_cpu", min_cpu, double);
     EXTRACT_INT_FIELD_MYSQL(result, "memory_size", memory_size, int64_t);
     EXTRACT_INT_FIELD_MYSQL(result, "log_disk_size", log_disk_size, int64_t);
+    EXTRACT_INT_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "data_disk_size", data_disk_size, int64_t,
+      false/*skip_null_error*/, true/*skip_column_error*/, ObUnitResource::DEFAULT_DATA_DISK_SIZE);
     EXTRACT_INT_FIELD_MYSQL(result, "max_iops", max_iops, int64_t);
     EXTRACT_INT_FIELD_MYSQL(result, "min_iops", min_iops, int64_t);
     EXTRACT_INT_FIELD_MYSQL(result, "iops_weight", iops_weight, int64_t);
+    EXTRACT_INT_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "max_net_bandwidth", max_net_bandwidth, int64_t,
+      false/*skip_null_error*/, true/*skip_column_error*/, ObUnitResource::DEFAULT_NET_BANDWIDTH);
+    EXTRACT_INT_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "net_bandwidth_weight", net_bandwidth_weight, int64_t,
+      false/*skip_null_error*/, true/*skip_column_error*/, ObUnitResource::DEFAULT_NET_BANDWIDTH_WEIGHT);
+
+    if (-1 == data_disk_size) {
+      // for compatability, lower version default value may be -1. Set as 0.
+      data_disk_size = 0;
+    }
 
     if (OB_SUCCESS == ret) {
       const ObUnitResource ur(
@@ -1079,9 +1181,12 @@ int ObUnitTableOperator::read_unit_config(const ObMySQLResult &result,
           min_cpu,
           memory_size,
           log_disk_size,
+          data_disk_size,
           max_iops,
           min_iops,
-          iops_weight);
+          iops_weight,
+          max_net_bandwidth,
+          net_bandwidth_weight);
 
       if (OB_FAIL(unit_config.init(unit_config_id, name, ur))) {
         LOG_WARN("init unit config fail", KR(ret), K(unit_config_id), K(name), K(ur));
@@ -1242,6 +1347,117 @@ int ObUnitTableOperator::read_tenants(ObSqlString &sql,
   return ret;
 }
 #undef READ_ITEMS
+
+int ObUnitTableOperator::read_tenant_server(
+    const ObMySQLResult &result,
+    uint64_t &tenant_id,
+    common::ObAddr &server,
+    common::ObAddr &migrate_from_server) const
+{
+  int ret = OB_SUCCESS;
+  tenant_id = OB_INVALID_TENANT_ID;
+  server.reset();
+  migrate_from_server.reset();
+  ObString ip;
+  int32_t port = 0;
+  ObString migrate_from_svr_ip;
+  int32_t migrate_from_svr_port = 0;
+  if (OB_UNLIKELY(!inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", KR(ret));
+  } else {
+    EXTRACT_INT_FIELD_MYSQL(result, "tenant_id", tenant_id, uint64_t);
+    EXTRACT_VARCHAR_FIELD_MYSQL(result, "svr_ip", ip);
+    EXTRACT_INT_FIELD_MYSQL(result, "svr_port", port, int32_t);
+    EXTRACT_VARCHAR_FIELD_MYSQL(result, "migrate_from_svr_ip", migrate_from_svr_ip);
+    EXTRACT_INT_FIELD_MYSQL(result, "migrate_from_svr_port", migrate_from_svr_port, int32_t);
+    if (OB_FAIL(ret)) {
+    } else if (OB_UNLIKELY(false == server.set_ip_addr(ip, port))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to use ip and port to set the server", KR(ret), K(ip), K(port));
+    } else if (OB_UNLIKELY(false == migrate_from_server.set_ip_addr(
+          migrate_from_svr_ip,
+          migrate_from_svr_port))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to use ip and port to set the migrate_from_server", KR(ret), K(migrate_from_svr_ip), K(migrate_from_svr_port));
+    }
+  }
+  return ret;
+}
+
+int ObUnitTableOperator::read_tenant_servers(
+    ObSqlString &sql,
+    ObIArray<ObTenantServers> &all_tenant_servers) const
+{
+  int ret = OB_SUCCESS;
+  all_tenant_servers.reset();
+  if (OB_UNLIKELY(!inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", KR(ret));
+  } else if (OB_UNLIKELY(sql.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid sql", KR(ret), K(sql));
+  } else if (OB_ISNULL(proxy_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid proxy", KR(ret), K(proxy_));
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      ObMySQLResult *result = nullptr;
+      if (OB_FAIL(proxy_->read(res, sql.ptr()))) {
+        LOG_WARN("execute sql failed", KR(ret), K(sql));
+      } else if (nullptr == (result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("result is not expected to be NULL", KR(ret), "result", OB_P(result));
+      } else {
+        ObTenantServers tenant_servers;
+        const int64_t renew_time = ObTimeUtility::current_time();
+        while (OB_SUCC(ret)) {
+          uint64_t tenant_id = OB_INVALID_TENANT_ID;
+          common::ObAddr server;
+          common::ObAddr migrate_server;
+          if (OB_FAIL(result->next())) {
+            if (OB_ITER_END == ret) {
+              ret = OB_SUCCESS;
+              break;
+            } else {
+              LOG_WARN("get next result failed", KR(ret));
+            }
+          } else if (OB_FAIL(read_tenant_server(*result, tenant_id, server, migrate_server))) {
+            LOG_WARN("read_tenant_server failed", KR(ret));
+          } else {
+            if (tenant_servers.is_valid()
+                  && tenant_id != tenant_servers.get_tenant_id()) {
+              if (OB_FAIL(all_tenant_servers.push_back(tenant_servers))) {
+                LOG_WARN("push back failed", KR(ret), K(tenant_servers));
+              } else {
+                tenant_servers.reset();
+              }
+            }
+            if (FAILEDx(tenant_servers.init_or_insert_server(
+                  tenant_id,
+                  server,
+                  migrate_server,
+                  renew_time))) {
+              LOG_WARN("failed to init_or_insert_server", KR(ret),
+                  K(tenant_id), K(server), K(migrate_server), K(renew_time));
+            }
+          } // end else
+        } // end while
+
+        // put the last tenant_servers into tenant_servers
+        if (OB_FAIL(ret)) {
+        } else if (OB_UNLIKELY(!tenant_servers.is_valid())) {
+          ret = OB_ENTRY_NOT_EXIST;
+          LOG_WARN("the query result is empty because the table is empty or there is no required value in the table",
+              KR(ret), K(sql));
+        } else if (OB_FAIL(all_tenant_servers.push_back(tenant_servers))) {
+          LOG_WARN("push_back failed", KR(ret), K(tenant_servers));
+        }
+      }
+    }
+  }
+  return ret;
+}
 
 }//end namespace share
 }//end namespace oceanbase

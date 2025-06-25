@@ -28,8 +28,8 @@ namespace obrpc
 class ObSyncRespCallback
 {
 public:
-  ObSyncRespCallback(ObRpcMemPool& pool)
-    : pkt_nio_cb_(NULL), pool_(pool), resp_(NULL), sz_(0), cond_(0), send_ret_(common::OB_SUCCESS), gtid_(0), pkt_id_(0){}
+  ObSyncRespCallback(ObRpcMemPool& pool, ObRpcProxy& proxy)
+    : pkt_nio_cb_(NULL), pool_(pool), proxy_(proxy), resp_(NULL), sz_(0), cond_(0), send_ret_(common::OB_SUCCESS){}
   ~ObSyncRespCallback() {}
   void* alloc(int64_t sz) { return pool_.alloc(sz); }
   int handle_resp(int io_err, const char* buf, int64_t sz);
@@ -45,6 +45,7 @@ public:
 private:
   void* pkt_nio_cb_;
   ObRpcMemPool& pool_;
+  const ObRpcProxy& proxy_;
   char* resp_;
   int64_t sz_;
   int cond_;
@@ -77,9 +78,6 @@ private:
   void* pkt_nio_cb_;
   ObRpcMemPool& pool_;
   UAsyncCB* ucb_;
-public:
-  uint64_t gtid_;
-  uint32_t pkt_id_;
 };
 
 void init_ucb(ObRpcProxy& proxy, UAsyncCB* ucb, const common::ObAddr& addr, int64_t send_ts, int64_t payload_sz);
@@ -125,7 +123,7 @@ public:
     auto &set = obrpc::ObRpcPacketSet::instance();
     const char* pcode_label = set.name_of_idx(set.idx_of_pcode(pcode));
     ObRpcMemPool pool(src_tenant_id, pcode_label);
-    ObSyncRespCallback cb(pool);
+    ObSyncRespCallback cb(pool, proxy);
     char* req = NULL;
     int64_t req_sz = 0;
     const char* resp = NULL;
@@ -136,11 +134,16 @@ public:
     uint8_t thread_id = balance_assign_tidx();
     uint64_t pnio_group_id = ObPocRpcServer::DEFAULT_PNIO_GROUP;
     // TODO:@fangwu.lcc map proxy.group_id_ to pnio_group_id
-    if (OB_LS_FETCH_LOG2 == pcode) {
+    if (OB_LS_FETCH_LOG2 == pcode || OB_CDC_FETCH_RAW_LOG == pcode) {
       pnio_group_id = ObPocRpcServer::RATELIMIT_PNIO_GROUP;
     }
     {
       lib::Thread::RpcGuard guard(addr, pcode);
+      int64_t relative_timeout = get_proxy_timeout(proxy);
+      if (relative_timeout > INT64_MAX/2) {
+        RPC_LOG_RET(WARN, OB_INVALID_ARGUMENT, "rpc timeout is too large", K(relative_timeout), K(pcode));
+        relative_timeout = INT64_MAX/2;
+      }
       if (OB_FAIL(rpc_encode_req(proxy, pool, pcode, args, opts, req, req_sz, false))) {
         RPC_LOG(WARN, "rpc encode req fail", K(ret));
       } else if(OB_FAIL(check_blacklist(addr))) {
@@ -149,7 +152,7 @@ public:
         const pn_pkt_t pkt = {
           req,
           req_sz,
-          start_ts + get_proxy_timeout(proxy),
+          start_ts + relative_timeout,
           static_cast<int16_t>(set.idx_of_pcode(pcode)),
           ObSyncRespCallback::client_cb,
           &cb
@@ -207,7 +210,7 @@ public:
     char rpc_timeguard_str[ObPocRpcServer::RPC_TIMEGUARD_STRING_SIZE] = {'\0'};
     ObTimeGuard timeguard("poc_rpc_post", 10 * 1000);
     // TODO:@fangwu.lcc map proxy.group_id_ to pnio_group_id
-    if (OB_LS_FETCH_LOG2 == pcode) {
+    if (OB_LS_FETCH_LOG2 == pcode || OB_CDC_FETCH_RAW_LOG == pcode) {
       pnio_group_id = ObPocRpcServer::RATELIMIT_PNIO_GROUP;
     }
     uint8_t thread_id = balance_assign_tidx();
@@ -239,8 +242,8 @@ public:
           set_ucb_args(newcb, args);
           init_ucb(proxy, cb->get_ucb(), addr, start_ts, req_sz);
         }
-        cb->gtid_ = (pnio_group_id<<32) + thread_id;
-        pkt_id_ptr = &cb->pkt_id_;
+        ucb->gtid_ = (pnio_group_id<<32) + thread_id;
+        pkt_id_ptr = &ucb->pkt_id_;
       }
       IGNORE_RETURN snprintf(rpc_timeguard_str, sizeof(rpc_timeguard_str), "sz=%ld,pcode=%x,id=%ld", req_sz, pcode, src_tenant_id);
       timeguard.click(rpc_timeguard_str);

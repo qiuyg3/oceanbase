@@ -13,10 +13,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/expr/ob_expr_repeat.h"
 
-#include <limits.h>
-#include <string.h>
 
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 
@@ -102,7 +99,7 @@ int ObExprRepeat::calc_result_type2(ObExprResType &type,
     }
   }
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(aggregate_charsets_for_string_result(type, &text, 1, type_ctx.get_coll_type()))) {
+    if (OB_FAIL(aggregate_charsets_for_string_result(type, &text, 1, type_ctx))) {
       LOG_WARN("failed to aggregate charsets for string result", K(ret));
     } else {
       text.set_calc_collation_level(type.get_collation_level());

@@ -24,6 +24,7 @@
 #include "lib/alloc/abit_set.h"
 #include "lib/allocator/ob_mod_define.h"
 #include "lib/list/ob_dlink_node.h"
+#include "lib/atomic/ob_atomic.h"
 
 #ifndef NDEBUG
 #define MEMCHK_LEVEL 1
@@ -60,6 +61,7 @@ static ssize_t get_page_size()
 
 class BlockSet;
 class ObjectSet;
+class ObjectSetV2;
 
 enum ObAllocPrio
 {
@@ -136,7 +138,8 @@ struct ObMemAttr
   uint64_t tenant_id_;
   ObLabel label_;
   uint64_t ctx_id_;
-  uint64_t sub_ctx_id_;
+  int32_t sub_ctx_id_;
+  int32_t numa_id_;
   ObAllocPrio prio_;
   explicit ObMemAttr(
     uint64_t tenant_id = common::OB_SERVER_TENANT_ID,
@@ -147,26 +150,31 @@ struct ObMemAttr
         label_(label),
         ctx_id_(ctx_id),
         sub_ctx_id_(ObSubCtxIds::MAX_SUB_CTX_ID),
+        numa_id_(0),
         prio_(prio),
         use_500_(false),
         expect_500_(true),
         ignore_version_(ObMemVersionNode::tl_ignore_node),
-        alloc_extra_info_(false)
+        use_malloc_v2_(false),
+        enable_malloc_hang_(false),
+        extra_size_(0)
   {}
   int64_t to_string(char* buf, const int64_t buf_len) const;
   bool use_500() const { return use_500_; }
   bool expect_500() const { return expect_500_; }
   bool ignore_version() const { return ignore_version_; }
 public:
-  union {
+  union { //FARM COMPAT WHITELIST
     char padding__[4];
     struct {
       struct {
         uint8_t use_500_ : 1;
         uint8_t expect_500_ : 1;
         uint8_t ignore_version_ : 1;
-        uint8_t alloc_extra_info_ : 1;
+        uint8_t use_malloc_v2_ : 1;
+        uint8_t enable_malloc_hang_ : 1;
       };
+      uint16_t extra_size_;
     };
   };
 };
@@ -244,9 +252,6 @@ struct AChunk {
   OB_INLINE int blk_offset(const ABlock *block) const;
   OB_INLINE int blk_nblocks(const ABlock *block) const;
   OB_INLINE char *blk_data(const ABlock *block) const;
-  OB_INLINE void mark_unused_blk_offset_bit(int offset);
-  OB_INLINE void unmark_unused_blk_offset_bit(int offset);
-  OB_INLINE bool is_all_blks_unused();
   union {
     uint32_t MAGIC_CODE_;
     struct {
@@ -255,6 +260,11 @@ struct AChunk {
       };
     };
   };
+#ifdef ENABLE_SANITY
+  void *ref_;
+#endif
+  int32_t numa_id_;
+  int32_t using_cnt_;
   BlockSet *block_set_;
   uint64_t washed_blks_;
   uint64_t washed_size_;
@@ -262,12 +272,43 @@ struct AChunk {
   AChunk *prev_, *next_; // ObTenantCtxAllocator's free_list or BlockSet's using_list
   AChunk *prev2_, *next2_; // ObTenantCtxAllocator's using_list
   ASimpleBitSet<MAX_BLOCKS_CNT> blk_bs_;
-  ASimpleBitSet<MAX_BLOCKS_CNT> unused_blk_bs_;
   char data_[0];
 } __attribute__ ((aligned (16)));
 
-
+class AObject;
+struct AObjectList
+{
+  struct Head {
+    int64_t cnt_      : 10;
+    int64_t addr_     : 54;
+  };
+  AObjectList()
+    : v_(0)
+  {}
+  void reset(AObject *obj, int64_t cnt)
+  {
+    Head h;
+    h.cnt_ = cnt;
+    h.addr_ = (int64_t)obj;
+    ATOMIC_BCAS(&v_, 0, *(int64_t*)&h);
+  }
+  void reset() { v_ = 0; }
+  int64_t push(AObject *obj);
+  AObject *popall(int64_t *cnt = NULL)
+  {
+    int64_t v = ATOMIC_TAS(&v_, 0);
+    Head *h = (Head*)&v;
+    if (NULL != cnt) *cnt = h->cnt_;
+    return (AObject*)h->addr_;
+  }
+  int64_t v_;
+};
 struct ABlock {
+  enum {
+    FULL,
+    PARTITIAL,
+    EMPTY,
+  };
   OB_INLINE ABlock();
   OB_INLINE AChunk *chunk() const;
   OB_INLINE void clear_magic_code();
@@ -282,14 +323,25 @@ struct ABlock {
         uint8_t in_use_ : 1;
         uint8_t is_large_ : 1;
         uint8_t is_washed_ : 1;
+        uint8_t status_ : 2;
+        uint8_t is_malloc_v2_ : 1;
       };
     };
   };
 
   uint64_t alloc_bytes_;
   uint32_t ablock_size_;
-  ObjectSet *obj_set_;
-  int64_t mem_context_;
+  union {
+    ObjectSet *obj_set_;
+    ObjectSetV2 *obj_set_v2_;
+  };
+  union {
+    struct {
+      int32_t sc_idx_;
+      int32_t max_cnt_;
+      AObjectList freelist_;
+    };
+  };
   ABlock *prev_, *next_;
 };
 
@@ -303,6 +355,15 @@ struct AObject {
   OB_INLINE uint64_t hold(uint32_t cells_per_block) const;
   OB_INLINE ObLabel label() const;
   OB_INLINE char *bt();
+  OB_INLINE void set_label(const char* label)
+  {
+    if (nullptr != label) {
+      STRNCPY(label_, label, AOBJECT_LABEL_SIZE);
+      label_[AOBJECT_LABEL_SIZE] = '\0';
+    } else {
+      MEMSET(label_, '\0', AOBJECT_LABEL_SIZE + 1);
+    }
+  }
 
   // members
   union {
@@ -331,6 +392,7 @@ struct AObject {
         uint8_t ignore_version_ : 1;
 
       };
+      ABlock *block_;
     };
   };
 
@@ -376,7 +438,7 @@ STATIC_ASSERT(ACHUNK_HEADER_SIZE < ACHUNK_PRESERVE_SIZE &&
               0 == (ACHUNK_HEADER_SIZE & (ABLOCK_ALIGN - 1)) &&
               0 == (ABLOCK_SIZE & (ABLOCK_ALIGN - 1)) &&
               AChunk::MAX_BLOCKS_CNT > BLOCKS_PER_CHUNK &&
-              ACHUNK_HEADER_SIZE >= BLOCKS_PER_CHUNK * ABLOCK_HEADER_SIZE &&
+              ACHUNK_HEADER_SIZE >= ACHUNK_PURE_HEADER_SIZE + BLOCKS_PER_CHUNK * ABLOCK_HEADER_SIZE &&
               0 == (ACHUNK_SIZE & (ABLOCK_SIZE - 1)), "meta check");
 
 inline uint64_t align_up(uint64_t x, uint64_t align)
@@ -391,6 +453,11 @@ inline uint64_t align_up2(uint64_t x, uint64_t align)
 
 AChunk::AChunk() :
     MAGIC_CODE_(ACHUNK_MAGIC_CODE),
+#ifdef ENABLE_SANITY
+    ref_(nullptr),
+#endif
+    numa_id_(0),
+    using_cnt_(0),
     block_set_(nullptr),
     washed_blks_(0), washed_size_(0), alloc_bytes_(0),
     prev_(this), next_(this),
@@ -445,33 +512,9 @@ void AChunk::mark_blk_offset_bit(int offset)
   blk_bs_.set(offset);
 }
 
-void AChunk::mark_unused_blk_offset_bit(int offset)
-{
-  unused_blk_bs_.set(offset);
-}
-
 void AChunk::unmark_blk_offset_bit(int offset)
 {
   blk_bs_.unset(offset);
-}
-
-void AChunk::unmark_unused_blk_offset_bit(int offset)
-{
-  unused_blk_bs_.unset(offset);
-}
-
-bool AChunk::is_all_blks_unused()
-{
-  bool ret = false;
-  if (0 != washed_size_) {
-    auto blk_bs = blk_bs_;
-    blk_bs.combine(unused_blk_bs_,
-          [](int64_t left, int64_t right) { return (left ^ right); });
-    ret = -1 == blk_bs.min_bit_ge(0);
-  } else {
-    ret = -1 == blk_bs_.min_bit_ge(1);
-  }
-  return ret;
 }
 
 ABlock *AChunk::offset2blk(int offset) const
@@ -527,11 +570,24 @@ char *AChunk::blk_data(const ABlock *block) const
   return (char*)this + ACHUNK_HEADER_SIZE + b_offset * ABLOCK_SIZE;
 }
 
+inline int64_t AObjectList::push(AObject *obj)
+{
+  int64_t ov = ATOMIC_LOAD(&v_);
+  Head nh;
+  nh.addr_ = (int64_t)obj;
+  do {
+    Head oh = *(Head*)&ov;
+    obj->next_ = (AObject*)oh.addr_;
+    nh.cnt_ = oh.cnt_ + 1;
+  } while (!ATOMIC_CMP_AND_EXCHANGE(&v_, &ov, *(int64_t*)&nh));
+  return nh.cnt_;
+}
+
 ABlock::ABlock() :
     MAGIC_CODE_(ABLOCK_MAGIC_CODE),
     alloc_bytes_(0),
     ablock_size_(0),
-    obj_set_(NULL), mem_context_(0),
+    obj_set_(NULL),
     prev_(this), next_(this)
 {}
 
@@ -574,7 +630,8 @@ char *ABlock::data() const
 AObject::AObject()
     : MAGIC_CODE_(FREE_AOBJECT_MAGIC_CODE),
       nobjs_(0), nobjs_prev_(0), obj_offset_(0),
-      alloc_bytes_(0), on_leak_check_(false), on_malloc_sample_(false)
+      alloc_bytes_(0), on_leak_check_(false), on_malloc_sample_(false),
+      block_(NULL)
 {
 }
 
@@ -602,7 +659,7 @@ bool AObject::is_last(uint32_t cells_per_block) const
 ABlock *AObject::block() const
 {
   AChunk *chunk = AChunk::ptr2chunk(this);
-  abort_unless(chunk->is_valid());
+  DEBUG_ASSERT(chunk->is_valid());
   ABlock *block = chunk->ptr2blk(this);
   return block;
 }
@@ -652,15 +709,23 @@ private:
 class ObMallocHookAttrGuard
 {
 public:
-  ObMallocHookAttrGuard(const ObMemAttr& attr);
+  ObMallocHookAttrGuard(const ObMemAttr& attr, const bool use_500 = true);
   ~ObMallocHookAttrGuard();
-  static ObMemAttr get_tl_mem_attr()
+  static ObMemAttr &get_tl_mem_attr()
   {
+    static thread_local ObMemAttr tl_mem_attr(OB_SERVER_TENANT_ID,
+                                              "glibc_malloc",
+                                              ObCtxIds::GLIBC);
     return tl_mem_attr;
   }
+  static bool &get_tl_use_500()
+  {
+    static __thread bool tl_use_500 = true;
+    return tl_use_500;
+  }
 private:
-  static thread_local ObMemAttr tl_mem_attr;
   ObMemAttr old_attr_;
+  bool old_use_500_;
 };
 
 class ObLightBacktraceGuard
@@ -690,13 +755,50 @@ private:
   const bool last_;
 };
 
-extern void inc_divisive_mem_size(const int64_t size);
-extern void dec_divisive_mem_size(const int64_t size);
-extern int64_t get_divisive_mem_size();
+class ObUnmanagedMemoryStat
+{
+public:
+  class DisableGuard
+  {
+  public:
+    DisableGuard()
+      : last_(tl_disabled())
+    {
+      tl_disabled() = true;
+    }
+    ~DisableGuard()
+    {
+      tl_disabled() = last_;
+    }
+    static bool &tl_disabled()
+    {
+      static __thread bool disabled = false;
+      return disabled;
+    }
+  private:
+    bool last_;
+  };
+  static ObUnmanagedMemoryStat &get_instance()
+  {
+    static ObUnmanagedMemoryStat instance;
+    return instance;
+  }
+  static bool is_disabled()
+  {
+    return DisableGuard::tl_disabled();
+  }
+  void inc(const int64_t size);
+  void dec(const int64_t size);
+  int64_t get_total_hold();
+private:
+  ObUnmanagedMemoryStat()
+  {}
+  int64_t hold_[OB_MAX_CPU_NUM];
+};
 
-extern void set_ob_mem_mgr_path();
-extern void unset_ob_mem_mgr_path();
-extern bool is_ob_mem_mgr_path();
+#define UNMAMAGED_MEMORY_STAT ObUnmanagedMemoryStat::get_instance()
+
+extern int64_t get_unmanaged_memory_size();
 
 extern void enable_memleak_light_backtrace(const bool);
 extern bool is_memleak_light_backtrace_enabled();

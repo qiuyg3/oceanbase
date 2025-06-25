@@ -12,23 +12,8 @@
 
 #define USING_LOG_PREFIX STORAGE
 
-#include <sys/resource.h>
-#include <sys/time.h>
-#include "common/object/ob_obj_compare.h"
-#include "common/sql_mode/ob_sql_mode_utils.h"
-#include "lib/stat/ob_diagnose_info.h"
-#include "lib/utility/ob_tracepoint.h"
-#include "storage/access/ob_multiple_scan_merge.h"
 #include "storage/access/ob_table_scan_iterator.h"
-#include "storage/access/ob_dml_param.h"
-#include "storage/access/ob_index_sstable_estimator.h"
 #include "storage/access/ob_sample_iter_helper.h"
-#include "storage/blocksstable/ob_storage_cache_suite.h"
-#include "storage/memtable/ob_memtable.h"
-#include "storage/tx_storage/ob_ls_map.h"
-#include "storage/tx_storage/ob_ls_service.h"
-#include "storage/tx/ob_trans_service.h"
-#include "storage/tablet/ob_tablet.h"
 
 namespace oceanbase
 {
@@ -39,6 +24,8 @@ using namespace oceanbase::share::schema;
 using namespace oceanbase::blocksstable;
 
 constexpr const char ObTableScanIterator::LABEL[];
+
+ERRSIM_POINT_DEF(ERRSIM_STORAGE_ITER_TRACE);
 
 ObTableScanIterator::ObTableScanIterator()
     : ObNewRowIterator(ObNewRowIterator::ObTableScanIterator),
@@ -53,6 +40,7 @@ ObTableScanIterator::ObTableScanIterator()
       row_sample_iterator_(NULL),
       block_sample_iterator_(NULL),
       // i_sample_iter_(NULL),
+      mview_merge_wrapper_(NULL),
       main_table_param_(),
       main_table_ctx_(),
       get_table_param_(),
@@ -81,6 +69,7 @@ void ObTableScanIterator::reset()
   reset_scan_iter(skip_scan_merge_);
   reset_scan_iter(memtable_row_sample_iterator_);
   reset_scan_iter(block_sample_iterator_);
+  reset_scan_iter(mview_merge_wrapper_);
   // reset_scan_iter(i_sample_iter_);
   if (nullptr != cached_iter_node_) {
     ObGlobalIteratorPool *iter_pool = MTL(ObGlobalIteratorPool*);
@@ -127,6 +116,7 @@ void ObTableScanIterator::reuse_row_iters()
   REUSE_SCAN_ITER(memtable_row_sample_iterator_);
   REUSE_SCAN_ITER(block_sample_iterator_);
   // REUSE_SCAN_ITER(i_sample_iter_);
+  REUSE_SCAN_ITER(mview_merge_wrapper_);
 
 #undef REUSE_SCAN_ITER
 }
@@ -134,10 +124,13 @@ void ObTableScanIterator::reuse_row_iters()
 int ObTableScanIterator::prepare_table_param(const ObTabletHandle &tablet_handle)
 {
   int ret = OB_SUCCESS;
-  if (nullptr == scan_param_ || nullptr == scan_param_->table_param_) {
+  const ObTablet *tablet = tablet_handle.get_obj();
+  if (OB_ISNULL(scan_param_)
+      || OB_ISNULL(scan_param_->table_param_)
+      || OB_ISNULL(tablet)) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "Invalid argument", K(ret), KP(scan_param_));
-  } else if (OB_FAIL(main_table_param_.init(*scan_param_, tablet_handle))) {
+    STORAGE_LOG(WARN, "invalid args", K(ret), KP(scan_param_), K(tablet_handle));
+  } else if (OB_FAIL(main_table_param_.init(*scan_param_, &tablet_handle))) {
     STORAGE_LOG(WARN, "failed to init main table param", K(ret));
   } else if (nullptr != cached_iter_node_) {
     main_table_param_.set_use_global_iter_pool();
@@ -156,10 +149,14 @@ bool ObTableScanIterator::can_use_global_iter_pool(const ObQRIterType iter_type)
              main_table_param_.iter_param_.is_use_column_store() ||
              main_table_param_.iter_param_.enable_pd_aggregate() ||
              main_table_param_.iter_param_.enable_pd_group_by() ||
-             main_table_param_.iter_param_.has_lob_column_out_) {
+             main_table_param_.iter_param_.is_column_replica_table_ ||
+             main_table_param_.iter_param_.has_lob_column_out_ ||
+             scan_param_->is_mview_query()) {
   } else {
     const int64_t table_cnt = get_table_param_.tablet_iter_.table_iter()->count();
-    const int64_t col_cnt = main_table_param_.get_max_out_col_cnt();
+    int64_t col_cnt = MAX(scan_param_->table_param_->get_read_info().get_schema_column_count(),
+                          get_table_param_.tablet_iter_.get_tablet()->get_rowkey_read_info().get_schema_column_count());
+    col_cnt += scan_param_->table_param_->get_access_virtual_col_cnt();
     ObGlobalIteratorPool *iter_pool = MTL(ObGlobalIteratorPool*);
     if (OB_NOT_NULL(iter_pool)) {
        use_pool = iter_pool->can_use_iter_pool(table_cnt, col_cnt, iter_type);
@@ -189,17 +186,23 @@ int ObTableScanIterator::prepare_cached_iter_node()
 
 void ObTableScanIterator::try_release_cached_iter_node(const ObQRIterType rescan_iter_type)
 {
-  if (nullptr != cached_iter_node_ && current_iter_type_ != rescan_iter_type) {
-    STORAGE_LOG(INFO, "iter type is changed in rescan", KPC(cached_iter_node_),
-      K(current_iter_type_), K(rescan_iter_type), KP(cached_iter_),
-      KP(single_merge_), KP(get_merge_), KP(scan_merge_), KP(multi_scan_merge_));
-    main_table_param_.diable_use_global_iter_pool();
-    main_table_ctx_.reset_cached_iter_node();
-    MTL(ObGlobalIteratorPool*)->release(cached_iter_node_);
-    cached_iter_node_ = nullptr;
-    current_iter_type_ = T_INVALID_ITER_TYPE;
-    if (nullptr != cached_iter_) {
-      *cached_iter_ = nullptr;
+  if (nullptr != cached_iter_node_) {
+    const int64_t table_cnt = get_table_param_.tablet_iter_.table_iter()->count();
+    const int64_t col_cnt = get_table_param_.tablet_iter_.get_tablet()->get_rowkey_read_info().get_request_count();
+    bool use_pool = current_iter_type_ == rescan_iter_type &&
+                    MTL(ObGlobalIteratorPool*)->can_use_iter_pool(table_cnt, col_cnt, rescan_iter_type);
+    if (!use_pool) {
+      STORAGE_LOG(INFO, "iter type/table cnt/col cnt is changed in rescan, disable global cache", KPC(cached_iter_node_),
+        K(table_cnt), K(col_cnt), K(current_iter_type_), K(rescan_iter_type), KP(cached_iter_),
+        KP(single_merge_), KP(get_merge_), KP(scan_merge_), KP(multi_scan_merge_));
+      main_table_param_.diable_use_global_iter_pool();
+      main_table_ctx_.reset_cached_iter_node();
+      MTL(ObGlobalIteratorPool*)->release(cached_iter_node_);
+      cached_iter_node_ = nullptr;
+      current_iter_type_ = T_INVALID_ITER_TYPE;
+      if (nullptr != cached_iter_) {
+        *cached_iter_ = nullptr;
+      }
     }
   }
 }
@@ -207,9 +210,9 @@ void ObTableScanIterator::try_release_cached_iter_node(const ObQRIterType rescan
 int ObTableScanIterator::prepare_table_context()
 {
   int ret = OB_SUCCESS;
-  if (nullptr == scan_param_ || nullptr == scan_param_->table_param_) {
+  if (OB_ISNULL(scan_param_) || OB_ISNULL(scan_param_->table_param_)) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "Invalid argument", K(ret), KP(scan_param_));
+    STORAGE_LOG(WARN, "invalid args", K(ret), KP(scan_param_));
   } else {
     ObVersionRange trans_version_range;
     trans_version_range.multi_version_start_ = 0;
@@ -220,12 +223,24 @@ int ObTableScanIterator::prepare_table_context()
       STORAGE_LOG(WARN, "trans version range is not valid", K(ret), K(trans_version_range));
     } else if (OB_FAIL(main_table_ctx_.init(*scan_param_, ctx_guard_.get_store_ctx(), trans_version_range, cached_iter_node_))) {
       STORAGE_LOG(WARN, "failed to init main table ctx", K(ret));
+    } else if (scan_param_->is_mview_query()) {
+      const ObTabletMeta &tablet_meta = get_table_param_.tablet_iter_.get_tablet()->get_tablet_meta();
+      if (OB_ISNULL(main_table_param_.op_filters_) || scan_param_->table_param_->use_lob_locator()) {
+        ret = OB_ERR_UNEXPECTED;
+        STORAGE_LOG(WARN, "Unexpected null scn filter or use lob locator in mview query", K(ret), KP(main_table_param_.op_filters_),
+                    K(scan_param_->table_param_->use_lob_locator()));
+      } else if (OB_FAIL(main_table_ctx_.init_mview_scan_info(tablet_meta.multi_version_start_,
+                                                              main_table_param_.op_filters_,
+                                                              main_table_param_.get_op()->get_eval_ctx()))) {
+        STORAGE_LOG(WARN, "failed to init mview scan info", K(ret));
+      }
     }
   }
   return ret;
 }
 
-int ObTableScanIterator::switch_scan_param(ObMultipleMerge &iter)
+template<typename T>
+int ObTableScanIterator::switch_scan_param(T &iter)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(iter.switch_param(main_table_param_, main_table_ctx_, get_table_param_))) {
@@ -273,9 +288,16 @@ int ObTableScanIterator::rescan(ObTableScanParam &scan_param)
     // there's no need to reset main_table_param_ and table_ctx
     // scan_param only reset query range fields in ObTableScan::rt_rescan()
     ObQRIterType rescan_iter_type = T_INVALID_ITER_TYPE;
-    if (OB_FAIL(main_table_ctx_.rescan_reuse(scan_param))) {
+    const ObTablet *tablet = get_table_param_.tablet_iter_.get_tablet_handle().get_obj();
+    bool is_tablet_spliting = false;
+    if (OB_ISNULL(tablet)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tablet is null", K(ret), K(scan_param_));
+    } else if (OB_FAIL(ObTabletSplitMdsHelper::get_is_spliting(*tablet, is_tablet_spliting))) {
+      STORAGE_LOG(WARN, "Fail to get tablet spliting status", K(ret));
+    } else if (OB_FAIL(main_table_ctx_.rescan_reuse(scan_param))) {
       STORAGE_LOG(WARN, "Failed to rescan reuse", K(ret));
-    } else if (OB_FAIL(table_scan_range_.init(*scan_param_))) {
+    } else if (OB_FAIL(table_scan_range_.init(*scan_param_, *tablet, is_tablet_spliting))) {
       STORAGE_LOG(WARN, "Failed to init table scan range", K(ret));
     } else if (OB_FAIL(rescan_for_iter())) {
       STORAGE_LOG(WARN, "Failed to switch param for iter", K(ret), K(*this));
@@ -291,9 +313,10 @@ int ObTableScanIterator::rescan(ObTableScanParam &scan_param)
   return ret;
 }
 
-int ObTableScanIterator::init(ObTableScanParam &scan_param, const ObTabletHandle &tablet_handle)
+int ObTableScanIterator::init(ObTableScanParam &scan_param, const ObTabletHandle &tablet_handle, const bool need_split_dst_table)
 {
   int ret = OB_SUCCESS;
+  bool is_tablet_spliting = false;
   ACTIVE_GLOBAL_ITERATOR_GUARD(ret, cached_iter_node_);
   ObStoreCtx &store_ctx = ctx_guard_.get_store_ctx();
   if (OB_UNLIKELY(is_inited_)) {
@@ -305,12 +328,15 @@ int ObTableScanIterator::init(ObTableScanParam &scan_param, const ObTabletHandle
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "Invalid argument to init table scan iter", K(ret), K(store_ctx), K(scan_param),
         K(tablet_handle));
-  } else if (OB_FAIL(table_scan_range_.init(scan_param))) {
+  } else if (OB_FAIL(ObTabletSplitMdsHelper::get_is_spliting(*tablet_handle.get_obj(), is_tablet_spliting))) {
+    STORAGE_LOG(WARN, "Fail to get tablet spliting status", K(ret));
+  } else if (OB_FAIL(table_scan_range_.init(scan_param, *tablet_handle.get_obj(), is_tablet_spliting))) {
     STORAGE_LOG(WARN, "Failed to init table scan range", K(ret), K(scan_param));
   } else if (OB_FAIL(table_scan_range_.get_query_iter_type(current_iter_type_))) {
     STORAGE_LOG(WARN, "Failed to get query iter type", K(ret));
   } else {
     scan_param_ = &scan_param;
+    get_table_param_.need_split_dst_table_ = need_split_dst_table;
     if (OB_FAIL(get_table_param_.tablet_iter_.set_tablet_handle(tablet_handle))) {
       STORAGE_LOG(WARN, "Fail to set tablet handle to iter", K(ret));
     } else if (OB_FAIL(prepare_table_param(tablet_handle))) {
@@ -329,9 +355,10 @@ int ObTableScanIterator::init(ObTableScanParam &scan_param, const ObTabletHandle
   return ret;
 }
 
-int ObTableScanIterator::switch_param(ObTableScanParam &scan_param, const ObTabletHandle &tablet_handle)
+int ObTableScanIterator::switch_param(ObTableScanParam &scan_param, const ObTabletHandle &tablet_handle, const bool need_split_dst_table)
 {
   int ret = OB_SUCCESS;
+  bool is_tablet_spliting = false;
   ACTIVE_GLOBAL_ITERATOR_GUARD(ret, cached_iter_node_);
   ObStoreCtx &store_ctx = ctx_guard_.get_store_ctx();
   ObQRIterType rescan_iter_type = T_INVALID_ITER_TYPE;
@@ -343,15 +370,18 @@ int ObTableScanIterator::switch_param(ObTableScanParam &scan_param, const ObTabl
           || OB_UNLIKELY(!tablet_handle.is_valid()))) {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "Invalid argument, ", K(ret), K(store_ctx), K(scan_param), K(tablet_handle));
-  } else if (OB_FAIL(table_scan_range_.init(scan_param))) {
+  } else if (OB_FAIL(ObTabletSplitMdsHelper::get_is_spliting(*tablet_handle.get_obj(), is_tablet_spliting))) {
+    STORAGE_LOG(WARN, "Fail to get tablet spliting status", K(ret));
+  } else if (OB_FAIL(table_scan_range_.init(scan_param, *tablet_handle.get_obj(), is_tablet_spliting))) {
     STORAGE_LOG(WARN, "Failed to init table scan range", K(ret), K(scan_param));
   } else if (OB_FAIL(table_scan_range_.get_query_iter_type(rescan_iter_type))) {
     STORAGE_LOG(WARN, "Failed to get query iter type", K(ret));
-  } else if (FALSE_IT(try_release_cached_iter_node(rescan_iter_type))) {
   } else {
     scan_param_ = &scan_param;
+    get_table_param_.need_split_dst_table_ = need_split_dst_table;
     if (OB_FAIL(get_table_param_.tablet_iter_.set_tablet_handle(tablet_handle))) {
       STORAGE_LOG(WARN, "Fail to set tablet handle to iter", K(ret));
+    } else if (FALSE_IT(try_release_cached_iter_node(rescan_iter_type))) {
     } else if (OB_FAIL(prepare_table_param(tablet_handle))) {
       STORAGE_LOG(WARN, "Fail to prepare table param, ", K(ret));
     } else if (OB_FAIL(prepare_table_context())) {
@@ -386,6 +416,7 @@ int ObTableScanIterator::rescan_for_iter()
     RESET_NOT_REFRESHED_ITER(get_table_param_.refreshed_merge_, skip_scan_merge_);
     RESET_NOT_REFRESHED_ITER(get_table_param_.refreshed_merge_, memtable_row_sample_iterator_);
     RESET_NOT_REFRESHED_ITER(get_table_param_.refreshed_merge_, block_sample_iterator_);
+    RESET_NOT_REFRESHED_ITER(get_table_param_.refreshed_merge_, mview_merge_wrapper_);
     get_table_param_.refreshed_merge_ = nullptr;
   }
 #undef RESET_NOT_REFRESHED_ITER
@@ -410,6 +441,11 @@ int ObTableScanIterator::switch_param_for_iter()
   SWITCH_PARAM_FOR_ITER(multi_scan_merge_, ret);
   SWITCH_PARAM_FOR_ITER(skip_scan_merge_, ret);
 #undef SWITCH_PARAM_FOR_ITER
+  if (OB_SUCC(ret) && nullptr != mview_merge_wrapper_) {
+    if (OB_FAIL(mview_merge_wrapper_->switch_param(main_table_param_, main_table_ctx_, get_table_param_))) {
+      STORAGE_LOG(WARN, "Failed to switch param", K(ret));
+    }
+  }
   return ret;
 }
 
@@ -499,7 +535,15 @@ int ObTableScanIterator::open_iter()
   } else {
     get_table_param_.frozen_version_ = scan_param_->frozen_version_;
     get_table_param_.sample_info_ = scan_param_->sample_info_;
-    if (table_scan_range_.is_get()) {
+    if (main_table_ctx_.is_mview_query()) {
+      ObMviewMerge *mview_merge = nullptr;
+      if (OB_FAIL(ObMviewMergeWrapper::alloc_mview_merge(main_table_param_, main_table_ctx_, get_table_param_,
+                                                         table_scan_range_,  mview_merge_wrapper_, mview_merge))) {
+        STORAGE_LOG(WARN, "Failed to alloc mview merge", K(ret));
+      } else {
+        main_iter_ = mview_merge;
+      }
+    } else if (table_scan_range_.is_get()) {
       if (OB_FAIL(init_and_open_get_merge_iter_())) {
         STORAGE_LOG(WARN, "init and open get merge iterator failed", KR(ret));
       }
@@ -542,7 +586,7 @@ int ObTableScanIterator::sort_sample_ranges()
   if (OB_UNLIKELY(!datum_utils.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "Unexpected error for invalid datum utils", K(ret), KPC(scan_param_->table_param_));
-  } else if (sample_ranges_.count() > 1 && scan_param_->scan_flag_.is_ordered_scan()) {
+  } else if (sample_ranges_.count() > 1 && scan_param_->scan_flag_.is_support_sort_scan()) {
     ObDatumComparor<ObDatumRange> comparor(datum_utils, ret, scan_param_->scan_flag_.is_reverse_scan());
     lib::ob_sort(sample_ranges_.begin(), sample_ranges_.end(), comparor);
     if (OB_FAIL(ret)) {
@@ -573,7 +617,7 @@ int ObTableScanIterator::init_and_open_scan_merge_iter_()
         INIT_AND_OPEN_ITER(multi_scan_merge_, sample_ranges_, false);
         if (OB_FAIL(ret)) {
         } else if (scan_param_->sample_info_.is_row_sample()) {
-          // Row sample is scan, do not need extra iterator.
+          // Row Sample and Hybrid Sample are scan, do not need extra iterator.
         } else {
           if (OB_FAIL(
                   sample_iter_helper.get_sample_iter(memtable_row_sample_iterator_, main_iter_, multi_scan_merge_))) {
@@ -621,6 +665,8 @@ int ObTableScanIterator::get_next_row(ObNewRow *&row)
 int ObTableScanIterator::get_next_row(blocksstable::ObDatumRow *&row)
 {
   ACTIVE_SESSION_FLAG_SETTER_GUARD(in_storage_read);
+  ObASHTabletIdSetterGuard ash_tablet_id_guard(scan_param_ != nullptr? scan_param_->tablet_id_.id() : 0);
+  ACTIVE_SESSION_RETRY_DIAG_INFO_SETTER(tablet_id_, scan_param_ != nullptr? scan_param_->tablet_id_.id() : 0);
   int ret = OB_SUCCESS;
   ACTIVE_GLOBAL_ITERATOR_GUARD(ret, cached_iter_node_);
   if (OB_UNLIKELY(!is_inited_)) {
@@ -629,7 +675,6 @@ int ObTableScanIterator::get_next_row(blocksstable::ObDatumRow *&row)
   } else if (OB_ISNULL(main_iter_)) {
     ret = OB_ITER_END;
   } else {
-    ObDatum *trans_info_datums = nullptr;
     if (scan_param_->op_ != nullptr) {
       scan_param_->op_->clear_datum_eval_flag();
       scan_param_->op_->reset_trans_info_datum();
@@ -654,6 +699,8 @@ int ObTableScanIterator::get_next_row(blocksstable::ObDatumRow *&row)
 int ObTableScanIterator::get_next_rows(int64_t &count, int64_t capacity)
 {
   ACTIVE_SESSION_FLAG_SETTER_GUARD(in_storage_read);
+  ObASHTabletIdSetterGuard ash_tablet_id_guard(scan_param_ != nullptr? scan_param_->tablet_id_.id() : 0);
+  ACTIVE_SESSION_RETRY_DIAG_INFO_SETTER(tablet_id_, scan_param_ != nullptr? scan_param_->tablet_id_.id() : 0);
   int ret = OB_SUCCESS;
   ACTIVE_GLOBAL_ITERATOR_GUARD(ret, cached_iter_node_);
   if (IS_NOT_INIT) {
@@ -662,7 +709,6 @@ int ObTableScanIterator::get_next_rows(int64_t &count, int64_t capacity)
   } else if (OB_ISNULL(main_iter_)) {
     ret = OB_ITER_END;
   } else {
-    ObDatum *trans_info_datums = nullptr;
     if (scan_param_->op_ != nullptr) {
       scan_param_->op_->clear_datum_eval_flag();
       scan_param_->op_->reset_trans_info_datum();
@@ -717,6 +763,11 @@ int ObTableScanIterator::check_txn_status_if_read_uncommitted_()
     }
   }
   return ret;
+}
+
+bool ObTableScanIterator::need_trace() const
+{
+  return OB_SUCCESS != ERRSIM_STORAGE_ITER_TRACE;
 }
 
 } // namespace storage

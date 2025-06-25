@@ -12,16 +12,8 @@
 
 #define USING_LOG_PREFIX SERVER_OMT
 #include "ob_tenant_config_mgr.h"
-#include "lib/thread/thread_mgr.h"
 #include "observer/ob_sql_client_decorator.h"
 #include "observer/ob_server_struct.h"
-#include "share/config/ob_common_config.h"
-#include "ob_multi_tenant.h"
-#include "ob_tenant.h"
-#include "share/ob_rpc_struct.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
-#include "share/schema/ob_multi_version_schema_service.h"
-#include "common/ob_tenant_data_version_mgr.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::share;
@@ -51,6 +43,13 @@ void ObTenantConfigGuard::set_config(ObTenantConfig *config)
     config_->unref();
   }
   config_ = config;
+}
+
+void ObTenantConfigGuard::trace_all_config() const
+{
+  if (OB_NOT_NULL(config_)) {
+    config_->trace_all_config();
+  }
 }
 
 int TenantConfigInfo::assign(const TenantConfigInfo &rhs)
@@ -206,16 +205,16 @@ int ObTenantConfigMgr::refresh_tenants(const ObIArray<uint64_t> &tenants)
         } else {
           // periodically(10s) check that ObTenantDataVersionMgr doesn't fall behind ObTenantConfigMgr
           bool value_updated = (*config)->compatible.value_updated();
+          int tmp_ret = OB_SUCCESS;
+          const uint64_t data_version = (*config)->compatible;
           if (value_updated) {
-            int tmp_ret = OB_SUCCESS;
-            const uint64_t data_version = (*config)->compatible;
             if (OB_TMP_FAIL(ODV_MGR.set(tenant_id, data_version))) {
               LOG_WARN("fail to set data_version in refresh_tenants", KR(tmp_ret), K(tenant_id),
-                       K(data_version));
+                       KDV(data_version));
             }
-            LOG_INFO("[DATA_VERSION] periodically update data_version", KR(tmp_ret), K(tenant_id),
-                     K(data_version));
           }
+          LOG_INFO("[DATA_VERSION] periodically update data_version", KR(tmp_ret), K(tenant_id),
+                   K(value_updated), KDV(data_version));
         }
       }
     }
@@ -253,8 +252,10 @@ int ObTenantConfigMgr::refresh_tenants(const ObIArray<uint64_t> &tenants)
     }
   }
   // 删 config
+  // use timeout to avoid holding the write lock of ObTenantConfigMgr::rwlock_ for too long
+  int64_t delete_abs_timeout_us = ObTimeUtility::current_time() + 500 * 1000;
   for (int i = 0; i < del_tenants.count(); ++i) {
-    if (OB_TMP_FAIL(del_tenant_config(del_tenants.at(i)))) {
+    if (OB_TMP_FAIL(del_tenant_config(del_tenants.at(i), delete_abs_timeout_us))) {
       LOG_WARN("fail del tenant config, will try later", K(i), K(del_tenants.at(i)), K(ret), K(tmp_ret));
     } else {
       LOG_INFO("del dropped tenant config succ.", K(i), K(del_tenants.at(i)));
@@ -278,7 +279,7 @@ int ObTenantConfigMgr::init_tenant_config(const obrpc::ObTenantConfigArg &arg)
   } else {
     DRWLock::WRLockGuard guard(rwlock_);
     ObTenantConfig *config = nullptr;
-    if (OB_FAIL(dump2file())) {
+    if (OB_FAIL(dump2file_unsafe())) {
       LOG_WARN("fail to dump config to file", KR(ret), K(arg));
     } else if (OB_FAIL(config_map_.get_refactored(ObTenantID(arg.tenant_id_), config))) {
       LOG_WARN("No tenant config found", K(arg.tenant_id_), K(ret));
@@ -322,7 +323,7 @@ int ObTenantConfigMgr::add_tenant_config(uint64_t tenant_id)
   return ret;
 }
 
-int ObTenantConfigMgr::del_tenant_config(uint64_t tenant_id)
+int ObTenantConfigMgr::del_tenant_config(uint64_t tenant_id, const int64_t abs_timeout_us)
 {
   int ret = OB_SUCCESS;
   ObTenantConfig *config = nullptr;
@@ -346,7 +347,7 @@ int ObTenantConfigMgr::del_tenant_config(uint64_t tenant_id)
     LOG_WARN("local tenant resource still exist, try to delete tenant config later", K(tenant_id));
   } else {
     config->set_deleting();
-    if (OB_FAIL(wait(config->get_update_task()))) {
+    if (OB_FAIL(wait(config->get_update_task(), abs_timeout_us))) {
       LOG_WARN("wait tenant config update task failed", K(ret), K(tenant_id));
     } else if (OB_FAIL(config_map_.erase_refactored(ObTenantID(tenant_id)))) {
       LOG_WARN("delete tenant config failed", K(ret), K(tenant_id));
@@ -432,15 +433,21 @@ void ObTenantConfigMgr::print() const
   } // for
 }
 
-int ObTenantConfigMgr::dump2file()
+int ObTenantConfigMgr::dump2file_unsafe()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(sys_config_mgr_->dump2file())) {
+  if (OB_FAIL(sys_config_mgr_->dump2file_unsafe())) {
     LOG_WARN("failed to dump2file", K(ret));
   } else if (OB_FAIL(sys_config_mgr_->config_backup())) {
     LOG_WARN("failed to dump2file backup", K(ret));
   }
   return ret;
+}
+
+int ObTenantConfigMgr::dump2file()
+{
+  DRWLock::RDLockGuard guard(rwlock_);
+  return dump2file_unsafe();
 }
 
 int ObTenantConfigMgr::set_tenant_config_version(uint64_t tenant_id, int64_t version)
@@ -556,7 +563,7 @@ int ObTenantConfigMgr::get_all_tenant_config_info(
                    VersionUtil::print_version_str(
                        dv_buf, OB_SERVER_VERSION_LENGTH, data_version)) {
           ret = OB_INVALID_ARGUMENT;
-          LOG_ERROR("fail to print data_version", K(ret), K(tenant_id), K(data_version));
+          LOG_ERROR("fail to print data_version", K(ret), K(tenant_id), KDV(data_version));
         } else {
           if (OB_FAIL(config_info.set_value(dv_buf))) {
             LOG_WARN("set value fail", K(ret), K(tenant_id), K(data_version), K(dv_buf));
@@ -663,10 +670,10 @@ int ObTenantConfigMgr::add_config_to_existing_tenant(const char *config_str)
     for (; it != config_map_.end() && OB_SUCC(ret); ++it) {
       if (OB_NOT_NULL(it->second)) {
         int64_t version = ObTimeUtility::current_time();
-        if (OB_FAIL(it->second->add_extra_config(config_str, version))) {
+        if (OB_FAIL(it->second->add_extra_config_unsafe(config_str, version))) {
           LOG_WARN("add tenant extra config failed", "tenant_id", it->second->get_tenant_id(),
                    "config_str", config_str, KR(ret));
-        } else if (OB_FAIL(dump2file())) {
+        } else if (OB_FAIL(dump2file_unsafe())) {
           LOG_WARN("fail to dump config to file", KR(ret), K(config_str));
         } else if (OB_FAIL(it->second->publish_special_config_after_dump())) {
           LOG_WARN("fail to publish config after dump", KR(ret), K(config_str));
@@ -689,7 +696,7 @@ int ObTenantConfigMgr::add_extra_config(const obrpc::ObTenantConfigArg &arg)
     if (OB_FAIL(config_map_.get_refactored(ObTenantID(arg.tenant_id_), config))) {
       LOG_ERROR("failed to get tenant config", K(arg.tenant_id_), K(ret));
     } else {
-      ret = config->add_extra_config(arg.config_str_.ptr());
+      ret = config->add_extra_config_unsafe(arg.config_str_.ptr());
     }
   }
   FLOG_INFO("add tenant extra config", K(arg));
@@ -717,23 +724,27 @@ int ObTenantConfigMgr::cancel(const ObTenantConfig::TenantConfigUpdateTask &task
   return ret;
 }
 
-int ObTenantConfigMgr::wait(const ObTenantConfig::TenantConfigUpdateTask &task)
+int ObTenantConfigMgr::wait(const ObTenantConfig::TenantConfigUpdateTask &task, const int64_t abs_timeout_us)
 {
   int ret = OB_EAGAIN;
-  const int try_times = 300;
+  const int try_times = 30;
   const int64_t period = 10000;
   ret = OB_EAGAIN;
-  for (int i = 0; i < try_times; ++i) {
+  bool has_timeout = false;
+  for (int i = 0; i < try_times && !has_timeout; ++i) {
     if (ATOMIC_LOAD(&task.running_task_count_) > 0) {
       // wait running task finish
     } else {
       ret = OB_SUCCESS;
       break;
     }
+    if (ObTimeUtility::current_time() >= abs_timeout_us) {
+      has_timeout = true;
+    }
     ob_usleep(period);
   }  // for
   if (OB_EAGAIN == ret) {
-    LOG_WARN("wait running update task failed, try later", K(ret), K(ATOMIC_LOAD(&task.running_task_count_)));
+    LOG_WARN("wait running update task failed, try later", K(ret), K(ATOMIC_LOAD(&task.running_task_count_)), K(abs_timeout_us));
   }
   return ret;
 }

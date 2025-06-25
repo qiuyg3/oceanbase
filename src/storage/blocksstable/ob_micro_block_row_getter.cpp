@@ -12,15 +12,9 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_micro_block_row_getter.h"
-#include "ob_macro_block_reader.h"
-#include "index_block/ob_index_block_row_scanner.h"
 #include "storage/access/ob_sstable_row_getter.h"
-#include "storage/access/ob_index_tree_prefetcher.h"
-#include "storage/blocksstable/ob_sstable.h"
 #include "storage/blocksstable/ob_storage_cache_suite.h"
-#include "storage/blocksstable/cs_encoding/ob_micro_block_cs_decoder.h"
-#include "lib/statistic_event/ob_stat_event.h"
-#include "lib/stat/ob_diagnose_info.h"
+#include "storage/truncate_info/ob_truncate_partition_filter.h"
 
 namespace oceanbase
 {
@@ -265,11 +259,9 @@ int ObMicroBlockRowGetter::get_row(
   return ret;
 }
 
-int ObMicroBlockRowGetter::get_block_row(
-    ObSSTableReadHandle &read_handle,
-    ObMacroBlockReader &block_reader,
-    const ObDatumRow *&store_row
-)
+int ObMicroBlockRowGetter::get_block_row(ObSSTableReadHandle &read_handle,
+                                         ObMacroBlockReader &block_reader,
+                                         const ObDatumRow *&store_row)
 {
   int ret = OB_SUCCESS;
   ObMicroBlockData block_data;
@@ -287,20 +279,20 @@ int ObMicroBlockRowGetter::get_block_row(
     if (store_row->row_flag_.is_not_exist()) {
       ++context_->table_store_stat_.empty_read_cnt_;
       EVENT_INC(ObStatEventIds::GET_ROW_EMPTY_READ);
-      if (!context_->query_flag_.is_index_back()
-          && context_->query_flag_.is_use_bloomfilter_cache()
+      if (!context_->query_flag_.is_index_back() && context_->query_flag_.is_use_bloomfilter_cache()
           && !sstable_->is_small_sstable()) {
-        (void) OB_STORE_CACHE.get_bf_cache().inc_empty_read(
-            MTL_ID(),
-            param_->table_id_,
-            read_handle.micro_handle_->macro_block_id_,
-            read_handle.get_rowkey().get_datum_cnt());
+        (void)OB_STORE_CACHE.get_bf_cache().inc_empty_read(MTL_ID(),
+                                                           param_->table_id_,
+                                                           param_->ls_id_,
+                                                           sstable_->get_key(),
+                                                           read_handle.micro_handle_->macro_block_id_,
+                                                           read_handle.get_rowkey().get_datum_cnt(),
+                                                           &read_handle);
       }
     } else {
       EVENT_INC(ObStatEventIds::GET_ROW_EFFECT_READ);
     }
   }
-
 
   return ret;
 }
@@ -387,6 +379,11 @@ int ObMicroBlockRowGetter::inner_get_row(
       }
     } else {
       row = &row_;
+      if (OB_UNLIKELY(!sstable_->is_major_sstable() &&
+                      IF_NEED_CHECK_BASE_VERSION_FILTER(context_) &&
+                      OB_FAIL(context_->check_filtered_by_base_version(row_)))) {
+        TRANS_LOG(WARN, "check base version filter fail", K(ret));
+      }
       LOG_DEBUG("Success to get row", K(ret), K(rowkey), K(row_), KPC_(read_info),
                 K(context_->enable_put_row_cache()), K(context_->use_fuse_row_cache_), K(macro_id));
     }
@@ -403,7 +400,7 @@ int ObMicroBlockRowGetter::inner_get_row(
       //put row cache, ignore fail
       ObRowCacheKey row_cache_key(
           MTL_ID(),
-          param_->tablet_id_,
+          sstable_->get_key().get_tablet_id(),
           rowkey,
           read_info_->get_datum_utils(),
           sstable_->get_data_version(),

@@ -12,19 +12,10 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_px_rpc_processor.h"
-#include "ob_px_sub_coord.h"
-#include "ob_px_task_process.h"
-#include "ob_px_admission.h"
 #include "ob_px_sqc_handler.h"
-#include "lib/signal/ob_signal_struct.h"
-#include "lib/ash/ob_active_session_guard.h"
 #include "sql/executor/ob_executor_rpc_processor.h"
-#include "sql/dtl/ob_dtl_channel_group.h"
-#include "storage/memtable/ob_lock_wait_mgr.h"
 #include "sql/engine/px/ob_px_target_mgr.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
-#include "sql/dtl/ob_dtl_basic_channel.h"
-#include "share/detect/ob_detect_callback.h"
 #include "share/detect/ob_detect_manager_utils.h"
 
 using namespace oceanbase::common;
@@ -39,6 +30,8 @@ int ObInitSqcP::init()
     LOG_WARN("unexpected sqc handler", K(ret));
   } else if (OB_FAIL(sqc_handler->init())) {
     LOG_WARN("Failed to init sqc handler", K(ret));
+    sqc_handler->reset();
+    op_reclaim_free(sqc_handler);
   } else {
     arg_.sqc_handler_ = sqc_handler;
     arg_.sqc_handler_->reset_reference_count(); //设置sqc_handler的引用计数为1.
@@ -58,12 +51,11 @@ void ObInitSqcP::destroy()
     int report_ret = OB_SUCCESS;
     ObPxSqcHandler::release_handler(arg_.sqc_handler_, report_ret);
   }
-  ObActiveSessionGuard::setup_default_ash();
 }
 
 int ObInitSqcP::process()
 {
-  ObActiveSessionGuard::get_stat().in_px_execution_ = true;
+  GET_DIAGNOSTIC_INFO->get_ash_stat().in_px_execution_ = true;
   int ret = OB_SUCCESS;
   LOG_TRACE("receive dfo", K_(arg));
   ObPxSqcHandler *sqc_handler = arg_.sqc_handler_;
@@ -95,6 +87,9 @@ int ObInitSqcP::process()
     LOG_WARN("fail to do thread auto scaling", K(ret), K(result_.reserved_thread_count_));
   } else if (result_.reserved_thread_count_ <= 0) {
     ret = OB_ERR_INSUFFICIENT_PX_WORKER;
+    ACTIVE_SESSION_RETRY_DIAG_INFO_SETTER(dop_, sqc_handler->get_phy_plan().get_px_dop());
+    ACTIVE_SESSION_RETRY_DIAG_INFO_SETTER(required_px_workers_number_, 1);
+    ACTIVE_SESSION_RETRY_DIAG_INFO_SETTER(admitted_px_workers_number_, result_.reserved_thread_count_);
     LOG_WARN("Worker thread res not enough", K_(result));
   } else if (OB_FAIL(sqc_handler->link_qc_sqc_channel())) {
     LOG_WARN("Failed to link qc sqc channel", K(ret));
@@ -233,7 +228,7 @@ int ObInitSqcP::after_process(int error_code)
     session->set_session_sleep();
   }
 
-  ObActiveSessionGuard::get_stat().in_px_execution_ = false;
+  GET_DIAGNOSTIC_INFO->get_ash_stat().in_px_execution_ = false;
   /**
    * 此处需要清理中断，并把分配的线程数和handler释放.
    * worker正常启动后，此时它的引用计数被更新成了
@@ -363,6 +358,8 @@ int ObInitFastSqcP::init()
     LOG_WARN("unexpected sqc handler", K(ret));
   } else if (OB_FAIL(sqc_handler->init())) {
     LOG_WARN("Failed to init sqc handler", K(ret));
+    sqc_handler->reset();
+    op_reclaim_free(sqc_handler);
   } else {
     arg_.sqc_handler_ = sqc_handler;
     arg_.sqc_handler_->reset_reference_count(); //设置sqc_handler的引用计数为1.
@@ -382,12 +379,11 @@ void ObInitFastSqcP::destroy()
     int report_ret = OB_SUCCESS;
     ObPxSqcHandler::release_handler(arg_.sqc_handler_, report_ret);
   }
-  ObActiveSessionGuard::setup_default_ash();
 }
 
 int ObInitFastSqcP::process()
 {
-  ObActiveSessionGuard::get_stat().in_sql_execution_ = true;
+  GET_DIAGNOSTIC_INFO->get_ash_stat().in_sql_execution_ = true;
   int ret = OB_SUCCESS;
   LOG_TRACE("receive dfo", K_(arg));
   ObPxSqcHandler *sqc_handler = arg_.sqc_handler_;
@@ -436,7 +432,7 @@ int ObInitFastSqcP::process()
     ObInterruptUtil::update_schema_error_code(&(sqc_handler->get_exec_ctx()), ret);
   }
 
-  ObActiveSessionGuard::get_stat().in_sql_execution_ = false;
+  GET_DIAGNOSTIC_INFO->get_ash_stat().in_sql_execution_ = false;
   if (OB_NOT_NULL(sqc_handler)) {
     // link channel之前或者link过程可能会失败.
     // 如果sqc和qc没有link, 由response将 ret 通知给px.
@@ -469,6 +465,7 @@ int ObInitFastSqcP::startup_normal_sqc(ObPxSqcHandler &sqc_handler)
     ObWorkerSessionGuard worker_session_guard(session);
     ObSQLSessionInfo::LockGuard lock_guard(session->get_query_lock());
     session->set_peer_addr(arg.sqc_.get_qc_addr());
+    ObDIActionGuard action_guard("PX SUB COORDINATOR");
     if (OB_FAIL(session->store_query_string(ObString::make_string("PX SUB COORDINATOR")))) {
       LOG_WARN("store query string to session failed", K(ret));
     } else if (OB_FAIL(sub_coord.pre_process())) {
@@ -603,8 +600,8 @@ int ObPxTenantTargetMonitorP::process()
   const uint64_t tenant_id = arg_.get_tenant_id();
   const uint64_t follower_version = arg_.get_version();
   // server id of the leader that the follower sync with previously.
-  const uint64_t prev_leader_server_id = ObPxTenantTargetMonitor::get_server_id(follower_version);
-  const uint64_t leader_server_id  = GCTX.server_id_;
+  const uint64_t prev_leader_server_index = ObPxTenantTargetMonitor::get_server_index(follower_version);
+  const uint64_t leader_server_index  = GCTX.get_server_index();
   bool is_leader;
   uint64_t leader_version;
   result_.set_tenant_id(tenant_id);
@@ -612,7 +609,7 @@ int ObPxTenantTargetMonitorP::process()
     LOG_ERROR("get is_leader failed", K(ret), K(tenant_id));
   } else if (!is_leader) {
     result_.set_status(MONITOR_NOT_MASTER);
-  } else if (arg_.need_refresh_all_ || prev_leader_server_id != leader_server_id) {
+  } else if (arg_.need_refresh_all_ || prev_leader_server_index != leader_server_index) {
     if (OB_FAIL(OB_PX_TARGET_MGR.reset_leader_statistics(tenant_id))) {
       LOG_ERROR("reset leader statistics failed", K(ret));
     } else if (OB_FAIL(OB_PX_TARGET_MGR.get_version(tenant_id, leader_version))) {
@@ -621,7 +618,7 @@ int ObPxTenantTargetMonitorP::process()
       result_.set_status(MONITOR_VERSION_NOT_MATCH);
       result_.set_version(leader_version);
       LOG_INFO("need refresh all", K(tenant_id), K(arg_.need_refresh_all_),
-               K(follower_version), K(prev_leader_server_id), K(leader_server_id));
+               K(follower_version), K(prev_leader_server_index), K(leader_server_index));
     }
   } else if (OB_FAIL(OB_PX_TARGET_MGR.get_version(tenant_id, leader_version))) {
     LOG_WARN("get master_version failed", K(ret), K(tenant_id));
@@ -662,6 +659,13 @@ int ObPxCleanDtlIntermResP::process()
 {
   int ret = OB_SUCCESS;
   dtl::ObDTLIntermResultKey key;
+#ifdef ERRSIM
+  int ecode = EventTable::EN_PX_SINGLE_DFO_NOT_ERASE_DTL_INTERM_RESULT;
+  if (OB_SUCCESS != ecode && OB_SUCC(ret)) {
+    LOG_WARN("rpc not erase_dtl_interm_result by design", K(ret));
+    return OB_SUCCESS;
+  }
+#endif
   int64_t batch_size = 0 == arg_.batch_size_ ? 1 : arg_.batch_size_;
   for (int64_t i = 0; i < arg_.info_.count(); i++) {
     ObPxCleanDtlIntermResInfo &info = arg_.info_.at(i);
@@ -684,7 +688,7 @@ int ObPxCleanDtlIntermResP::process()
                 ret = OB_SUCCESS;
                 break;
               } else {
-                LOG_WARN("fail to release recieve internal result", K(ret), K(ret));
+                LOG_WARN("fail to release receive internal result", K(ret), K(ret));
               }
             }
           }

@@ -149,12 +149,17 @@ inline common::ObString concat_qualified_name(const common::ObString &db_name, c
   int64_t pos = 0;
   if (OB_LIKELY(buffer != nullptr)) {
     if (tbl_name.length() > 0 && db_name.length() > 0) {
-      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, "%s.%s.%s",
-                              to_cstring(db_name), to_cstring(tbl_name), to_cstring(col_name));
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, db_name);
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, ".");
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, tbl_name);
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, ".");
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, col_name);
     } else if (tbl_name.length() > 0) {
-      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, "%s.%s", to_cstring(tbl_name), to_cstring(col_name));
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, tbl_name);
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, ".");
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, col_name);
     } else {
-      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, "%s", to_cstring(col_name));
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, col_name);
     }
   }
   return common::ObString(pos, buffer);
@@ -166,9 +171,11 @@ inline common::ObString concat_table_name(const common::ObString &db_name, const
   int64_t pos = 0;
   if (OB_LIKELY(buffer != nullptr)) {
     if (db_name.length() > 0) {
-      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, "%s.%s", to_cstring(db_name), to_cstring(tbl_name));
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, db_name);
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, ".");
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, tbl_name);
     } else {
-      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, "%s", to_cstring(tbl_name));
+      common::databuff_printf(buffer, CSTRING_BUFFER_LEN, pos, tbl_name);
     }
   }
   return common::ObString(pos, buffer);
@@ -268,7 +275,7 @@ typedef common::ObFastArray<ObRawExpr *, FAST_ARRAY_COUNT> RawExprFastArray;
 typedef common::ObTuple<ObRawExpr*, ObConstRawExpr*, int64_t> ExternalParamInfo;
 
 struct ExternalParams{
-  ExternalParams() : by_name_(false), params_( ){}
+  ExternalParams() : by_name_(false), need_clear_(false), params_() {}
   ~ExternalParams() {}
 
 public:
@@ -277,6 +284,7 @@ public:
   int assign(ExternalParams &other)
   {
     by_name_ = other.by_name_;
+    need_clear_ = need_clear_;
     return params_.assign(other.params_);
   }
   ExternalParamInfo &at(int64_t i)
@@ -290,6 +298,7 @@ public:
 
 public:
   bool by_name_;
+  bool need_clear_ = false;
   common::ObSEArray<ExternalParamInfo, 8> params_;
 };
 
@@ -359,6 +368,7 @@ struct ObResolverParams
        tg_timing_event_(-1),
        is_column_ref_(true),
        hidden_column_scope_(T_NONE_SCOPE),
+       hidden_column_name_(NULL),
        outline_parse_result_(NULL),
        is_execute_call_stmt_(false),
        enable_res_map_(false),
@@ -370,7 +380,9 @@ struct ObResolverParams
        package_guard_(NULL),
        star_expansion_infos_(),
        is_for_rt_mv_(false),
-       is_resolve_fake_cte_table_(false)
+       is_resolve_fake_cte_table_(false),
+       is_returning_(false),
+       is_in_view_(false)
   {}
   bool is_force_trace_log() { return force_trace_log_; }
 
@@ -429,6 +441,7 @@ public:
   int64_t tg_timing_event_;      // mysql mode, trigger的触发时机和类型
   bool is_column_ref_;                   // used to mark normal column ref
   ObStmtScope hidden_column_scope_; // record scope for first hidden column which need check hidden_column_visable in opt_param hint
+  const char *hidden_column_name_;  // record column name for first hidden column which need check hidden_column_visable in opt_param hint
   ParseResult *outline_parse_result_;
   bool is_execute_call_stmt_;
   bool enable_res_map_;
@@ -441,6 +454,8 @@ public:
   common::ObArray<ObStarExpansionInfo> star_expansion_infos_;
   bool is_for_rt_mv_; // call resolve in transformation for expanding inline real-time materialized view
   bool is_resolve_fake_cte_table_;
+  bool is_returning_;
+  bool is_in_view_;
 };
 } // end namespace sql
 } // end namespace oceanbase

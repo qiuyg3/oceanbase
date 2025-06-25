@@ -10,18 +10,12 @@
  * See the Mulan PubL v2 for more details.
  */
 #define USING_LOG_PREFIX STORAGE
-#include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #define private public
 #define protected public
 #include "storage/high_availability/ob_storage_ha_src_provider.h"
 #include "storage/ls/ob_ls.h"
-#include "storage/ls/ob_ls_meta_package.h"
 #include "test_migration.h"
-#include "rpc/mock_ob_common_rpc_proxy.h"
-#include "storage/ob_locality_manager.h"
-#include "lib/ob_errno.h"
-#include "logservice/palf/palf_handle_impl.h"
 
 namespace oceanbase
 {
@@ -65,16 +59,24 @@ class MockMemberList
 {
 public:
   MockMemberList() {}
-  virtual ~MockMemberList() {}
+  virtual ~MockMemberList()
+  {
+    mock_ls_.log_handler_.is_inited_ = false;
+  }
 
   int get_ls_member_list_for_checkpoint(const uint64_t, const share::ObLSID &,
-      const bool, common::ObAddr &leader, common::GlobalLearnerList &, common::ObIArray<common::ObAddr> &addr_list)
+      const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(4/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -84,6 +86,7 @@ public:
   {
     int ret = OB_SUCCESS;
     common::ObAddr rs_recommand_addr;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(3/*addr_count*/, addr_list))) {
@@ -92,6 +95,10 @@ public:
       LOG_WARN("failed to mock rs recommand addr", K(ret));
     } else if (OB_FAIL(mock_learner_list(rs_recommand_addr, learner_list))) {
       LOG_WARN("failed to mock learner list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(add_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -100,10 +107,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(5/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -112,10 +124,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(5/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -124,10 +141,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(3/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -136,10 +158,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(3/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -148,10 +175,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(1/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -160,10 +192,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(2/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -172,10 +209,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(4/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -184,10 +226,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(3/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -196,10 +243,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(2/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -208,10 +260,15 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock leader addr", K(ret));
     } else if (OB_FAIL(mock_addr_list(1/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -220,8 +277,13 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_addr_list(5/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -230,8 +292,13 @@ public:
       const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
   {
     int ret = OB_SUCCESS;
+    common::ObAddr dst;
     if (OB_FAIL(mock_addr_list(5/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -241,14 +308,56 @@ public:
   {
     int ret = OB_SUCCESS;
     common::ObAddr addr;
+    common::ObAddr dst;
     if (OB_FAIL(mock_leader_addr(leader))) {
       LOG_WARN("failed to mock addr", K(ret));
-    } else if (OB_FAIL(mock_addr_list(3/*addr_count*/, addr_list))) {
+    } else if (OB_FAIL(mock_addr_list(4/*addr_count*/, addr_list))) {
       LOG_WARN("failed to mock addr list", K(ret));
     } else if (OB_FAIL(mock_check_replica_type_addr(addr))) {
       LOG_WARN("failed to mock rs recommand addr", K(ret));
     } else if (OB_FAIL(mock_learner_list(addr, learner_list))) {
       LOG_WARN("failed to mock learner list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(add_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
+    }
+    return ret;
+  }
+
+  int get_ls_member_list_for_c_replica(const uint64_t, const share::ObLSID &,
+      const bool, common::ObAddr &leader, common::GlobalLearnerList &learner_list, common::ObIArray<common::ObAddr> &addr_list)
+  {
+    int ret = OB_SUCCESS;
+    common::ObAddr dst;
+    common::ObAddr c_addr_2;
+    common::ObAddr c_addr_3;
+    common::ObAddr c_addr_4;
+    common::ObAddr r_addr_5;
+    if (OB_FAIL(mock_leader_addr(leader))) {
+      LOG_WARN("failed to mock leader addr", K(ret));
+    } else if (OB_FAIL(mock_addr_list(1/*addr_count*/, addr_list))) {
+      LOG_WARN("failed to mock addr list", K(ret));
+    } else if (OB_FAIL(mock_dst_addr(dst))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(mock_learner_list(dst, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
+    } else if (OB_FAIL(mock_c_replica_type_addr_2(c_addr_2))) {
+      LOG_WARN("failed to mock c replica addr", K(ret));
+    } else if (OB_FAIL(mock_c_replica_type_addr_3(c_addr_3))) {
+      LOG_WARN("failed to mock c replica addr", K(ret));
+    } else if (OB_FAIL(mock_c_replica_type_addr_4(c_addr_4))) {
+      LOG_WARN("failed to mock c replica addr", K(ret));
+    } else if (OB_FAIL(add_c_to_learner_list(c_addr_2, learner_list))) {
+      LOG_WARN("failed to mock to add c replica to learner list ", K(ret));
+    } else if (OB_FAIL(add_c_to_learner_list(c_addr_3, learner_list))) {
+      LOG_WARN("failed to mock to add c replica to learner list ", K(ret));
+    } else if (OB_FAIL(add_c_to_learner_list(c_addr_4, learner_list))) {
+      LOG_WARN("failed to mock to add c replica to learner list ", K(ret));
+    } else if (OB_FAIL(mock_check_replica_type_addr(r_addr_5))) {
+      LOG_WARN("failed to mock addr", K(ret));
+    } else if (OB_FAIL(add_learner_list(r_addr_5, learner_list))) {
+      LOG_WARN("failed to mock to add dst to learner list ", K(ret));
     }
     return ret;
   }
@@ -276,7 +385,12 @@ public:
     if (OB_FAIL(mock_addr("192.168.1.1:1234", parent))) {
       LOG_WARN("failed to mock addr", K(ret));
     } else {
-      mock_ls_.log_handler_.palf_handle_.palf_handle_impl_ = &mock_palf_handle_impl_;
+      mock_ls_.log_handler_.is_inited_ = true;
+      mock_ls_.log_handler_.is_in_stop_state_ = false;
+      if (OB_ISNULL(mock_ls_.log_handler_.palf_handle_)) {
+        mock_ls_.log_handler_.palf_handle_ = new palf::PalfHandle();
+      }
+      static_cast<palf::PalfHandle*>(mock_ls_.log_handler_.palf_handle_)->palf_handle_impl_ = &mock_palf_handle_impl_;
       mock_palf_handle_impl_.is_inited_ = true;
       mock_palf_handle_impl_.config_mgr_.parent_ = parent;
       ls_handle.ls_ = &mock_ls_;
@@ -384,6 +498,7 @@ public:
   virtual void SetUp();
   virtual void TearDown();
 private:
+  static const int64_t INIT_CLUSTER_ID = 1;
   ObStorageHAChooseSrcHelper choose_src_helper_;
   MockStorageRpc storage_rpc_;
   ObStorageRpcProxy storage_rpc_proxy_;
@@ -401,6 +516,7 @@ TestChooseMigrationSourcePolicy::~TestChooseMigrationSourcePolicy()
 void TestChooseMigrationSourcePolicy::SetUp()
 {
   int ret = OB_SUCCESS;
+  GCONF.cluster_id = INIT_CLUSTER_ID;
   const share::ObLSID ls_id(1);
   share::SCN local_ls_checkpoint_scn;
   local_ls_checkpoint_scn.set_base();
@@ -435,17 +551,20 @@ TEST_F(TestChooseMigrationSourcePolicy, get_available_src_with_checkpoint_policy
   EXPECT_CALL(member_helper_, get_ls_leader(_, _, _))
       .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
   EXPECT_CALL(member_helper_, get_ls(_, _))
-      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_succ));
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_succ_with_palf));
   const uint64_t tenant_id = 1001;
   const share::ObLSID ls_id(1);
   share::SCN local_ls_checkpoint_scn;
   local_ls_checkpoint_scn.set_base();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_checkpoint(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_checkpoint_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_checkpoint_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, choose_src_helper_.get_available_src(mock_arg, src_info));
   common::ObAddr expect_addr;
   EXPECT_EQ(OB_SUCCESS, mock_addr("192.168.1.1:1234", expect_addr));
@@ -476,10 +595,12 @@ TEST_F(TestChooseMigrationSourcePolicy, get_available_src_with_rs_recommend)
   local_ls_checkpoint_scn.set_base();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_rs_recommand(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_recommand_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));  EXPECT_EQ(OB_SUCCESS, get_recommand_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, choose_src_helper_.get_available_src(mock_arg, src_info));
   common::ObAddr expect_addr;
   EXPECT_EQ(OB_SUCCESS, mock_addr("192.168.1.4:1234", expect_addr));
@@ -511,10 +632,12 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_idc_leader)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_IDC_LEADER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -549,10 +672,12 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_idc_follower)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_IDC_FOLLOWER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -585,10 +710,12 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_region_leader)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_REGION_LEADER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -621,10 +748,12 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_region_follower)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_REGION_FOLLOWER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -655,10 +784,12 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_diff_region_leader)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_DIFF_REGION_LEADER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -690,10 +821,12 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_diff_region_follower)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_DIFF_REGION_FOLLOWER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -726,10 +859,12 @@ TEST_F(TestChooseMigrationSourcePolicy, region_mode_region_follower)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::REGION_MODE_REGION_FOLLOWER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::REGION, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -762,10 +897,13 @@ TEST_F(TestChooseMigrationSourcePolicy, region_mode_region_leader)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::REGION_MODE_REGION_LEADER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::REGION, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -797,10 +935,13 @@ TEST_F(TestChooseMigrationSourcePolicy, region_mode_diff_region_follower)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::REGION_MODE_DIFF_REGION_FOLLOWER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::REGION, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -831,10 +972,13 @@ TEST_F(TestChooseMigrationSourcePolicy, region_mode_diff_region_leader)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::REGION_MODE_DIFF_REGION_LEADER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::REGION, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -869,10 +1013,13 @@ TEST_F(TestChooseMigrationSourcePolicy, get_available_src_with_rebuild)
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_rebuild(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_IDC_LEADER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -897,58 +1044,111 @@ TEST_F(TestChooseMigrationSourcePolicy, member_helper_get_member_list)
 // test ObMigrationSrcByLocationProvider init fail
 TEST_F(TestChooseMigrationSourcePolicy, src_provider_init_idc_fail)
 {
+  MockMemberList member_list;
+  EXPECT_CALL(member_helper_, get_ls_member_list_and_learner_list_(_, _, _, _, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_member_list_for_idc_mode_idc_leader));
+  EXPECT_CALL(member_helper_, get_ls_leader(_, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
+  EXPECT_CALL(member_helper_, check_tenant_primary())
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::check_tenant_primary_true));
   const uint64_t tenant_id = 1001;
   const share::ObLSID ls_id(1);
   share::SCN local_ls_checkpoint_scn;
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_init_fail(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  int ret = OB_SUCCESS;
+  ObMigrationChooseSrcHelperInitParam param;
+  param.tenant_id_ = tenant_id;
+  param.ls_id_ = ls_id;
+  param.local_clog_checkpoint_scn_ = local_ls_checkpoint_scn;
+  param.arg_ = mock_arg;
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
 }
 // test ObMigrationSrcByLocationProvider init fail
 TEST_F(TestChooseMigrationSourcePolicy, src_provider_init_region_fail)
 {
+  MockMemberList member_list;
+  EXPECT_CALL(member_helper_, get_ls_member_list_and_learner_list_(_, _, _, _, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_member_list_for_region_mode_region_follower));
+  EXPECT_CALL(member_helper_, get_ls_leader(_, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
+  EXPECT_CALL(member_helper_, check_tenant_primary())
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::check_tenant_primary_true));
   const uint64_t tenant_id = 1001;
   const share::ObLSID ls_id(1);
   share::SCN local_ls_checkpoint_scn;
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_init_fail(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_region_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  param.tenant_id_ = tenant_id;
+  param.ls_id_ = ls_id;
+  param.local_clog_checkpoint_scn_ = local_ls_checkpoint_scn;
+  param.arg_ = mock_arg;
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, get_region_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
 }
 // test ObRSRecommendSrcProvider init fail
 TEST_F(TestChooseMigrationSourcePolicy, src_provider_init_recommand_fail)
 {
+  MockMemberList member_list;
+  EXPECT_CALL(member_helper_, get_ls_member_list_and_learner_list_(_, _, _, _, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_member_list_for_rs_recommand));
+  EXPECT_CALL(member_helper_, get_ls_leader(_, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
+  EXPECT_CALL(member_helper_, check_tenant_primary())
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::check_tenant_primary_true));
   const uint64_t tenant_id = 1001;
   const share::ObLSID ls_id(1);
   share::SCN local_ls_checkpoint_scn;
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_init_fail(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_recommand_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  param.tenant_id_ = tenant_id;
+  param.ls_id_ = ls_id;
+  param.local_clog_checkpoint_scn_ = local_ls_checkpoint_scn;
+  param.arg_ = mock_arg;
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, get_recommand_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
 }
 // test ObMigrationSrcByCheckpointProvider init fail
 TEST_F(TestChooseMigrationSourcePolicy, src_provider_init_checkpoint_fail)
 {
+  MockMemberList member_list;
+  EXPECT_CALL(member_helper_, get_ls_member_list_and_learner_list_(_, _, _, _, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_member_list_for_checkpoint));
+  EXPECT_CALL(member_helper_, get_ls_leader(_, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
+  EXPECT_CALL(member_helper_, check_tenant_primary())
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::check_tenant_primary_true));
   const uint64_t tenant_id = 1001;
   const share::ObLSID ls_id(1);
   share::SCN local_ls_checkpoint_scn;
   local_ls_checkpoint_scn.set_min();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_init_fail(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_checkpoint_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  param.tenant_id_ = tenant_id;
+  param.ls_id_ = ls_id;
+  param.local_clog_checkpoint_scn_ = local_ls_checkpoint_scn;
+  param.arg_ = mock_arg;
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, get_checkpoint_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
 }
 // test check replica valid fail
 // candidate addr: ["192.168.1.1:1234", "192.168.1.2:1234", "192.168.1.3:1234", "192.168.1.4:1234", "192.168.1.5:1234"]
@@ -960,17 +1160,17 @@ TEST_F(TestChooseMigrationSourcePolicy, src_provider_init_checkpoint_fail)
 // 192.168.1.3:1234 : checkpoint -> OB_BASE_SCN_TS_NS, type -> F
 // 192.168.1.4:1234 : checkpoint -> OB_BASE_SCN_TS_NS + 2, type -> F
 // 192.168.1.5:1234 : checkpoint -> OB_MAX_SCN_TS_NS, type -> R
-// output addr:192.168.1.3:1234
+// output addr:192.168.1.4:1234
 TEST_F(TestChooseMigrationSourcePolicy, get_available_src_condition_fail)
 {
   MockLsMetaInfo ls_meta;
   EXPECT_CALL(storage_rpc_, post_ls_meta_info_request(_, _, _, _))
       .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_parent_checkpoint))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_base_checkpoint))
       .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_min_checkpoint))
       .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_base_checkpoint))
       .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_large_checkpoint))
-      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_invalid_type_checkpoint))
-      .WillRepeatedly(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_min_checkpoint));
+      .WillRepeatedly(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_invalid_type_checkpoint));
   MockMemberList member_list;
   EXPECT_CALL(member_helper_, get_ls_member_list_and_learner_list_(_, _, _, _, _, _))
       .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_member_list_for_replica_type_failed));
@@ -978,7 +1178,7 @@ TEST_F(TestChooseMigrationSourcePolicy, get_available_src_condition_fail)
       .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
   EXPECT_CALL(member_helper_, get_ls(_, _))
       .WillOnce(Invoke(&member_list, &MockMemberList::get_ls_fail))
-      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_succ));
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_succ_with_palf));
   EXPECT_CALL(member_helper_, check_tenant_primary())
       .WillRepeatedly(Invoke(&member_list, &MockMemberList::check_tenant_primary_true));
   const uint64_t tenant_id = 1001;
@@ -987,13 +1187,16 @@ TEST_F(TestChooseMigrationSourcePolicy, get_available_src_condition_fail)
   local_ls_checkpoint_scn.set_base();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_checkpoint(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_checkpoint_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_checkpoint_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, choose_src_helper_.get_available_src(mock_arg, src_info));
   common::ObAddr expect_addr;
-  EXPECT_EQ(OB_SUCCESS, mock_addr("192.168.1.3:1234", expect_addr));
+  EXPECT_EQ(OB_SUCCESS, mock_addr("192.168.1.4:1234", expect_addr));
   EXPECT_EQ(expect_addr, src_info.src_addr_);
 }
 // test check replica valid fail
@@ -1024,7 +1227,7 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_check_replica_fail)
       .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
   EXPECT_CALL(member_helper_, get_ls(_, _))
       .WillOnce(Invoke(&member_list, &MockMemberList::get_ls_fail))
-      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_succ));
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_succ_with_palf));
   EXPECT_CALL(member_helper_, check_tenant_primary())
       .WillRepeatedly(Invoke(&member_list, &MockMemberList::check_tenant_primary_true));
   const uint64_t tenant_id = 1001;
@@ -1033,10 +1236,13 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_check_replica_fail)
   local_ls_checkpoint_scn.set_base();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_location(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_IDC_LEADER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
@@ -1081,12 +1287,120 @@ TEST_F(TestChooseMigrationSourcePolicy, idc_mode_r_replica_init)
   local_ls_checkpoint_scn.set_base();
   ObMigrationOpArg mock_arg;
   EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_r_type(mock_arg));
-  ObStorageHASrcProvider::ChooseSourcePolicy policy;
-  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, policy));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
   ObStorageHASrcInfo src_info;
-  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, policy, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
   EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_IDC_LEADER, locality_manager_));
   EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
+  static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.get_available_src(mock_arg, src_info));
+  common::ObAddr expect_addr;
+  EXPECT_EQ(OB_SUCCESS, mock_addr("192.168.1.4:1234", expect_addr));
+  EXPECT_EQ(expect_addr, src_info.src_addr_);
+}
+
+// test c replica choose src: no other C replica
+// candidate addr: ["192.168.1.1:1234", "192.168.1.2:1234", "192.168.1.3:1234", "192.168.1.4:1234", "192.168.1.5:1234"]
+// local checkpoint -> OB_BASE_SCN_TS_NS
+// parent checkpoint -> OB_BASE_SCN_TS_NS + 1
+// dst type -> C
+// 192.168.1.1:1234 : idc -> idc1, region -> region1, checkpoint -> OB_MIN_SCN_TS_NS, type -> F, leader
+// 192.168.1.2:1234 : idc -> idc2, region -> region1, checkpoint -> OB_BASE_SCN_TS_NS, type -> F
+// 192.168.1.3:1234 : idc -> idc2, region -> region1, checkpoint -> OB_BASE_SCN_TS_NS, type -> F
+// 192.168.1.4:1234 : idc -> idc1, region -> region2, checkpoint -> OB_BASE_SCN_TS_NS + 2, type -> F
+// 192.168.1.5:1234 : idc -> idc1, region -> region2, checkpoint -> OB_MIN_SCN_TS_NS, type -> F
+// output addr:192.168.1.4:1234
+TEST_F(TestChooseMigrationSourcePolicy, c_replica_no_other)
+{
+  MockLsMetaInfo ls_meta;
+  EXPECT_CALL(storage_rpc_, post_ls_meta_info_request(_, _, _, _))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_parent_checkpoint))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_min_checkpoint))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_base_checkpoint))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_base_checkpoint))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_large_checkpoint))
+      .WillRepeatedly(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_min_checkpoint));
+  MockMemberList member_list;
+  EXPECT_CALL(member_helper_, get_ls_member_list_and_learner_list_(_, _, _, _, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_member_list_for_idc_mode_idc_leader));
+  EXPECT_CALL(member_helper_, get_ls_leader(_, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
+  EXPECT_CALL(member_helper_, get_ls(_, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_succ_with_palf));
+  EXPECT_CALL(member_helper_, check_tenant_primary())
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::check_tenant_primary_true));
+  const uint64_t tenant_id = 1001;
+  const share::ObLSID ls_id(1);
+  share::SCN local_ls_checkpoint_scn;
+  local_ls_checkpoint_scn.set_base();
+  ObMigrationOpArg mock_arg;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_c_type(mock_arg));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
+  ObStorageHASrcInfo src_info;
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_IDC_LEADER, locality_manager_));
+  EXPECT_EQ(ObStorageHASrcProvider::ChooseSourcePolicy::IDC, choose_src_helper_.get_provider()->get_policy_type());
+  static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.get_available_src(mock_arg, src_info));
+  common::ObAddr expect_addr;
+  EXPECT_EQ(OB_SUCCESS, mock_addr("192.168.1.4:1234", expect_addr));
+  EXPECT_EQ(expect_addr, src_info.src_addr_);
+}
+
+// test c replica choose src: have other C replica
+// candidate addr: ["192.168.1.1:1234", "192.168.1.2:1234", "192.168.1.3:1234", "192.168.1.4:1234", "192.168.1.5:1234"]
+// local checkpoint -> OB_BASE_SCN_TS_NS
+// parent checkpoint -> OB_BASE_SCN_TS_NS + 1
+// dst type -> C
+// 192.168.1.1:1234 : idc -> idc1, region -> region1, checkpoint -> OB_MIN_SCN_TS_NS, type -> F, leader
+// 192.168.1.2:1234 : idc -> idc2, region -> region1, checkpoint -> OB_MIN_SCN_TS_NS, type -> C
+// 192.168.1.3:1234 : idc -> idc2, region -> region1, checkpoint -> OB_BASE_SCN_TS_NS, type -> C
+// 192.168.1.4:1234 : idc -> idc1, region -> region2, checkpoint -> OB_BASE_SCN_TS_NS + 2, type -> C
+// 192.168.1.5:1234 : idc -> idc1, region -> region2, checkpoint -> OB_BASE_SCN_TS_NS + 2, type -> R
+// output addr:192.168.1.4:1234
+TEST_F(TestChooseMigrationSourcePolicy, c_replica_have_other)
+{
+  MockLsMetaInfo ls_meta;
+  // when replica type is F, won't fetch ls_info
+  EXPECT_CALL(storage_rpc_, post_ls_meta_info_request(_, _, _, _))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_parent_checkpoint))
+      // .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_min_checkpoint))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_min_checkpoint))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_base_checkpoint))
+      .WillOnce(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_large_checkpoint))
+      .WillRepeatedly(Invoke(&ls_meta, &MockLsMetaInfo::post_ls_meta_info_request_large_checkpoint));
+  MockMemberList member_list;
+  EXPECT_CALL(member_helper_, get_ls_member_list_and_learner_list_(_, _, _, _, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_member_list_for_c_replica));
+  EXPECT_CALL(member_helper_, get_ls_leader(_, _, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_leader_succ));
+  EXPECT_CALL(member_helper_, get_ls(_, _))
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::get_ls_succ_with_palf));
+  EXPECT_CALL(member_helper_, check_tenant_primary())
+      .WillRepeatedly(Invoke(&member_list, &MockMemberList::check_tenant_primary_true));
+  const uint64_t tenant_id = 1001;
+  const share::ObLSID ls_id(1);
+  share::SCN local_ls_checkpoint_scn;
+  local_ls_checkpoint_scn.set_base();
+  ObMigrationOpArg mock_arg;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_arg_for_c_type(mock_arg));
+  ObMigrationChooseSrcHelperInitParam param;
+  EXPECT_EQ(OB_SUCCESS, mock_migrate_choose_helper_param(tenant_id, ls_id, local_ls_checkpoint_scn, mock_arg, param));
+  EXPECT_EQ(OB_SUCCESS, member_helper_.get_member_list_by_replica_type(tenant_id, ls_id,
+        mock_arg.dst_, param.info_, param.is_first_c_replica_));
+  EXPECT_EQ(OB_SUCCESS, get_idc_policy(mock_arg, tenant_id, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_));
+  ObStorageHASrcInfo src_info;
+  EXPECT_EQ(OB_SUCCESS, choose_src_helper_.init(param, &storage_rpc_, &member_helper_));
+  EXPECT_EQ(true, param.use_c_replica_policy_);
+  EXPECT_EQ(OB_SUCCESS, mock_locality_manager(MOCKLOCALITY::IDC_MODE_IDC_LEADER, locality_manager_));
   static_cast<ObMigrationSrcByLocationProvider *>(choose_src_helper_.get_provider())->set_locality_manager_(&locality_manager_);
   EXPECT_EQ(OB_SUCCESS, choose_src_helper_.get_available_src(mock_arg, src_info));
   common::ObAddr expect_addr;

@@ -10,37 +10,13 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include <cstdint>
-#include "lib/oblog/ob_log_module.h"
-#include "lib/time/ob_time_utility.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "logservice/palf/lsn.h"
 #include "ob_archive_fetcher.h"
-#include "lib/ob_define.h"
-#include "lib/ob_errno.h"
-#include "lib/stat/ob_session_stat.h"
-#include "lib/thread/ob_thread_name.h"        // lib::set_thread_name
 #include "logservice/ob_log_service.h"        // ObLogService
-#include "logservice/palf/log_group_entry.h"  // LogGroupEntry
-#include "logservice/palf_handle_guard.h"     // PalfHandleGuard
 #include "ob_archive_allocator.h"             // ObArchiveAllocator
-#include "ob_archive_define.h"                // ArchiveWorkStation
 #include "ob_archive_sender.h"                // ObArchiveSender
 #include "ob_ls_mgr.h"                        // ObArchiveLSMgr
-#include "ob_archive_task.h"                  // ObArchive.*Task
-#include "ob_ls_task.h"                       // ObLSArchiveTask
-#include "ob_archive_round_mgr.h"             // ObArchiveRoundMgr
-#include "ob_archive_util.h"
 #include "ob_archive_sequencer.h"             // ObArchivesSequencer
-#include "objit/common/ob_item_type.h"        // print
-#include "observer/omt/ob_tenant_config_mgr.h"
-#include "rootserver/ob_tenant_info_loader.h" // ObTenantInfoLoader
-#include "share/ob_debug_sync.h"              // DEBUG_SYNC
-#include "share/ob_debug_sync_point.h"        // LOG_ARCHIVE_PUSH_LOG
-#include "share/ob_errno.h"
-#include "share/ob_ls_id.h"
-#include "share/ob_tenant_info_proxy.h"       // ObAllTenantInfo
-#include "share/scn.h"
+#include "lib/ash/ob_active_session_guard.h"
 
 namespace oceanbase
 {
@@ -277,6 +253,7 @@ int ObArchiveFetcher::modify_thread_count(const int64_t thread_count)
 void ObArchiveFetcher::run1()
 {
   ARCHIVE_LOG(INFO, "ObArchiveFetcher thread start");
+  ObDIActionGuard ag("LogService", "LogArchiveService", "ArchiveFetcher");
   lib::set_thread_name("ArcFetcher");
   ObCurTraceId::init(GCONF.self_addr_);
 
@@ -289,6 +266,7 @@ void ObArchiveFetcher::run1()
       int64_t end_tstamp = ObTimeUtility::current_time();
       int64_t wait_interval = THREAD_RUN_INTERVAL - (end_tstamp - begin_tstamp);
       if (wait_interval > 0) {
+        common::ObBKGDSessInActiveGuard inactive_guard;
         fetch_cond_.timedwait(wait_interval);
       }
     }
@@ -362,8 +340,7 @@ int ObArchiveFetcher::handle_log_fetch_task_(ObArchiveLogFetchTask &task)
   bool need_delay = false;
   bool submit_log = false;
   const ObLSID id = task.get_ls_id();
-  PalfGroupBufferIterator iter(id.id(), palf::LogIOUser::ARCHIVE);
-  PalfHandleGuard palf_handle_guard;
+  PalfGroupBufferIterator iter;
   TmpMemoryHelper helper(unit_size_, allocator_);
   ObArchiveSendTask *send_task = NULL;
   const ArchiveWorkStation &station = task.get_station();
@@ -389,7 +366,7 @@ int ObArchiveFetcher::handle_log_fetch_task_(ObArchiveLogFetchTask &task)
       ARCHIVE_LOG(TRACE, "need delay", K(task), K(need_delay));
   } else if (OB_FAIL(init_helper_(task, commit_lsn, helper))) {
     ARCHIVE_LOG(WARN, "init helper failed", K(ret), K(task));
-  } else if (OB_FAIL(init_iterator_(task.get_ls_id(), helper, palf_handle_guard, iter))) {
+  } else if (OB_FAIL(init_iterator_(task.get_ls_id(), helper, iter))) {
     ARCHIVE_LOG(WARN, "init iterator failed", K(ret), K(task));
   } else if (OB_FAIL(generate_send_buffer_(iter, helper))) {
     ARCHIVE_LOG(WARN, "generate send buffer failed", K(ret), K(task));
@@ -595,19 +572,19 @@ int ObArchiveFetcher::init_helper_(ObArchiveLogFetchTask &task, const LSN &commi
 
 int ObArchiveFetcher::init_iterator_(const ObLSID &id,
     const TmpMemoryHelper &helper,
-    PalfHandleGuard &palf_handle_guard,
     PalfGroupBufferIterator &iter)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(log_service_->open_palf(id, palf_handle_guard))) {
+  bool exists = false;
+  if (OB_FAIL(seek_log_iterator(id, helper.get_start_offset(), iter))) {
     if (OB_LS_NOT_EXIST == ret) {
       ARCHIVE_LOG(WARN, "ls not exist", K(ret), K(id), "tenant_id", MTL_ID());
       ret = OB_LOG_ARCHIVE_LEADER_CHANGED;
     } else {
-      ARCHIVE_LOG(WARN, "open ls failed", K(ret), K(id), K(helper));
+      ARCHIVE_LOG(WARN, "iterator seek failed", K(ret), K(id), K(helper));
     }
-  } else if (OB_FAIL(palf_handle_guard.seek(helper.get_start_offset(), iter))) {
-    ARCHIVE_LOG(WARN, "iterator seek failed", K(ret), K(id), K(helper));
+  } else if (OB_FAIL(iter.set_io_context(palf::LogIOContext(MTL_ID(), id.id(), palf::LogIOUser::ARCHIVE)))) {
+    ARCHIVE_LOG(WARN, "iterator set_io_context failed", K(ret), K(id), K(helper));
   } else {
     ARCHIVE_LOG(TRACE, "init iterator succ", K(id), K(helper));
   }

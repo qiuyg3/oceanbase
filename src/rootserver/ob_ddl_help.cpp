@@ -10,18 +10,9 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "lib/ob_errno.h"
 #define USING_LOG_PREFIX RS
 #include "rootserver/ob_ddl_help.h"
-#include "rootserver/ob_ddl_operator.h"
 #include "rootserver/ob_ddl_service.h"
-#include "rootserver/ob_zone_manager.h"
-#include "share/ob_primary_zone_util.h"
-#include "share/schema/ob_schema_struct.h"
-#include "share/schema/ob_part_mgr_util.h"
-#include "share/ob_rpc_struct.h"
-#include "lib/string/ob_sql_string.h"
-#include "sql/resolver/ob_resolver_utils.h"
 #include "share/schema/ob_schema_service_sql_impl.h"
 namespace oceanbase
 {
@@ -57,7 +48,8 @@ int ObTableGroupHelp::add_tables_to_tablegroup(ObMySQLTransaction &trans,
     LOG_WARN("tablegroup_id is invalid", KR(ret), K(tablegroup_id));
   } else if (is_sys_tablegroup_id(tablegroup_id)) {
     ret = OB_OP_NOT_ALLOW;
-    LOG_WARN("can not handle with sys tablegroup", KR(ret), K(tablegroup_id));
+    LOG_WARN("user table cannot add to sys tablegroup", KR(ret), K(tablegroup_id));
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "user table add to sys tablegroup");
   } else if (OB_ISNULL(ddl_service_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ddl_service is null", KR(ret));
@@ -86,7 +78,9 @@ int ObTableGroupHelp::add_tables_to_tablegroup(ObMySQLTransaction &trans,
         LOG_WARN("fail to get table schema", KR(ret), K(tenant_id), K(database_id), K(table_item));
       } else if (OB_ISNULL(table_schema)) {
         ret = OB_TABLE_NOT_EXIST;
-        LOG_USER_ERROR(OB_TABLE_NOT_EXIST, to_cstring(table_item.database_name_), to_cstring(table_item.table_name_));
+        ObCStringHelper helper;
+        LOG_USER_ERROR(OB_TABLE_NOT_EXIST, helper.convert(table_item.database_name_),
+                                           helper.convert(table_item.table_name_));
         LOG_WARN("table not exist!", KR(ret), K(tenant_id), K(database_id), K(table_item));
       } else if (is_inner_table(table_schema->get_table_id())) {
         //the tablegroup of sys table must be oceanbase
@@ -97,10 +91,19 @@ int ObTableGroupHelp::add_tables_to_tablegroup(ObMySQLTransaction &trans,
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("alter tablegroup of table with materialized view log is not supported", KR(ret));
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "alter tablegroup of table with materialized view log is");
+      } else if (table_schema->table_referenced_by_fast_lsm_mv()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("alter tablegroup of table required by materialized view is not supported",
+                 KR(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "alter tablegroup of table required by materialized view is");
       } else if (table_schema->is_mlog_table()) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("alter tablegroup of materialized view log is not supported", KR(ret));
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "alter tablegroup of materialized view log is");
+      } else if (table_schema->is_external_table()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "alter tablegroup of external table is");
       } else {
         if (is_contain(table_ids, table_schema->get_table_id())) {
           duplicate_table = true;
@@ -127,8 +130,6 @@ int ObTableGroupHelp::add_tables_to_tablegroup(ObMySQLTransaction &trans,
                                           table_item.table_name_.length(),
                                           table_item.table_name_.ptr()))) {
           LOG_WARN("failed to append sql", KR(ret));
-        } else if (OB_FAIL(ddl_service_->check_tablegroup_in_single_database(schema_guard, new_table_schema))) {
-          LOG_WARN("fail to check tablegroup in single database", KR(ret));
         } else {
           ObString sql_str = sql.string();
           if (OB_FAIL(ddl_operator.alter_tablegroup(schema_guard, new_table_schema, trans, &sql_str))) {
@@ -163,6 +164,7 @@ int ObTableGroupHelp::check_table_alter_tablegroup(
     LOG_WARN("cann't alter table's tablegroup", KR(ret),
              "src_tg_id", orig_table_schema.get_tablegroup_id(),
              "dst_tg_id", new_table_schema.get_tablegroup_id());
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "user table add to sys tablegroup");
   } else if (OB_INVALID_ID == new_table_schema.get_tablegroup_id()) {
     // skip
   } else {
@@ -216,7 +218,7 @@ int ObTableGroupHelp::check_table_partition_in_tablegroup(const ObTableSchema *f
   const uint64_t tenant_id = table.get_tenant_id();
   const uint64_t tablegroup_id = table.get_tablegroup_id();
   const ObTablegroupSchema *tablegroup = NULL;
-  if (OB_INVALID_ID == tablegroup_id) {
+  if (OB_UNLIKELY(OB_INVALID_ID == tablegroup_id)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("tablegroup_id is invalid", KR(ret), K(tablegroup_id));
   } else if (is_sys_tablegroup_id(tablegroup_id)) {

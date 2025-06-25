@@ -11,19 +11,10 @@
  */
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
-#include "share/schema/ob_dependency_info.h"
-#include "ob_schema_getter_guard.h"
-#include "lib/container/ob_tuple.h"
-#include "lib/mysqlclient/ob_mysql_transaction.h"
-#include "lib/string/ob_sql_string.h"
-#include "share/ob_dml_sql_splicer.h"
-#include "share/schema/ob_schema_utils.h"
-#include "observer/ob_server_struct.h"
+#include "ob_dependency_info.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/executor/ob_maintain_dependency_info_task.h"
-#include "share/schema/ob_schema_struct.h"
 #include "rootserver/ob_ddl_operator.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
 
 namespace oceanbase
 {
@@ -929,6 +920,33 @@ int ObDependencyInfo::modify_all_obj_status(const ObIArray<std::pair<uint64_t, s
   return ret;
 }
 
+int ObDependencyInfo::insert_dependency_infos(common::ObMySQLTransaction &trans,
+                                           ObIArray<ObDependencyInfo> &dep_infos,
+                                           uint64_t tenant_id,
+                                           uint64_t dep_obj_id,
+                                           uint64_t schema_version, uint64_t owner_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_INVALID_ID == owner_id
+   || OB_INVALID_ID == dep_obj_id
+   || OB_INVALID_ID == tenant_id
+   || OB_INVALID_SCHEMA_VERSION == schema_version) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("illegal schema version or owner id", K(ret), K(schema_version),
+                                                   K(owner_id), K(dep_obj_id));
+  } else {
+    for (int64_t i = 0 ; OB_SUCC(ret) && i < dep_infos.count(); ++i) {
+      ObDependencyInfo & dep = dep_infos.at(i);
+      dep.set_tenant_id(tenant_id);
+      dep.set_dep_obj_id(dep_obj_id);
+      dep.set_dep_obj_owner_id(owner_id);
+      dep.set_schema_version(schema_version);
+      OZ (dep.insert_schema_object_dependency(trans));
+    }
+  }
+  return ret;
+}
+
 void ObDependencyInfo::reset()
 {
   tenant_id_ = OB_INVALID_ID;
@@ -1287,7 +1305,6 @@ int ObReferenceObjTable::fill_rowkey_pairs(
 
 int ObReferenceObjTable::batch_execute_insert_or_update_obj_dependency(
     const uint64_t tenant_id,
-    const bool is_standby,
     const int64_t new_schema_version,
     const ObReferenceObjTable::DependencyObjKeyItemPairs &dep_objs,
     ObMySQLTransaction &trans,
@@ -1299,8 +1316,6 @@ int ObReferenceObjTable::batch_execute_insert_or_update_obj_dependency(
   if (OB_INVALID_ID == tenant_id) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid argument", K(ret), K(tenant_id));
-  } else if (is_standby) {
-    // do nothing
   } else {
     ObSqlString sql;
     ObDMLSqlSplicer dml;
@@ -1345,7 +1360,6 @@ int ObReferenceObjTable::batch_execute_insert_or_update_obj_dependency(
 
 int ObReferenceObjTable::batch_execute_delete_obj_dependency(
     const uint64_t tenant_id,
-    const bool is_standby,
     const ObReferenceObjTable::DependencyObjKeyItemPairs &dep_objs,
     ObMySQLTransaction &trans)
 {
@@ -1354,8 +1368,6 @@ int ObReferenceObjTable::batch_execute_delete_obj_dependency(
   if (OB_INVALID_ID == tenant_id) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid argument", K(ret), K(tenant_id));
-  } else if (is_standby) {
-    // do nothing
   } else {
     share::ObDMLSqlSplicer dml;
     ObSqlString sql;
@@ -1433,7 +1445,9 @@ int ObReferenceObjTable::get_or_add_def_obj_item(const uint64_t dep_obj_id,
     if (OB_FAIL(ref_obj_version_table_.get_refactored(ref_obj_key, dep_obj_item))) {
       if (OB_HASH_NOT_EXIST == ret) {
         ret = OB_SUCCESS;
-        CK (OB_NOT_NULL(buf = static_cast<char *>(allocator.alloc(sizeof(ObDependencyObjItem)))));
+        OV (OB_NOT_NULL(buf = static_cast<char *>(allocator.alloc(sizeof(ObDependencyObjItem)))),
+            OB_ALLOCATE_MEMORY_FAILED,
+            K(sizeof(ObDependencyObjItem)));
         OX (dep_obj_item = new(buf) ObDependencyObjItem);
         OZ (ref_obj_version_table_.set_refactored(ref_obj_key, dep_obj_item));
       } else {
@@ -1510,7 +1524,11 @@ int ObReferenceObjTable::process_reference_obj_table(const uint64_t tenant_id,
                                                      sql::ObMaintainDepInfoTaskQueue &task_queue)
 {
   int ret = OB_SUCCESS;
-  if (!is_inited() || GCTX.is_standby_cluster()) {
+  share::ObTenantRole::Role tenant_role;
+  bool is_standby = false;
+  if (OB_FAIL(ObShareUtil::mtl_check_if_tenant_role_is_standby(tenant_id, is_standby))) {
+    LOG_WARN("fail to execute mtl_check_if_tenant_role_is_standby", KR(ret), K(tenant_id));
+  } else if (OB_UNLIKELY(!is_inited() || is_standby)) {
     if (OB_INVALID_ID != dep_obj_id) {
       OZ (task_queue.erase_view_id_from_set(dep_obj_id));
     }

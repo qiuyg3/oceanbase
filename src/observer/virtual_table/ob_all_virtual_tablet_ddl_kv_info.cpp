@@ -13,7 +13,6 @@
 #include "observer/virtual_table/ob_all_virtual_tablet_ddl_kv_info.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/ddl/ob_tablet_ddl_kv.h"
-#include "storage/ddl/ob_tablet_ddl_kv_mgr.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::storage;
@@ -27,7 +26,7 @@ ObAllVirtualTabletDDLKVInfo::ObAllVirtualTabletDDLKVInfo()
       addr_(),
       ls_id_(share::ObLSID::INVALID_LS_ID),
       ls_iter_guard_(),
-      ls_tablet_iter_(ObMDSGetTabletMode::READ_READABLE_COMMITED),
+      ls_tablet_iter_(ObMDSGetTabletMode::READ_ALL_COMMITED),
       ddl_kvs_handle_(),
       curr_tablet_id_(),
       ddl_kv_idx_(-1)

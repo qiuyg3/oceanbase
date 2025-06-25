@@ -14,15 +14,10 @@
 
 #include "ob_sync_cmd_driver.h"
 
-#include "lib/profile/ob_perf_event.h"
 #include "obsm_row.h"
 #include "sql/resolver/cmd/ob_variable_set_stmt.h"
 #include "observer/mysql/obmp_query.h"
 #include "rpc/obmysql/packet/ompk_row.h"
-#include "rpc/obmysql/packet/ompk_eof.h"
-#include "share/ob_lob_access_utils.h"
-#include "observer/mysql/obmp_stmt_prexecute.h"
-#include "src/pl/ob_pl_user_type.h"
 #include "sql/engine/expr/ob_expr_xml_func_helper.h"
 
 namespace oceanbase
@@ -153,8 +148,6 @@ int ObSyncCmdDriver::response_result(ObMySQLResultSet &result)
     if (!result.is_pl_stmt(result.get_stmt_type())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_ERROR("Not SELECT, should not have any row!!!", K(ret));
-    } else if (is_mysql_mode() && session_.client_non_standard()) {
-      // do nothing
     } else if (OB_FAIL(response_query_result(result))) {
       LOG_WARN("response query result fail", K(ret));
       free_output_row(result);
@@ -324,16 +317,28 @@ int ObSyncCmdDriver::response_query_result(ObMySQLResultSet &result)
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("session info is null", K(ret));
   } else {
+    ObCharsetType charset_type = CHARSET_INVALID;
+    ObCharsetType nchar = CHARSET_INVALID;
+
+    if (OB_SUCC(ret)) {
+      const ObSQLSessionInfo &my_session = result.get_session();
+      if (OB_FAIL(my_session.get_ncharacter_set_connection(nchar))) {
+        LOG_WARN("get ncharacter set connection failed", K(ret));
+      } else if (OB_FAIL(my_session.get_character_set_results(charset_type))) {
+        LOG_WARN("fail to get result charset", K(ret));
+      }
+    }
+
     ObNewRow *tmp_row = const_cast<ObNewRow*>(row);
     for (int64_t i = 0; OB_SUCC(ret) && i < tmp_row->get_count(); i++) {
       ObObj& value = tmp_row->get_cell(i);
       if (ob_is_string_tc(value.get_type()) && CS_TYPE_INVALID != value.get_collation_type()) {
-        OZ(convert_string_value_charset(value, result));
+        OZ(convert_string_value_charset(value, result, charset_type, nchar));
       } else if (value.is_clob_locator()
-                && OB_FAIL(convert_lob_value_charset(value, result))) {
+                && OB_FAIL(convert_lob_value_charset(value, result, charset_type, nchar))) {
         LOG_WARN("convert lob value charset failed", K(ret));
       } else if (ob_is_text_tc(value.get_type())
-                && OB_FAIL(convert_text_value_charset(value, result))) {
+                && OB_FAIL(convert_text_value_charset(value, result, charset_type, nchar))) {
         LOG_WARN("convert text value charset failed", K(ret));
       }
       if (OB_FAIL(ret)) {
@@ -353,6 +358,7 @@ int ObSyncCmdDriver::response_query_result(ObMySQLResultSet &result)
       ObSMRow sm_row(protocol_type,
                      *row,
                      dtc_params,
+                     *tmp_session,
                      result.get_field_columns(),
                      ctx_.schema_guard_,
                      tmp_session->get_effective_tenant_id());

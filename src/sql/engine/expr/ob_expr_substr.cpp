@@ -12,14 +12,8 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 
-#include "lib/oblog/ob_log.h"
-#include "share/object/ob_obj_cast.h"
-#include "share/vector/ob_vector_define.h"
 #include "sql/engine/expr/ob_expr_substr.h"
-#include "objit/common/ob_item_type.h"
-#include "sql/engine/expr/ob_expr_util.h"
 #include "sql/session/ob_sql_session_info.h"
-#include "storage/ob_storage_util.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 
 namespace oceanbase
@@ -187,6 +181,7 @@ int ObExprSubstr::calc_result_length_oracle(const ObExprResType *types_array,
           if (result_type.is_varchar_or_char() && LS_BYTE == result_type.get_length_semantics()) {
             res_len *= mbmaxlen;
           }
+          res_len = MIN(res_len, INT32_MAX);
         }
       }
     }
@@ -254,19 +249,20 @@ int ObExprSubstr::calc_result_typeN(ObExprResType &type,
         type.set_varchar();
       }
     }
-    OZ(aggregate_charsets_for_string_result(type, types_array, 1, type_ctx.get_coll_type()));
+    OZ(aggregate_charsets_for_string_result(type, types_array, 1, type_ctx));
     if (OB_SUCC(ret)) {
       if (is_mysql_mode() && (types_array[0].is_text() || types_array[0].is_blob())) {
         // do nothing
       } else {
         types_array[0].set_calc_type(ObVarcharType);
+        types_array[0].set_calc_collation_level(type.get_collation_level());
+        types_array[0].set_calc_collation_type(type.get_collation_type());
       }
-      types_array[0].set_calc_collation_level(type.get_calc_collation_level());
-      types_array[0].set_calc_collation_type(type.get_collation_type());
     }
     if (OB_SUCC(ret)) {
       for (int i = 1; i < param_num; i++) {
         types_array[i].set_calc_type(ObIntType);
+        types_array[i].set_calc_collation_level(type.get_collation_level());
       }
     }
     if (OB_SUCC(ret) && !ob_is_text_tc(type.get_type())) {
@@ -468,7 +464,7 @@ int ObExprSubstr::substr(common::ObString &varchar,
       } else {
         if (do_ascii_optimize_check) { // ObCharsetType is CHARSET_UTF8MB4 or CHARSET_GBK
           res_len = min(length, varchar.length() - start);
-          is_ascii = storage::is_ascii_str(varchar.ptr(), start + res_len);
+          is_ascii = storage::is_ascii_str(varchar.ptr() + start, res_len);
         }
         if (is_ascii) {
           varchar.assign_ptr(varchar.ptr() + start, static_cast<int32_t>(res_len));
@@ -888,7 +884,6 @@ int ObExprSubstr::vector_substr(VECTOR_EVAL_FUNC_ARG_DECL)
           eval_flags.set(idx);
         }
       }
-      eval_flags.set_all(bound.start(), bound.end());
     } else {
       // 2. calc substr while result is not all null
       int64_t pos = 0;

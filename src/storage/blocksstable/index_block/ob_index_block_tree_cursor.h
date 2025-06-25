@@ -57,6 +57,8 @@ struct ObIndexBlockTreePathItem
   ~ObIndexBlockTreePathItem() { reset(); }
 
   void reset();
+  void move_from(ObIndexBlockTreePathItem& item_ptr);
+  int assign(const ObIndexBlockTreePathItem& other);
 
   MacroBlockId macro_block_id_;
   int64_t curr_row_idx_;
@@ -169,8 +171,11 @@ public:
       const bool is_lower_bound,
       bool &equal,
       bool &is_beyond_the_range);
+  /* `cascade` and `is_reverse_scan` can set to false by default */
+  int pull_up(const bool cascade, const bool is_reverse_scan);
   int pull_up_to_root();
   int move_forward(const bool is_reverse_scan);
+  int move_forward_micro(const uint64_t step);
 
   TO_STRING_KV(K_(cursor_path), K_(is_normal_cg_sstable), K_(curr_path_item));
 public:
@@ -178,6 +183,8 @@ public:
   int get_idx_parser(const ObIndexBlockRowParser *&parser);
   int get_idx_row_header(const ObIndexBlockRowHeader *&idx_header);
   int get_macro_block_id(MacroBlockId &macro_id);
+  int get_current_node_macro_id(MacroBlockId &macro_id);
+  int get_parent_node_macro_id(MacroBlockId &macro_id);
 
   // Need to release held item at the end of lifetime
   int get_child_micro_infos(
@@ -211,7 +218,6 @@ private:
   // Index blocks store endkeys, so locate with lower_bound() can make sure we find
   // the exact micro block by which the search key is included in range
   int drill_down();
-  int pull_up(const bool cascade = false, const bool is_reverse_scan = false);
   int locate_rowkey_in_curr_block(const ObDatumRowkey &rowkey, bool &is_beyond_the_range);
   int search_rowkey_in_transformed_block(
       const ObDatumRowkey &rowkey,
@@ -233,6 +239,7 @@ private:
       ObIArray<ObDatumRowkey> &end_keys);
   int check_reach_target_depth(const MoveDepth target_depth, bool &reach_target_depth);
   int init_curr_endkey(ObDatumRow &row_buf, const int64_t datum_cnt);
+  int move_until_cannot_skip(int64_t &remain_step);
 
 private:
   static const int64_t OB_INDEX_BLOCK_MAX_COL_CNT =

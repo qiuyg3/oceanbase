@@ -55,6 +55,7 @@ class ObILibCacheObject;
 class ObPhysicalPlan;
 class ObLibCacheAtomicOp;
 class ObEvolutionPlan;
+class ObSpmBaselineLoader;
 
 typedef common::hash::ObHashMap<uint64_t, ObPlanCache *> PlanCacheMap;
 #ifdef OB_BUILD_SPM
@@ -265,12 +266,15 @@ public:
    */
   int add_plan(ObPhysicalPlan *plan, ObPlanCacheCtx &pc_ctx);
 
+  static bool is_contains_external_object(const DependenyTableStore &dep_schema_objs);
   /**
    * Add new ps plan to PlanCache
    */
   template<class T>
   int add_ps_plan(T *plan,
                   ObPlanCacheCtx &pc_ctx);
+  int try_get_plan(common::ObIAllocator &allocator, ObPlanCacheCtx &pc_ctx, ObCacheObjGuard &guard);
+  int try_get_ps_plan(ObCacheObjGuard &guard, const ObPsStmtId stmt_id, ObPlanCacheCtx &pc_ctx);
 
   // cache object access functions
   /* 根据ObPlanCacheKey以及参数在plan cache中查询符合要求的执行计划 */
@@ -361,10 +365,14 @@ public:
   template<typename CallBack = ObKVEntryTraverseOp>
   int foreach_cache_evict(CallBack &cb);
 #ifdef OB_BUILD_SPM
-  int cache_evict_baseline_by_sql_id(uint64_t db_id, common::ObString sql_id);
+  int cache_evict_baseline(uint64_t db_id, common::ObString sql_id);
   // load plan baseline from plan cache
   // int load_plan_baseline();
   int load_plan_baseline(const obrpc::ObLoadPlanBaselineArg &arg, uint64_t &load_count);
+  int batch_load_plan_baseline(const obrpc::ObLoadPlanBaselineArg &arg,
+                               const PlanIdArray &plan_ids,
+                               int64_t &pos,
+                               uint64_t &load_count);
   int check_baseline_finish();
 #endif
   void destroy();

@@ -12,32 +12,10 @@
 
 #define USING_LOG_PREFIX RS
 
-#include "ob_root_inspection.h"
 
-#include "lib/string/ob_sql_string.h"
-#include "lib/mysqlclient/ob_mysql_proxy.h"
-#include "lib/utility/ob_tracepoint.h"
-#include "share/inner_table/ob_inner_table_schema.h"
-#include "share/schema/ob_multi_version_schema_service.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/schema/ob_schema_utils.h"
-#include "share/ob_zone_info.h"
-#include "share/system_variable/ob_system_variable_factory.h"
-#include "share/system_variable/ob_system_variable_init.h"
-#include "rootserver/ob_root_utils.h"
-#include "rootserver/ob_zone_manager.h"
-#include "rootserver/ob_ddl_operator.h"
+#include "ob_root_inspection.h"
 #include "rootserver/ob_root_service.h"
-#include "observer/ob_server_struct.h"
-#include "observer/ob_sql_client_decorator.h"
-#include "share/ob_primary_zone_util.h"
-#include "share/ob_upgrade_utils.h"
-#include "share/rc/ob_context.h"
-#include "share/schema/ob_schema_mgr.h"
-#include "share/ob_schema_status_proxy.h"//ObSchemaStatusProxy
 #include "share/ob_global_stat_proxy.h"//ObGlobalStatProxy
-#include "share/ob_tenant_info_proxy.h" // ObAllTenantInfoProxy
-#include "share/schema/ob_table_schema.h"
 
 namespace oceanbase
 {
@@ -58,11 +36,6 @@ int ObTenantChecker::inspect(bool &passed, const char* &warning_info)
   if (OB_SUCCESS != (tmp_ret = alter_tenant_primary_zone_())) {
     ret = OB_SUCC(ret) ? tmp_ret : ret;
     LOG_WARN("fail to alter tenant primary_zone", KR(ret), KR(tmp_ret));
-  }
-
-  if (OB_SUCCESS != (tmp_ret = check_create_tenant_end_())) {
-    ret = OB_SUCC(ret) ? tmp_ret : ret;
-    LOG_WARN("fail to check create tenant end", KR(ret), KR(tmp_ret));
   }
 
   if (OB_SUCCESS != (tmp_ret = check_garbage_tenant_(passed))) {
@@ -111,65 +84,6 @@ int ObTenantChecker::alter_tenant_primary_zone_()
           ROOTSERVICE_EVENT_ADD("inspector", "alter_tenant_primary_zone",
                                 "tenant_id", tenant_schema->get_tenant_id(),
                                 "tenant", tenant_schema->get_tenant_name());
-        }
-      }
-    }
-  }
-  return ret;
-}
-
-int ObTenantChecker::check_create_tenant_end_()
-{
-  int ret = OB_SUCCESS;
-  ObSchemaGetterGuard schema_guard;
-  ObArray<uint64_t> tenant_ids;
-  if (OB_ISNULL(schema_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("schema service not init", K(ret));
-  } else if (!schema_service_->is_sys_full_schema()) {
-    // skip
-  } else if (GCTX.is_standby_cluster()) {
-    // skip
-  } else if (OB_FAIL(schema_service_->get_tenant_ids(tenant_ids))) {
-    LOG_WARN("get_tenant_ids failed", K(ret));
-  } else if (OB_ISNULL(GCTX.root_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("rootservice is null", KR(ret));
-  } else {
-    const ObSimpleTenantSchema *tenant_schema = NULL;
-    int64_t schema_version = OB_INVALID_VERSION;
-    int64_t baseline_schema_version = OB_INVALID_VERSION;
-    FOREACH_CNT(tenant_id, tenant_ids) {
-      // overwrite ret
-      if (!GCTX.root_service_->is_full_service()) {
-        ret = OB_CANCELED;
-        LOG_WARN("rs is not in full service", KR(ret));
-        break;
-      } else if (OB_FAIL(schema_service_->get_tenant_schema_guard(*tenant_id, schema_guard))) {
-        LOG_WARN("get_schema_guard failed", KR(ret), K(*tenant_id));
-      } else if (OB_FAIL(schema_guard.get_schema_version(*tenant_id, schema_version))) {
-        LOG_WARN("fail to get tenant schema version", KR(ret), K(*tenant_id));
-      } else if (!share::schema::ObSchemaService::is_formal_version(schema_version)) {
-        // tenant is still in creating
-      } else if (OB_FAIL(schema_guard.get_tenant_info(*tenant_id, tenant_schema))) {
-        LOG_WARN("fail to get tenant schema", KR(ret), K(*tenant_id));
-      } else if (OB_ISNULL(tenant_schema)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("tenant not exist", KR(ret), K(*tenant_id));
-      } else if (OB_FAIL(schema_service_->get_baseline_schema_version(*tenant_id, false/*auto update*/,
-                                                                      baseline_schema_version))) {
-        LOG_WARN("fail to get baseline schema_version", KR(ret), K(*tenant_id));
-      } else if (OB_INVALID_VERSION == baseline_schema_version) {
-        //baseline_schema_version is not valid, just skip to create this kind of tenant
-      } else if (tenant_schema->is_creating()) {
-        obrpc::ObCreateTenantEndArg arg;
-        arg.exec_tenant_id_ = OB_SYS_TENANT_ID;
-        arg.tenant_id_ = *tenant_id;
-        if (OB_FAIL(rpc_proxy_.create_tenant_end(arg))) {
-          LOG_WARN("fail to execute create tenant end", KR(ret), K(*tenant_id));
-        } else {
-          LOG_INFO("execute create_tenant_end", KR(ret), K(*tenant_id), K(schema_version));
-          ROOTSERVICE_EVENT_ADD("inspector", "tenant_checker", "info", "execute create_tenant_end", "tenant_id", *tenant_id);
         }
       }
     }
@@ -312,7 +226,7 @@ int ObTableGroupChecker::inspect_(
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < table_ids.count(); i++) {
       const uint64_t table_id = table_ids.at(i);
-      const ObTableSchema *table = NULL;
+      const ObSimpleTableSchemaV2 *table = NULL;
       // schema guard cannot be used repeatedly in iterative logic,
       // otherwise it will cause a memory hike in schema cache
       if (!GCTX.root_service_->is_full_service()) {
@@ -320,7 +234,7 @@ int ObTableGroupChecker::inspect_(
         LOG_WARN("rs is not in full service", KR(ret));
       } else if (OB_FAIL(schema_service_.get_tenant_schema_guard(tenant_id, schema_guard))) {
         LOG_WARN("get schema guard failed", K(ret), K(tenant_id));
-      } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_id, table))) {
+      } else if (OB_FAIL(schema_guard.get_simple_table_schema(tenant_id, table_id, table))) {
         LOG_WARN("get table schema failed", K(ret), KT(table_id));
       } else if (OB_ISNULL(table)) {
         ret = OB_ERR_UNEXPECTED;
@@ -890,7 +804,7 @@ int ObRootInspection::check_sys_param_(const uint64_t tenant_id)
              "table_name", OB_ALL_SYS_VARIABLE_TNAME, K(sys_param_names), K(extra_cond));
   }
   if (OB_SCHEMA_ERROR != ret) {
-  } else if (GCONF.in_upgrade_mode()) {
+  } else if (need_ignore_error_message_(tenant_id)) {
     LOG_WARN("check sys_variable failed", KR(ret));
   } else {
     LOG_DBA_ERROR(OB_ERR_ROOT_INSPECTION, "msg", "system variables are unmatched", KR(ret));
@@ -991,8 +905,6 @@ int ObRootInspection::calc_diff_names(const uint64_t tenant_id,
                                       ObIArray<Name> &miss_names /* data inner table less than hard code*/)
 {
   int ret = OB_SUCCESS;
-  ObRefreshSchemaStatus schema_status;
-  schema_status.tenant_id_ = tenant_id;
   fetch_names.reset();
   if (!inited_) {
     ret = OB_NOT_INIT;
@@ -1007,28 +919,21 @@ int ObRootInspection::calc_diff_names(const uint64_t tenant_id,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("table_name is null or names is empty",
              KR(ret), K(tenant_id), KP(table_name), K(names));
-  } else if (GCTX.is_standby_cluster() && is_user_tenant(tenant_id)) {
-    if (OB_ISNULL(GCTX.schema_status_proxy_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("schema status proxy is null", K(ret));
-    } else if (OB_FAIL(GCTX.schema_status_proxy_->get_refresh_schema_status(tenant_id, schema_status))) {
-      LOG_WARN("fail to get schema status", KR(ret), K(tenant_id));
-    }
   }
 
   if (OB_SUCC(ret)) {
-    const uint64_t exec_tenant_id = schema_status.tenant_id_;
-    int64_t snapshot_timestamp = schema_status.snapshot_timestamp_;
+    const uint64_t exec_tenant_id = tenant_id;
     ObSqlString sql;
-    ObSQLClientRetryWeak sql_client_retry_weak(sql_proxy_,
-                                               snapshot_timestamp);
     if (OB_FAIL(sql.append_fmt("SELECT name FROM %s%s%s", table_name,
         (extra_cond.empty()) ? "" : " WHERE ", extra_cond.ptr()))) {
       LOG_WARN("append_fmt failed", KR(ret), K(tenant_id), K(table_name), K(extra_cond));
+    } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("GCTX.sql_proxy_ is null", KR(ret), KP(GCTX.sql_proxy_));
     } else {
       SMART_VAR(ObMySQLProxy::MySQLResult, res) {
         ObMySQLResult *result = NULL;
-        if (OB_FAIL(sql_client_retry_weak.read(res, exec_tenant_id, sql.ptr()))) {
+        if (OB_FAIL(GCTX.sql_proxy_->read(res, exec_tenant_id, sql.ptr()))) {
           LOG_WARN("execute sql failed", KR(ret), K(tenant_id), K(sql));
           can_retry_ = true;
         } else if (OB_ISNULL(result = res.get_result())) {
@@ -1063,7 +968,7 @@ int ObRootInspection::calc_diff_names(const uint64_t tenant_id,
     if (OB_SUCC(ret)) {
       if (fetch_names.count() <= 0) {
         LOG_WARN("maybe tenant or zone has been deleted, ignore it",
-                 KR(ret), K(schema_status), K(table_name), K(extra_cond));
+                 KR(ret), K(table_name), K(extra_cond));
       } else {
         extra_names.reset();
         miss_names.reset();
@@ -1207,7 +1112,7 @@ int ObRootInspection::check_sys_table_schemas_(
     ret = OB_SUCC(ret) ? back_ret : ret;
   }
   if (OB_SCHEMA_ERROR != ret) {
-  } else if (GCONF.in_upgrade_mode()) {
+  } else if (need_ignore_error_message_(tenant_id)) {
     LOG_WARN("check sys table schema failed", KR(ret), K(tenant_id));
   } else {
     LOG_ERROR("check sys table schema failed", KR(ret), K(tenant_id));
@@ -1286,9 +1191,8 @@ int ObRootInspection::check_table_schema(const ObTableSchema &hard_code_table,
               "table_name", hard_code_table.get_table_name(), "column",
               hard_code_column->get_column_name(), K(ret));
         } else {
-          const bool ignore_column_id = is_virtual_table(hard_code_table.get_table_id());
           if (OB_FAIL(check_column_schema_(hard_code_table.get_table_name(),
-              *column, *hard_code_column, ignore_column_id))) {
+              *column, *hard_code_column))) {
             LOG_WARN("column schema mismatch with hard code column schema",
                 "table_name",inner_table.get_table_name(), "column", *column,
                 "hard_code_column", *hard_code_column, K(ret));
@@ -1333,7 +1237,6 @@ int ObRootInspection::check_and_get_system_table_column_diff(
     const ObColumnSchemaV2 *column = NULL;
     const ObColumnSchemaV2 *hard_code_column = NULL;
     ObColumnSchemaV2 tmp_column; // check_column_can_be_altered_online() may change dst_column, is ugly.
-    bool ignore_column_id = false;
 
     // case 1. check if columns should be dropped.
     // case 2. check if column can be altered online.
@@ -1353,8 +1256,7 @@ int ObRootInspection::check_and_get_system_table_column_diff(
         // case 2
         int tmp_ret = check_column_schema_(table_schema.get_table_name_str(),
                                            *column,
-                                           *hard_code_column,
-                                           ignore_column_id);
+                                           *hard_code_column);
         if (OB_SUCCESS == tmp_ret) {
           // not changed
         } else if (OB_SCHEMA_ERROR != tmp_ret) {
@@ -1438,6 +1340,7 @@ int ObRootInspection::check_sys_view_(
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       common::sqlclient::ObMySQLResult *result = NULL;
       ObSqlString sql;
+      ObASHSetInnerSqlWaitGuard ash_inner_sql_guard(ObInnerSqlWaitTypeId::RS_CHECK_SYS_VIEW_EXPANSION);
       // case 0: check expansion of sys view definition
       if (is_oracle) {
         if (OB_FAIL(sql.assign_fmt("SELECT FIELD FROM \"%s\".\"%s\" WHERE TABLE_ID = %lu",
@@ -1654,8 +1557,7 @@ int ObRootInspection::check_table_options_(const ObTableSchema &table,
 
 int ObRootInspection::check_column_schema_(const ObString &table_name,
                                            const ObColumnSchemaV2 &column,
-                                           const ObColumnSchemaV2 &hard_code_column,
-                                           const bool ignore_column_id)
+                                           const ObColumnSchemaV2 &hard_code_column)
 {
   int ret = OB_SUCCESS;
   if (table_name.empty() || !column.is_valid() || !hard_code_column.is_valid()) {
@@ -1689,9 +1591,7 @@ int ObRootInspection::check_column_schema_(const ObString &table_name,
       }
     }
 
-    if (!ignore_column_id) {
-      CMP_COLUMN_ATTR(column_id);
-    }
+    CMP_COLUMN_ATTR(column_id);
     CMP_COLUMN_ATTR(tenant_id);
     CMP_COLUMN_ATTR(table_id);
     // don't need to check schema version
@@ -1801,6 +1701,37 @@ int ObRootInspection::check_cancel()
     ret = OB_CANCELED;
   }
   return ret;
+}
+
+int ObRootInspection::check_in_compatibility_mode_(const int64_t &tenant_id, bool &in_compatibility_mode)
+{
+  int ret = OB_SUCCESS;
+  uint64_t data_version = 0;
+  if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, data_version))) {
+    LOG_WARN("failed to get data version", KR(ret), K(tenant_id));
+  } else {
+    in_compatibility_mode = (data_version < DATA_CURRENT_VERSION);
+  }
+  return ret;
+}
+
+bool ObRootInspection::need_ignore_error_message_(const int64_t &tenant_id)
+{
+  int ret = OB_SUCCESS;
+  bool ignore = false;
+  bool in_compatibility_mode = false;
+  if (GCONF.in_upgrade_mode()) {
+    LOG_INFO("in upgrade mode, ignore root inspection error message", KR(ret),
+        K(GCONF.in_upgrade_mode()));
+    ignore = true;
+  } else if (OB_FAIL(check_in_compatibility_mode_(tenant_id, in_compatibility_mode))) {
+    LOG_WARN("failed to check compatible", KR(ret), K(tenant_id));
+  } else if (in_compatibility_mode) {
+    LOG_INFO("compatible not change to DATA_CURRENT_VERSION, ignore root inspection error message",
+        KR(ret), K(tenant_id), K(in_compatibility_mode));
+    ignore = true;
+  }
+  return ignore;
 }
 
 int ObRootInspection::check_tenant_status_(const uint64_t tenant_id)

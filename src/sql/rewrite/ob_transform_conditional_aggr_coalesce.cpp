@@ -13,8 +13,6 @@
 #define USING_LOG_PREFIX SQL_REWRITE
 #include "sql/rewrite/ob_transform_conditional_aggr_coalesce.h"
 #include "sql/rewrite/ob_transform_utils.h"
-#include "sql/optimizer/ob_optimizer_util.h"
-#include "common/ob_smart_call.h"
 #include "share/stat/ob_opt_stat_manager.h"
 #include "sql/optimizer/ob_log_plan.h"
 using namespace oceanbase::sql;
@@ -48,9 +46,8 @@ int ObTransformConditionalAggrCoalesce::transform_one_stmt(
   if (OB_ISNULL(stmt) || OB_ISNULL(ctx_) || OB_ISNULL(stmt->get_query_ctx())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("param has null", K(ret), K(stmt), K(ctx_));
-  } else if (stmt->get_query_ctx()->optimizer_features_enable_version_ < COMPAT_VERSION_4_2_3 ||
-             (stmt->get_query_ctx()->optimizer_features_enable_version_ >= COMPAT_VERSION_4_3_0 &&
-              stmt->get_query_ctx()->optimizer_features_enable_version_ < COMPAT_VERSION_4_3_2)) {
+  } else if (!stmt->get_query_ctx()->check_opt_compat_version(COMPAT_VERSION_4_2_3, COMPAT_VERSION_4_3_0,
+                                                              COMPAT_VERSION_4_3_2)) {
     // do nothing
   } else if (OB_FAIL(check_hint_valid(*stmt,
                                       force_trans_wo_pullup,
@@ -773,10 +770,10 @@ int ObTransformConditionalAggrCoalesce::coalesce_cond_aggrs(ObIArray<ObAggFunRaw
                                            new_case_expr))) {
         LOG_WARN("failed to build case when exprs", K(ret));
       } else if (OB_FALSE_IT(cast_case_expr = new_case_expr)) {
-      } else if (ObTransformUtils::add_cast_for_replace_if_need(*ctx_->expr_factory_,
+      } else if (OB_FAIL(ObTransformUtils::add_cast_for_replace_if_need(*ctx_->expr_factory_,
                                                                 cond_aggr,
                                                                 cast_case_expr,
-                                                                ctx_->session_info_)) {
+                                                                ctx_->session_info_))) {
         LOG_WARN("failed to add cast", K(ret));
       } else if (OB_FAIL(case_exprs.push_back(cast_case_expr))) {
         LOG_WARN("failed to push back expr", K(ret));
@@ -911,6 +908,7 @@ int ObTransformConditionalAggrCoalesce::create_and_replace_aggrs_for_merge(ObSel
     for (int i = 0; OB_SUCC(ret) && i < view_stmt->get_select_item_size(); i++) {
       ObRawExpr *col_expr = NULL;
       ObAggFunRawExpr* aggr_for_merge = NULL;
+      ObRawExpr *aggr_with_cast = NULL;
       ObItemType aggr_type = T_INVALID;
       if (OB_ISNULL(select_expr = view_stmt->get_select_item(i).expr_)) {
         ret = OB_ERR_UNEXPECTED;
@@ -927,9 +925,15 @@ int ObTransformConditionalAggrCoalesce::create_and_replace_aggrs_for_merge(ObSel
         LOG_WARN("failed to create aggr for merge", K(ret));
       } else if (OB_FAIL(select_stmt->get_aggr_items().push_back(aggr_for_merge))) {
         LOG_WARN("failed to push back expr", K(ret));
+      } else if (OB_FALSE_IT(aggr_with_cast = aggr_for_merge)) {
+      } else if (OB_FAIL(ObTransformUtils::add_cast_for_replace_if_need(*ctx_->expr_factory_,
+                                                                        col_expr,
+                                                                        aggr_with_cast,
+                                                                        ctx_->session_info_))) {
+        LOG_WARN("failed to add cast", K(ret));
       } else if (OB_FAIL(cols_for_replace.push_back(col_expr))) {
         LOG_WARN("failed to push back expr", K(ret));
-      } else if (OB_FAIL(aggrs_for_merge.push_back(aggr_for_merge))) {
+      } else if (OB_FAIL(aggrs_for_merge.push_back(aggr_with_cast))) {
         LOG_WARN("failed to push back expr", K(ret));
       }
     }

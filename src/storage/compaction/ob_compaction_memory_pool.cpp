@@ -13,19 +13,15 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_compaction_memory_pool.h"
-#include "lib/oblog/ob_log_module.h"
 #include "share/ob_force_print_log.h"
 #include "share/ob_thread_mgr.h"
-#include "lib/allocator/ob_mod_define.h"
-#include "share/rc/ob_tenant_base.h"
-#include "share/scheduler/ob_tenant_dag_scheduler.h"
 #include "storage/compaction/ob_compaction_memory_context.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
 using namespace oceanbase::storage;
 using namespace oceanbase::blocksstable;
-
+using namespace oceanbase::share;
 
 ObCompactionBufferBlock::ObCompactionBufferBlock()
   : header_(nullptr),
@@ -272,7 +268,7 @@ void ObTenantCompactionMemPool::reset()
     total_block_num_ = 0;
     used_block_num_ = 0;
     reserve_mode_signal_ = 0;
-    mem_mode_ = MemoryMode::NORMAL_MODE;
+    mem_mode_ = NORMAL_MODE;
     is_inited_ = false;
   }
 
@@ -557,6 +553,28 @@ bool ObTenantCompactionMemPool::release_reserve_mem()
   return bret;
 }
 
+void ObTenantCompactionMemPool::uplevel_memory_mode(const bool is_reserve_mode)
+{
+  MemoryMode cur_mode = NORMAL_MODE;
+  MemoryMode new_mode = NORMAL_MODE;
+
+  if (MTL_IS_MINI_MODE()) {
+    new_mode = CRITICAL_MODE;
+  } else if (cur_mode == ATOMIC_LOAD(&mem_mode_)) {
+    new_mode = EMERGENCY_MODE;
+  } else if (is_reserve_mode) {
+    cur_mode = EMERGENCY_MODE;
+    new_mode = CRITICAL_MODE;
+  }
+
+  if (cur_mode == new_mode) {
+    // no need to update mem mode
+  } else if (cur_mode == ATOMIC_CAS(&mem_mode_, cur_mode, new_mode)) {
+    FLOG_INFO("update compaction memory mode", K(cur_mode), K(new_mode), K(is_reserve_mode));
+  }
+}
+
+
 
 /* ********************************************** ObCompactionBufferWriter ********************************************** */
 ObCompactionBufferWriter::ObCompactionBufferWriter(
@@ -616,7 +634,7 @@ int ObCompactionBufferWriter::ensure_space(int64_t size)
     if (OB_FAIL(resize(size))) {
       LOG_WARN("failed to resize buffer writer", K(ret), K(size));
     } else {
-      LOG_INFO("success to resize buffer writer", K(ret), K(size));
+      LOG_TRACE("success to resize buffer writer", K(ret), K(size));
     }
   }
 

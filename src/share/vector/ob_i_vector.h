@@ -52,10 +52,26 @@ namespace common
                                 const ObLength r_len,       \
                                 int &cmp_ret
 
+#define VECTOR_COMPARE_BATCH_ROWS_ARGS const sql::ObExpr &expr,    \
+                                const uint16_t *sel,               \
+                                const uint16_t sel_cnt,            \
+                                sql::ObCompactRow **rows,          \
+                                const int64_t row_col_idx,         \
+                                const sql::RowMeta &row_meta,      \
+                                int *cmp_ret
 #define VECTOR_NOT_NULL_COMPARE_ARGS const sql::ObExpr &expr,    \
                                 const int64_t row_idx1,      \
                                 const int64_t row_idx2,      \
                                 int &cmp_ret
+#define VECTOR_MUL_COMPARE_ARGS const sql::ObExpr &expr,      \
+                                const sql::ObBitVector &skip, \
+                                const sql::EvalBound &bound,  \
+                                const bool r_null,            \
+                                const char *r_v,              \
+                                const ObLength r_len,         \
+                                int64_t &diff_row_idx,        \
+                                int &cmp_ret
+
 #define DEF_VEC_READ_INTERFACES(Derived)                                                           \
 public:                                                                                            \
   OB_INLINE bool is_false(const int64_t idx) const                                                 \
@@ -174,6 +190,10 @@ public:                                                                         
   {                                                                                                \
     return get<int64_t>(idx);                                                                      \
   }                                                                                                \
+  OB_INLINE int64_t get_mysql_datetime(const int64_t idx) const                            \
+  {                                                                                                \
+    return get<int64_t>(idx);                                                              \
+  }                                                                                                \
   OB_INLINE int64_t get_timestamp(const int64_t idx) const                                         \
   {                                                                                                \
     return get<int64_t>(idx);                                                                      \
@@ -181,6 +201,10 @@ public:                                                                         
   OB_INLINE int32_t get_date(const int64_t idx) const                                              \
   {                                                                                                \
     return get<int32_t>(idx);                                                                      \
+  }                                                                                                \
+  OB_INLINE int32_t get_mysql_date(const int64_t idx) const                                    \
+  {                                                                                                \
+    return get<int32_t>(idx);                                                                  \
   }                                                                                                \
   OB_INLINE int64_t get_time(const int64_t idx) const                                              \
   {                                                                                                \
@@ -201,6 +225,10 @@ public:                                                                         
   OB_INLINE const ObOTimestampData &get_otimestamp_tz(const int64_t idx) const                     \
   {                                                                                                \
     return *(reinterpret_cast<const ObOTimestampData *>(derived_this().get_payload(idx)));         \
+  }                                                                                                \
+  OB_INLINE const ObOTimestampTinyData &get_otimestamp_tiny(const int64_t idx) const                     \
+  {                                                                                                \
+    return *(reinterpret_cast<const ObOTimestampTinyData *>(derived_this().get_payload(idx)));         \
   }                                                                                                \
   OB_INLINE ObString get_string(const int64_t idx) const                                           \
   {                                                                                                \
@@ -303,6 +331,10 @@ public:                                                                         
   {                                                                                                \
     set<int64_t>(idx, v);                                                                          \
   }                                                                                                \
+  OB_INLINE void set_mysql_datetime(const int64_t idx, const ObMySQLDateTime v)                    \
+  {                                                                                                \
+    set<ObMySQLDateTime>(idx, v);                                                                  \
+  }                                                                                                \
   OB_INLINE void set_timestamp(const int64_t idx, const int64_t v)                                 \
   {                                                                                                \
     set<int64_t>(idx, v);                                                                          \
@@ -314,6 +346,10 @@ public:                                                                         
   OB_INLINE void set_date(const int64_t idx, const int32_t v)                                      \
   {                                                                                                \
     set<int32_t>(idx, v);                                                                          \
+  }                                                                                                \
+  OB_INLINE void set_mysql_date(const int64_t idx, const ObMySQLDate v)                            \
+  {                                                                                                \
+    set<ObMySQLDate>(idx, v);                                                                      \
   }                                                                                                \
   OB_INLINE void set_year(const int64_t idx, const int8_t v)                                       \
   {                                                                                                \
@@ -329,15 +365,15 @@ public:                                                                         
   }                                                                                                \
   OB_INLINE void set_interval_ds(const int64_t idx, const ObIntervalDSValue &v)                    \
   {                                                                                                \
-    derived_this().set_payload_shallow(idx, &v, v.get_store_size());                               \
+    derived_this().set_payload(idx, &v, v.get_store_size());                                       \
   }                                                                                                \
   OB_INLINE void set_otimestamp_tz(const int64_t idx, const ObOTimestampData &v)                   \
   {                                                                                                \
-    *(reinterpret_cast<ObOTimestampData *>(no_cv(derived_this().get_payload(idx)))) = v;           \
+    derived_this().set_payload(idx, &v, sizeof(v));                                                \
   }                                                                                                \
-  OB_INLINE void set_otimestamp(const int64_t idx, const ObOTimestampData &v)                      \
+  OB_INLINE void set_otimestamp_tiny(const int64_t idx, const ObOTimestampTinyData &v)             \
   {                                                                                                \
-    *(reinterpret_cast<ObOTimestampData *>(no_cv(derived_this().get_payload(idx)))) = v;           \
+    derived_this().set_payload(idx, &v, sizeof(v));                                                \
   }                                                                                                \
   OB_INLINE void set_number(const int64_t idx, const number::ObNumber &num)                        \
   {                                                                                                \
@@ -495,6 +531,11 @@ public:
   virtual int null_first_cmp(VECTOR_ONE_COMPARE_ARGS) const = 0;
   virtual int null_last_cmp(VECTOR_ONE_COMPARE_ARGS) const = 0;
   virtual int no_null_cmp(VECTOR_NOT_NULL_COMPARE_ARGS) const = 0;
+  // compare the values ​​in the given interval with EvalBound and return the first unequal row idx
+  virtual int null_first_mul_cmp(VECTOR_MUL_COMPARE_ARGS) const = 0;
+  virtual int null_last_mul_cmp(VECTOR_MUL_COMPARE_ARGS) const = 0;
+  virtual int null_first_cmp_batch_rows(VECTOR_COMPARE_BATCH_ROWS_ARGS) const = 0;
+  virtual int no_null_cmp_batch_rows(VECTOR_COMPARE_BATCH_ROWS_ARGS) const = 0;
 
   // append values to this vector from idx-th column of rows
   virtual int from_rows(const sql::RowMeta &row_meta,
@@ -514,13 +555,13 @@ public:
                        const int64_t col_idx) = 0;
 
   // set values from this vector to idx-th column of rows
-  virtual void to_rows(const sql::RowMeta &row_meta,
+  virtual int to_rows(const sql::RowMeta &row_meta,
                       sql::ObCompactRow **stored_rows,
                       const uint16_t selector[],
                       const int64_t size,
                       const int64_t col_idx) const = 0;
 
-  virtual void to_rows(const sql::RowMeta &row_meta,
+  virtual int to_rows(const sql::RowMeta &row_meta,
                       sql::ObCompactRow **stored_rows,
                       const int64_t size,
                       const int64_t col_idx) const = 0;

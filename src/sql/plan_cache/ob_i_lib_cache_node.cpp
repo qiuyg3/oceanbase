@@ -11,7 +11,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_PC
-#include "sql/plan_cache/ob_i_lib_cache_node.h"
+#include "ob_i_lib_cache_node.h"
 #include "sql/plan_cache/ob_plan_cache.h"
 
 using namespace oceanbase::common;
@@ -127,6 +127,9 @@ int ObILibCacheNode::add_cache_obj(ObILibCacheCtx &ctx,
       obj->set_added_lc(true);
       LOG_DEBUG("succ to add cache obj", KPC(obj));
     }
+  }
+  if (OB_FAIL(ret) && ret != OB_SQL_PC_PLAN_DUPLICATE) {
+    is_invalid_ = true;
   }
   return ret;
 }

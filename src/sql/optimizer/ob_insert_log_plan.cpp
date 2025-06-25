@@ -11,25 +11,13 @@
  */
 
 #define USING_LOG_PREFIX SQL_OPT
-#include "sql/resolver/dml/ob_insert_stmt.h"
-#include "sql/optimizer/ob_log_insert.h"
+#include "sql/optimizer/ob_log_select_into.h"
 #include "sql/optimizer/ob_insert_log_plan.h"
-#include "sql/optimizer/ob_log_operator_factory.h"
-#include "sql/optimizer/ob_log_plan_factory.h"
-#include "sql/optimizer/ob_select_log_plan.h"
 #include "sql/optimizer/ob_log_expr_values.h"
-#include "sql/optimizer/ob_log_group_by.h"
-#include "sql/optimizer/ob_log_table_scan.h"
-#include "sql/engine/expr/ob_expr_column_conv.h"
-#include "sql/optimizer/ob_log_subplan_filter.h"
 #include "sql/optimizer/ob_log_insert_all.h"
-#include "sql/optimizer/ob_log_link_dml.h"
-#include "sql/ob_optimizer_trace_impl.h"
-#include "common/ob_smart_call.h"
 #include "sql/resolver/dml/ob_del_upd_resolver.h"
-#include "share/system_variable/ob_sys_var_class_type.h"
-#include "share/stat/ob_stat_define.h"
 #include "sql/rewrite/ob_transform_utils.h"
+#include "share/stat/ob_dbms_stats_utils.h"
 using namespace oceanbase;
 using namespace sql;
 using namespace oceanbase::common;
@@ -82,28 +70,35 @@ int ObInsertLogPlan::generate_normal_raw_plan()
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "update values contain non onetime subquery");
         LOG_WARN("update values contain non onetime subquery", K(ret));
-      } else if (!subquery.empty() && OB_FAIL(candi_allocate_subplan_filter(subquery))) {
-        LOG_WARN("failed to allocate subplan", K(ret));
+      } else if (OB_FAIL(candi_allocate_subplan_filter_for_assignments(assign_exprs))) {
+        LOG_WARN("failed to allocate subplan filter for assignments", K(ret));
       } else { /*do nothing*/ }
     }
 
     bool need_osg = false;
     OSGShareInfo *osg_info = NULL;
+    double online_sample_percent = 100.;
     if (OB_SUCC(ret)) {
-      // compute parallel before check allocate stats gather
-      if (OB_FAIL(compute_dml_parallel())) {
+      if (OB_FAIL(check_use_direct_load())) {
+        LOG_WARN("failed to check use direct load", K(ret));
+      } else if (OB_FAIL(prepare_dml_infos())) {
+        LOG_WARN("failed to prepare dml infos", K(ret));
+      } else if (OB_FAIL(compute_dml_parallel())) {
         LOG_WARN("failed to compute dml parallel", K(ret));
-      } else if (use_pdml() && OB_FAIL(set_is_direct_insert())) {
-        LOG_WARN("failed to set is direct insert", K(ret));
       }
       if (OB_SUCC(ret)) {
         bool tmp_need_osg = false;
         if (OB_FAIL(check_need_online_stats_gather(tmp_need_osg))) {
           LOG_WARN("fail to check wether we need optimizer stats gathering operator", K(ret));
+        } else if (tmp_need_osg &&
+                   OB_FAIL(get_online_estimate_percent(online_sample_percent))) {
+          LOG_WARN("failed to get sys online sample percent", K(ret));
         } else {
-          if (is_direct_insert()) {
+          if (get_optimizer_context().get_direct_load_optimizer_ctx().use_direct_load()) {
             get_optimizer_context().get_exec_ctx()->get_table_direct_insert_ctx()
               .set_is_online_gather_statistics(tmp_need_osg);
+            get_optimizer_context().get_exec_ctx()->get_table_direct_insert_ctx()
+              .set_online_sample_percent(online_sample_percent);
           } else {
             need_osg = tmp_need_osg;
           }
@@ -116,12 +111,21 @@ int ObInsertLogPlan::generate_normal_raw_plan()
       } else if (need_osg && OB_ISNULL(osg_info)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get unexpected null");
+      } else if (need_osg) {
+        osg_info->online_sample_rate_ = online_sample_percent;
       }
     }
-
     if (OB_SUCC(ret)) {
-      if (OB_FAIL(prepare_dml_infos())) {
-        LOG_WARN("failed to prepare dml infos", K(ret));
+      TableItem *insert_table = NULL;
+      if (OB_ISNULL(insert_table = insert_stmt->get_table_item_by_id(insert_stmt->get_insert_table_info().table_id_))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("insert target table is unexpected null", K(ret));
+      } else if (schema::EXTERNAL_TABLE == insert_table->table_type_) {
+        if (OB_FAIL(candi_allocate_select_into_for_insert())) {
+          LOG_WARN("failed to allocate select into op", K(ret));
+        } else {
+          LOG_TRACE("succeed to allocate select into clause", K(candidates_.candidate_plans_.count()));
+        }
       } else if (use_pdml()) {
         if (OB_FAIL(candi_allocate_pdml_insert(osg_info))) {
           LOG_WARN("failed to allocate pdml insert", K(ret));
@@ -333,44 +337,6 @@ int ObInsertLogPlan::generate_osg_share_info(OSGShareInfo *&info)
   return ret;
 }
 
-// Direct-insert is enabled only:
-// 1. pdml insert
-// 2. _ob_enable_direct_load
-// 3. insert into select clause
-// 4. append hint or direct_load hint
-// 5. full_direct_load(auto_commit, not in a transaction) or inc_direct_load
-int ObInsertLogPlan::set_is_direct_insert() {
-  int ret = OB_SUCCESS;
-  is_direct_insert_ = false;
-  bool auto_commit = false;
-  const ObSQLSessionInfo* session_info = get_optimizer_context().get_session_info();
-  if (OB_ISNULL(get_stmt()) || OB_ISNULL(session_info)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get unexpected null", K(ret), K(get_stmt()), K(session_info));
-  } else if (get_stmt()->is_overwrite()) {
-    // insert overwrite with full direct load
-    if (OB_FAIL(session_info->get_autocommit(auto_commit))) {
-      LOG_WARN("failed to get auto commit", KR(ret));
-    } else if (auto_commit && !session_info->is_in_transaction()){
-      is_direct_insert_ = true;
-      set_is_insert_overwrite(true);
-    }
-  } else if (!get_stmt()->value_from_select()
-             || (!get_optimizer_context().get_global_hint().has_direct_load())
-             || !GCONF._ob_enable_direct_load) {
-  } else if (get_optimizer_context().get_global_hint().has_inc_direct_load()) {
-    is_direct_insert_ = true;
-  } else {
-    // full direct load
-    if (OB_FAIL(session_info->get_autocommit(auto_commit))) {
-      LOG_WARN("failed to get auto commit", KR(ret));
-    } else if (auto_commit && !session_info->is_in_transaction()){
-      is_direct_insert_ = true;
-    }
-  }
-  return ret;
-}
-
 int ObInsertLogPlan::check_contain_non_onetime_expr(const ObRawExpr *expr, bool &contain)
 {
   int ret = OB_SUCCESS;
@@ -444,11 +410,19 @@ int ObInsertLogPlan::check_need_online_stats_gather(bool &need_osg)
     // shouldn't gather stats if the stmt is insert update.
     // if the online_opt_stat_gather is enable, should gather opt_stats even there is no hint.
     // if the online_opt_stat_gather is disable, only gather opt_stats when there is hint.
-    need_osg = need_gathering
-               && !get_optimizer_context().get_query_ctx()->get_global_hint().has_no_gather_opt_stat_hint()
-               && online_sys_var
-               && ((get_optimizer_context().get_query_ctx()->get_global_hint().should_generate_osg_operator())
-                   || use_pdml());
+    if (!need_gathering ||
+        get_optimizer_context().get_query_ctx()->get_global_hint().has_no_gather_opt_stat_hint()) {
+      need_osg = false;
+    } else if (get_optimizer_context().get_query_ctx()->get_global_hint().has_gather_opt_stat_hint()) {
+      need_osg = true;
+    } else if (!online_sys_var) {
+      need_osg = false;
+    } else if (use_pdml() ||
+               get_optimizer_context().get_query_ctx()->get_global_hint().should_generate_osg_operator()) {
+      need_osg = true;
+    } else {
+      need_osg = false;
+    }
     LOG_TRACE("online insert stat", K(online_sys_var), K(need_osg), K(need_gathering));
   }
   return ret;
@@ -722,6 +696,10 @@ int ObInsertLogPlan::allocate_insert_as_top(ObLogicalOperator *&top,
     insert_op->set_table_partition_info(table_partition_info);
     insert_op->set_lock_row_flag_expr(lock_row_flag_expr);
     insert_op->set_has_instead_of_trigger(insert_stmt->has_instead_of_trigger());
+    if (get_can_use_parallel_das_dml()) {
+      insert_op->set_das_dop(max_dml_parallel_);
+      LOG_TRACE("insert das dop", K(max_dml_parallel_));
+    }
     insert_op->set_is_partition_wise(is_partition_wise);
     if (OB_NOT_NULL(insert_stmt->get_table_item(0))) {
       insert_op->set_append_table_id(insert_stmt->get_table_item(0)->ref_id_);
@@ -872,6 +850,9 @@ int ObInsertLogPlan::check_insert_plan_need_multi_partition_dml(ObTablePartition
   } else if (0 == insert_table_part->get_phy_tbl_location_info().get_partition_cnt()) {
     is_multi_part_dml = true;
     OPT_TRACE("insert table has no partition, force use multi part dml");
+  } else if (use_parallel_das_dml_) {
+    is_multi_part_dml = true;
+    OPT_TRACE("insert table use parallel das dml, force use multi part dml");
   } else if (insert_stmt->has_instead_of_trigger() ||
              index_dml_infos_.count() > 1 ||
              get_optimizer_context().is_batched_multi_stmt() ||
@@ -1333,27 +1314,43 @@ int ObInsertLogPlan::prepare_unique_constraint_info(const ObTableSchema &index_s
                                           constraint_info.constraint_columns_,
                                           true))) {
     LOG_WARN("failed to generate index rowkey exprs", K(ret));
-  } else if (!index_schema.is_index_table() && index_schema.is_heap_table()) {
+  } else if (!index_schema.is_index_table() && index_schema.is_table_without_pk()) {
     // 如果是堆表，那么这里还需要在 constraint_info.constraint_columns_中追加分区建
     // 因为4.0版本堆表 分区建 + hidden_pk 才能保证唯一性
     const ColumnItem *col_item = NULL;
-    ObSEArray<uint64_t, 5> rowkey_partkey_ids;
-    if (OB_FAIL(index_schema.get_rowkey_partkey_column_ids(rowkey_partkey_ids))) {
-      LOG_WARN("fail to get rowkey partkey column_ids", K(ret), K(index_schema.get_table_id()));
+    const ObRowkeyColumn *key_column = NULL;
+    ObSEArray<uint64_t, 5> partkey_ids;
+    const ObPartitionKeyInfo &partition_info = index_schema.get_partition_key_info();
+    const ObPartitionKeyInfo &sub_partition_info = index_schema.get_subpartition_key_info();
+    for (int i = 0; OB_SUCC(ret) && i < partition_info.get_size(); ++i) {
+      if (NULL == (key_column = partition_info.get_column(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("The key column is NULL, ", K(i));
+      } else if (OB_FAIL(add_var_to_array_no_dup(partkey_ids, key_column->column_id_))) {
+        LOG_WARN("failed to push back part key column id", K(ret));
+      } else { /*do nothing*/ }
     }
-
-    for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_partkey_ids.count(); ++i) {
-      uint64_t column_id = rowkey_partkey_ids.at(i);
+    for (int i = 0; OB_SUCC(ret) && i < sub_partition_info.get_size(); ++i) {
+      if (NULL == (key_column = sub_partition_info.get_column(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("The key column is NULL, ", K(i));
+      } else if (OB_FAIL(add_var_to_array_no_dup(partkey_ids, key_column->column_id_))) {
+        LOG_WARN("failed to push back subpart key column id", K(ret));
+      } else { /*do nothing*/ }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < partkey_ids.count(); ++i) {
+      uint64_t partkey_cid = partkey_ids.at(i);
       if (OB_ISNULL(col_item = ObResolverUtils::find_col_by_base_col_id(*insert_stmt,
                                                                         constraint_info.table_id_,
-                                                                        column_id))) {
+                                                                        partkey_cid,
+                                                                        OB_INVALID_ID,
+                                                                        true))) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get column expr by id failed", K(ret), K(i), K(column_id), K(rowkey_partkey_ids));
-      } else if (OB_FAIL(add_var_to_array_no_dup(constraint_info.constraint_columns_, col_item->expr_))) {
+        LOG_WARN("get column expr by id failed", K(ret), K(partkey_cid), K(i), K(partkey_ids));
+      } else if (OB_FAIL(constraint_info.constraint_columns_.push_back(col_item->expr_))) {
         LOG_WARN("store column expr to column exprs failed", K(ret));
       }
     }
-
   }
   return ret;
 }
@@ -1429,13 +1426,14 @@ int ObInsertLogPlan::prepare_table_dml_info_for_ddl(const ObInsertTableInfo& tab
       //@TODO: 后续@yibo, @cangdi会重构create local index的处理
       index_dml_info->ref_table_id_ = table_item->ddl_table_id_;
     }
-    
+
     if (OB_SUCC(ret)) {
       if (OB_FAIL(get_all_rowkey_columns_for_ddl(table_info, index_schema, index_dml_info->column_exprs_))) {
         LOG_WARN("failed to get all rowkey columns for ddl" , K(ret));
       } else if (OB_FAIL(get_all_columns_for_ddl(table_info, index_schema, index_dml_info->column_exprs_))) {
         LOG_WARN("failed to get all columns for ddl" , K(ret));
-      } else if (index_schema->is_index_table() && !index_schema->is_global_index_table() && data_table_schema->is_heap_table() && 
+      } else if (index_schema->is_index_local_storage() &&
+                 index_schema->need_partition_key_for_build_local_index(*data_table_schema) &&
                  OB_FAIL(get_all_part_columns_for_ddl(table_info, data_table_schema, index_dml_info->column_exprs_))) {
         LOG_WARN("failed to get all part columns for ddl" , K(ret));
       } else {
@@ -1728,6 +1726,153 @@ int ObInsertLogPlan::candi_allocate_optimizer_stats_merge(OSGShareInfo *osg_info
   }
   if (OB_SUCC(ret) && OB_FAIL(prune_and_keep_best_plans(stats_gathering_plan))) {
     LOG_WARN("failed to prune and keep best plans", K(ret));
+  }
+  return ret;
+}
+
+int ObInsertLogPlan::get_online_estimate_percent(double &percent)
+{
+  int ret = OB_SUCCESS;
+  percent = 100.;
+  const ObSQLSessionInfo *session_info = NULL;
+  if (OB_ISNULL(get_optimizer_context().get_exec_ctx()) ||
+      OB_ISNULL(session_info = get_optimizer_context().get_session_info()) ||
+      OB_ISNULL(get_stmt()) ||
+      OB_ISNULL(get_optimizer_context().get_query_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (get_optimizer_context().get_query_ctx()->optimizer_features_enable_version_ < COMPAT_VERSION_4_3_2) {
+    // do nothing
+  } else if (OB_FAIL(ObDbmsStatsUtils::get_sys_online_estimate_percent(*get_optimizer_context().get_exec_ctx(),
+                                                                       session_info->get_effective_tenant_id(),
+                                                                       get_stmt()->get_insert_table_info().ref_table_id_,
+                                                                       percent))) {
+    LOG_WARN("failed to get sys online estimate percent", K(ret));
+  }
+  return ret;
+}
+int ObInsertLogPlan::candi_allocate_select_into_for_insert()
+{
+  int ret = OB_SUCCESS;
+  ObExchangeInfo exch_info;
+  CandidatePlan candidate_plan;
+  ObSEArray<CandidatePlan, 4> select_into_plans;
+  int64_t dml_parallel = ObGlobalHint::UNSET_PARALLEL;
+  int64_t server_cnt = 0;
+  if (OB_FAIL(get_parallel_info_from_candidate_plans(server_cnt, dml_parallel))) {
+    LOG_WARN("failed to get parallel info from candidate plans", K(ret));
+  } else if (dml_parallel > 1) {
+    exch_info.dist_method_ = ObPQDistributeMethod::RANDOM;
+  }
+  for (int64_t i = 0 ; OB_SUCC(ret) && i < candidates_.candidate_plans_.count(); ++i) {
+    candidate_plan = candidates_.candidate_plans_.at(i);
+    if (OB_ISNULL(candidate_plan.plan_tree_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(ret));
+    } else if (candidate_plan.plan_tree_->is_sharding()
+               && OB_FAIL((allocate_exchange_as_top(candidate_plan.plan_tree_, exch_info)))) {
+      LOG_WARN("failed to allocate exchange as top", K(ret));
+    } else if (OB_FAIL(allocate_select_into_as_top_for_insert(candidate_plan.plan_tree_))) {
+      LOG_WARN("failed to allocate select into", K(ret));
+    } else if (OB_FAIL(select_into_plans.push_back(candidate_plan))) {
+      LOG_WARN("failed to push back candidate plan", K(ret));
+    } else { /*do nothing*/ }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(prune_and_keep_best_plans(select_into_plans))) {
+      LOG_WARN("failed to prune and keep best plans", K(ret));
+    } else { /*do nothing*/ }
+  }
+  return ret;
+}
+
+int ObInsertLogPlan::allocate_select_into_as_top_for_insert(ObLogicalOperator *&old_top)
+{
+  int ret = OB_SUCCESS;
+  ObLogSelectInto *select_into = NULL;
+  ObSchemaGetterGuard *schema_guard = NULL;
+  const ObTableSchema *table_schema = NULL;
+  ObSQLSessionInfo *session_info = NULL;
+  const ObInsertStmt *stmt = get_stmt();
+  ObColumnRefRawExpr *col_expr = NULL;
+  if (OB_ISNULL(old_top) || OB_ISNULL(stmt)
+      || OB_ISNULL(schema_guard = get_optimizer_context().get_schema_guard())
+      || OB_ISNULL(session_info = get_optimizer_context().get_session_info())
+      || stmt->get_table_items().count() != 2
+      || OB_ISNULL(stmt->get_table_item(0)) || OB_ISNULL(stmt->get_table_item(1))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("Get unexpected null", K(ret), K(old_top), K(schema_guard), K(session_info), K(stmt));
+  } else if (OB_FAIL(schema_guard->get_table_schema(session_info->get_effective_tenant_id(),
+                                                    stmt->get_insert_table_info().ref_table_id_,
+                                                    table_schema))) {
+    LOG_WARN("get table schema from schema guard failed", K(ret));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_ISNULL(select_into = static_cast<ObLogSelectInto *>(
+                       get_log_op_factory().allocate(*this, LOG_SELECT_INTO)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory for ObLogSelectInto failed", K(ret));
+  } else {
+    ObString external_properties;
+    const ObString &table_format_or_properties = table_schema->get_external_file_format().empty()
+                                            ? table_schema->get_external_properties()
+                                            : table_schema->get_external_file_format();
+    const ObInsertTableInfo& table_info = stmt->get_insert_table_info();
+    if (table_format_or_properties.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("external properties is empty", K(ret));
+    } else if (table_schema->get_external_properties().empty()) { //目前只支持写odps外表 其他类型暂不支持
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("not support to insert into external table which is not in odps", K(ret));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "insert into external table which is not in odps");
+    } else if (OB_FAIL(ob_write_string(get_allocator(), table_format_or_properties, external_properties))) {
+      LOG_WARN("failed to append string", K(ret));
+    } else if (OB_FAIL(select_into->get_select_exprs().assign(table_info.column_conv_exprs_))) {
+      LOG_WARN("failed to get select exprs", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_info.values_desc_.count(); i++) {
+      if (OB_ISNULL(col_expr = table_info.values_desc_.at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null", K(ret));
+      } else if (OB_FAIL(select_into->get_alias_names().push_back(col_expr->get_column_name()))) {
+        LOG_WARN("failed to push back column name", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      select_into->set_is_overwrite(stmt->is_external_table_overwrite());
+      select_into->set_external_properties(external_properties);
+      select_into->set_external_partition(stmt->get_table_item(0)->external_table_partition_);
+      select_into->set_child(ObLogicalOperator::first_child, old_top);
+      // compute property
+      if (OB_FAIL(select_into->compute_property())) {
+        LOG_WARN("failed to compute equal set", K(ret));
+      } else {
+        old_top = select_into;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObInsertLogPlan::perform_vector_assign_expr_replacement(ObDelUpdStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo* session_info = optimizer_context_.get_session_info();
+  if (OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("stmt is null", K(ret), K(stmt));
+  } else {
+    ObInsertTableInfo &table_info = static_cast<ObInsertStmt*>(stmt)->get_insert_table_info();
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_info.assignments_.count(); ++i) {
+      ObRawExpr *value = table_info.assignments_.at(i).expr_;
+      bool replace_happened = false;
+      if (OB_FAIL(replace_alias_ref_expr(value, replace_happened))) {
+        LOG_WARN("failed to replace alias ref expr", K(ret));
+      } else if (replace_happened && OB_FAIL(value->formalize(session_info))) {
+        LOG_WARN("failed to formalize expr", K(ret));
+      }
+    }
   }
   return ret;
 }

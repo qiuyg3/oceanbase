@@ -14,42 +14,11 @@
 
 
 #include "observer/mysql/obmp_stmt_prexecute.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/stat/ob_session_stat.h"
-#include "lib/profile/ob_perf_event.h"
-#include "lib/timezone/ob_time_convert.h"
-#include "lib/encode/ob_base64_encode.h"
-#include "observer/mysql/obsm_utils.h"
-#include "rpc/ob_request.h"
-#include "rpc/obmysql/ob_mysql_packet.h"
-#include "rpc/obmysql/ob_mysql_util.h"
-#include "rpc/obmysql/packet/ompk_prepare.h"
 #include "rpc/obmysql/packet/ompk_prexecute.h"
-#include "rpc/obmysql/packet/ompk_eof.h"
-#include "rpc/obmysql/packet/ompk_resheader.h"
 #include "rpc/obmysql/packet/ompk_field.h"
-#include "rpc/obmysql/packet/ompk_row.h"
-#include "rpc/obmysql/obsm_struct.h"
-#include "observer/mysql/obsm_row.h"
 #include "observer/mysql/obmp_stmt_prepare.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/ob_time_utility2.h"
 #include "sql/ob_sql.h"
-#include "sql/ob_sql_context.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "sql/plan_cache/ob_prepare_stmt_struct.h"
-#include "observer/omt/ob_tenant.h"
-#include "observer/mysql/ob_sync_plan_driver.h"
 #include "observer/mysql/ob_sync_cmd_driver.h"
-#include "observer/mysql/ob_async_cmd_driver.h"
-#include "observer/mysql/ob_async_plan_driver.h"
-#include "observer/mysql/obmp_stmt_send_piece_data.h"
-#include "observer/ob_req_time_service.h"
-#include "pl/ob_pl_user_type.h"
-#include "pl/ob_pl_package.h"
-#include "pl/ob_pl_resolver.h"
-#include "pl/ob_pl_exception_handling.h"
-#include "rpc/obmysql/ob_mysql_field.h"
 
 namespace oceanbase
 {
@@ -81,6 +50,11 @@ int ObMPStmtPrexecute::before_process()
 
   if (OB_FAIL(ObMPBase::before_process())) {
     LOG_WARN("fail to call before process", K(ret));
+  } else if (!GCONF._ob_enable_prepared_statement) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "The disabled '_ob_enable_prepared_statement' parameter prevents the use of "
+                   "prepared statements");
   } else if ((OB_ISNULL(req_))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("request should not be null", K(ret));
@@ -152,28 +126,37 @@ int ObMPStmtPrexecute::before_process()
                              lib::Worker::CompatMode::ORACLE : lib::Worker::CompatMode::MYSQL);
       uint32_t ps_stmt_checksum = DEFAULT_ITERATION_COUNT;
       ObSQLSessionInfo::LockGuard lock_guard(session->get_query_lock());
+      bool need_response_error = false;
       session->set_current_trace_id(ObCurTraceId::get_trace_id());
       session->init_use_rich_format();
       session->set_proxy_version(get_proxy_version());
-      int64_t packet_len = (reinterpret_cast<const ObMySQLRawPacket &>
-                                (req_->get_packet())).get_clen();
       ObReqTimeGuard req_timeinfo_guard;
-      if (sql_len_ > 0 && 0 == stmt_id_) {
+      if (OB_FAIL(ret)) {
+      } else if (OB_UNLIKELY(!session->is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("invalid session", K_(sql), K(ret));
+      } else if (OB_FAIL(process_kill_client_session(*session))) {
+        LOG_WARN("client session has been killed", K(ret));
+      } else if (OB_UNLIKELY(session->is_zombie())) {
+        ret = OB_ERR_SESSION_INTERRUPTED;
+        LOG_WARN("session has been killed", K(session->get_session_state()), K_(sql),
+                K(session->get_server_sid()), "proxy_sessid", session->get_proxy_sessid(), K(ret));
+      } else if (pkt.exist_trace_info()
+                 && OB_FAIL(session->update_sys_variable(SYS_VAR_OB_TRACE_INFO,
+                                                         pkt.get_trace_info()))) {
+        LOG_WARN("fail to update trace info", K(ret));
+      } else if (FALSE_IT(session->set_txn_free_route(pkt.txn_free_route()))) {
+      } else if (OB_FAIL(process_extra_info(*session, pkt, need_response_error))) {
+        LOG_WARN("fail get process extra info", K(ret));
+      } else if (FALSE_IT(session->post_sync_session_info())) {
+      } else if (sql_len_ > 0 && 0 == stmt_id_) {
         int64_t query_timeout = 0;
         int64_t tenant_version = 0;
         int64_t sys_version = 0;
         bool force_sync_resp = false;
-        bool need_response_error = false;
-        if (OB_UNLIKELY(!session->is_valid())) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_ERROR("invalid session", K_(sql), K(ret));
-        } else if (OB_FAIL(process_kill_client_session(*session))) {
-          LOG_WARN("client session has been killed", K(ret));
-        } else if (OB_UNLIKELY(session->is_zombie())) {
-          ret = OB_ERR_SESSION_INTERRUPTED;
-          LOG_WARN("session has been killed", K(session->get_session_state()), K_(sql),
-                  K(session->get_sessid()), "proxy_sessid", session->get_proxy_sessid(), K(ret));
-        } else if (OB_UNLIKELY(packet_len > session->get_max_packet_size())) {
+        int64_t packet_len =
+            (reinterpret_cast<const ObMySQLRawPacket &>(req_->get_packet())).get_clen();
+        if (OB_UNLIKELY(packet_len > session->get_max_packet_size())) {
           ret = OB_ERR_NET_PACKET_TOO_LARGE;
           LOG_WARN("packet too large than allowd for the session", K_(sql), K(ret));
         } else if (OB_FAIL(session->get_query_timeout(query_timeout))) {
@@ -309,7 +292,7 @@ int ObMPStmtPrexecute::before_process()
           } else {
             const bool enable_sql_audit =
             GCONF.enable_sql_audit && session->get_local_ob_enable_sql_audit();
-            if (!is_pl_stmt(stmt_type_) && enable_sql_audit) {
+            if (enable_sql_audit) {
               OZ (store_params_value_to_str(*allocator_, *session));
             }
             PS_DEFENSE_CHECK(4) // exec_mode
@@ -338,7 +321,7 @@ int ObMPStmtPrexecute::before_process()
                   //   if (OB_NOT_NULL(session->get_cursor(close_stmt_id))) {
                   //     if (OB_FAIL(session->close_cursor(close_stmt_id))) {
                   //       tmp_ret = ret;
-                  //       LOG_WARN("fail to close cursor", K(ret), K(stmt_id_), K(close_stmt_id), K(session->get_sessid()));
+                  //       LOG_WARN("fail to close cursor", K(ret), K(stmt_id_), K(close_stmt_id), K(session->get_server_sid()));
                   //     }
                   //   }
                   //   if (OB_FAIL(session->close_ps_stmt(close_stmt_id))) {
@@ -359,13 +342,13 @@ int ObMPStmtPrexecute::before_process()
                       || (OB_NOT_NULL(ps_session_info)
                           && ps_stmt_checksum != ps_session_info->get_ps_stmt_checksum())) {
                     ret = OB_ERR_PREPARE_STMT_CHECKSUM;
-                    LOG_ERROR("ps stmt checksum fail", K(ret), "session_id", session->get_sessid(),
+                    LOG_ERROR("ps stmt checksum fail", K(ret), "session_id", session->get_server_sid(),
                                                     K(ps_stmt_checksum), K(*ps_session_info));
                     LOG_DBA_ERROR_V2(OB_SERVER_PS_STMT_CHECKSUM_MISMATCH, ret,
                                      "ps stmt checksum fail. ",
                                      "the ps stmt checksum is ", ps_stmt_checksum,
                                      ", but current session stmt checksum is ", ps_session_info->get_ps_stmt_checksum(),
-                                     ". current session id is ", session->get_sessid(), ". ");
+                                     ". current session id is ", session->get_server_sid(), ". ");
                 } else {
                   PS_DEFENSE_CHECK(4) // extend_flag
                   {
@@ -421,6 +404,7 @@ int ObMPStmtPrexecute::clean_ps_stmt(ObSQLSessionInfo &session,
      *    其他时候都退化成了 local 重试，不需要清理
      */
     get_ctx().cur_sql_ = sql_;
+    get_ctx().raw_sql_ = sql_;
     if (OB_FAIL(session.close_ps_stmt(stmt_id_))) {
       LOG_WARN("close cursor failed.", K(ret), K(stmt_id_));
     }
@@ -441,168 +425,147 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
                                         bool &async_resp_used,
                                         ObPsStmtId &inner_stmt_id)
 {
+  ACTIVE_SESSION_FLAG_SETTER_GUARD(in_sql_execution);
   int ret = OB_SUCCESS;
   if (OB_OCI_EXACT_FETCH != exec_mode_ && stmt::T_SELECT == stmt_type_) {
     LOG_DEBUG("begin server cursor.");
     set_ps_cursor_type(ObPrexecutePsCursorType);
-    ObDbmsCursorInfo *cursor = NULL;
-    bool use_stream = false;
+    ObPsCursorInfo *cursor = NULL;
     inner_stmt_id = OB_INVALID_ID;
     // 1.创建cursor
     ObPsStmtId inner_stmt_id = OB_INVALID_ID;
-    if (OB_NOT_NULL(session.get_cursor(stmt_id_))) {
-      if (OB_FAIL(session.close_cursor(stmt_id_))) {
-        LOG_WARN("fail to close result set", K(ret), K(stmt_id_), K(session.get_sessid()));
+    get_ctx().cur_sql_ = sql_;
+    if (OB_FAIL(session.get_inner_ps_stmt_id(stmt_id_, inner_stmt_id))) {
+      LOG_WARN("get inner ps stmt id failed.", K(ret), K(stmt_id_), K(inner_stmt_id));
+    } else if (OB_FAIL(gctx_.sql_engine_->init_result_set(ctx, result))) {
+      LOG_WARN("init result set failed.", K(ret), K(stmt_id_));
+    } else if (OB_FAIL(ps_cursor_open(session, ctx, result, params, cursor, stmt_id_,
+                                      need_response_error, enable_perf_event))) {
+      LOG_WARN("open cursor failed.", K(ret), K(stmt_id_));
+    } else if (OB_ISNULL(cursor)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("cursor is null", K(ret), K(stmt_id_));
+    } else if (OB_OCI_STMT_SCROLLABLE_READONLY == exec_mode_) {
+      cursor->set_scrollable();
+    }
+
+    if (OB_SUCC(ret) && cursor->isopen()) {
+
+      int64_t row_num = 0;
+      bool is_fetched = false;
+      int64_t cur = 0;
+      bool last_row = false;
+      bool ac = true;
+      int8_t has_result = 0;
+      ObSchemaGetterGuard schema_guard;
+      const common::ColumnsFieldArray *fields = NULL;
+      if (OB_FAIL(cursor->get_field_columns(fields))) {
+        LOG_WARN("get field columns failed.", K(ret));
+      } else if (OB_ISNULL(fields)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("field columns is null", K(ret));
+      } else if (0 != iteration_count_ && fields->count() > 0) {
+        has_result = 1;
+        LOG_DEBUG("has result set.", K(stmt_id_));
+        cursor->set_fetch_size(iteration_count_);
+        if (OB_FAIL(ps_cursor_store_data(session, iteration_count_))) {
+          LOG_WARN("pre store data failed.", K(ret), K(iteration_count_));
+        }
       }
-    }
-    OZ (session.make_dbms_cursor(cursor, stmt_id_));
-    CK (OB_NOT_NULL(cursor));
-    OX (cursor->set_stmt_type(stmt::T_SELECT));
-    OZ (session.get_inner_ps_stmt_id(stmt_id_, inner_stmt_id));
-    OX (cursor->set_ps_sql(sql_));
-    OZ (session.ps_use_stream_result_set(use_stream));
-    if (use_stream) {
-      OX (cursor->set_streaming());
-    }
-    if (OB_OCI_STMT_SCROLLABLE_READONLY == exec_mode_) {
-      OX (cursor->set_scrollable());
-    }
-    OZ (cursor->prepare_entity(session));
-    CK (OB_NOT_NULL(cursor->get_allocator()));
-    OZ (cursor->init_params(params.count()));
-    OZ (cursor->get_exec_params().assign(params));
-    OZ (gctx_.sql_engine_->init_result_set(ctx, result));
-    //监控项统计开始
-    set_exec_start_timestamp(ObTimeUtility::current_time());
-    if (OB_SUCC(ret)) {
-      ObPLExecCtx pl_ctx(cursor->get_allocator(), &result.get_exec_context(), NULL/*params*/,
-                        NULL/*result*/, &ret, NULL/*func*/, true);
-      get_ctx().cur_sql_ = sql_;
-      if (
-#ifdef ERRSIM
-          OB_FAIL(common::EventTable::COM_STMT_PREXECUTE_PS_CURSOR_OPEN_ERROR) ||
-#endif
-          OB_FAIL(ObSPIService::dbms_dynamic_open(&pl_ctx, *cursor))
-      ) {
-        LOG_WARN("cursor open faild.", K(cursor->get_id()));
-        // select do not support arraybinding
-        if (!THIS_WORKER.need_retry()) {
-          int cli_ret = OB_SUCCESS;
-          retry_ctrl.test_and_save_retry_state(
-            gctx_, ctx, result, ret, cli_ret, get_arraybounding() /*ararybinding only local retry*/);
-          if (OB_ERR_PROXY_REROUTE == ret) {
-            LOG_DEBUG("run stmt_query failed, check if need retry",
-                      K(ret), K(cli_ret), K(retry_ctrl.need_retry()), K_(stmt_id));
-          } else {
-            LOG_WARN("run stmt_query failed, check if need retry",
-                    K(ret), K(cli_ret), K(retry_ctrl.need_retry()), K_(stmt_id));
-          }
-          ret = cli_ret;
-        }
-        if (OB_ERR_PROXY_REROUTE == ret && !get_arraybounding()) {
-          need_response_error = true;
-        }
-      } else {
-        int64_t row_num = 0;
-        bool is_fetched = false;
-        int64_t cur = 0;
-        bool last_row = false;
-        bool ac = true;
-        int8_t has_result = 0;
-        ObSchemaGetterGuard schema_guard;
-        if (0 != iteration_count_ && cursor->get_field_columns().count() > 0) {
-          has_result = 1;
-          LOG_DEBUG("has result set.", K(stmt_id_));
-        }
-        if (OB_FAIL(session.get_autocommit(ac))) {
-          LOG_WARN("fail to get autocommit", K(ret));
-        } else if (OB_FAIL(response_param_query_header(session, &cursor->get_field_columns(),
-                                          get_params(), stmt_id_, has_result, 0))) {
-          LOG_WARN("send header packet faild.", K(ret));
-        } else if (OB_FAIL(gctx_.schema_service_->get_tenant_schema_guard(session.get_effective_tenant_id(), schema_guard))) {
-          LOG_WARN("get tenant schema guard failed ", K(ret), K(session.get_effective_tenant_id()));
-        }
-        if (-1 == cursor->get_current_position() && iteration_count_ > 0) {
-          // execute 如果返回数据，需要更新一下cursor的指针位置
-          OX (cursor->set_current_position(0));
-        }
-        while (OB_SUCC(ret) && row_num < iteration_count_
-                && OB_SUCC(sql::ObSPIService::dbms_cursor_fetch(&pl_ctx, *cursor))) {
-          common::ObNewRow &row = cursor->get_current_row();
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(session.get_autocommit(ac))) {
+        LOG_WARN("fail to get autocommit", K(ret));
+      } else if (OB_FAIL(response_param_query_header(session, fields,
+                                        get_params(), stmt_id_, has_result, 0))) {
+        LOG_WARN("send header packet faild.", K(ret));
+      } else if (OB_FAIL(gctx_.schema_service_->get_tenant_schema_guard(session.get_effective_tenant_id(), schema_guard))) {
+        LOG_WARN("get tenant schema guard failed ", K(ret), K(session.get_effective_tenant_id()));
+      }
+      if (-1 == cursor->get_current_position() && iteration_count_ > 0) {
+        // execute 如果返回数据，需要更新一下cursor的指针位置
+        OX (cursor->set_current_position(0));
+      }
+      while (OB_SUCC(ret) && row_num < iteration_count_
+              && OB_SUCC(sql::ObSPIService::ps_cursor_fetch(*cursor, session))) {
+        common::ObNewRow &row = cursor->get_current_row();
 #ifndef NDEBUG
-          LOG_DEBUG("cursor fetch: ", K(cursor->get_id()), K(cursor->is_streaming()),
-                                          K(cursor->get_current_row().cells_[0]),
-                                          K(cursor->get_current_position()),
-                                          K(row_num), K(iteration_count_));
+        LOG_DEBUG("cursor fetch: ", K(cursor->get_id()), K(cursor->is_streaming()),
+                                        K(cursor->get_current_row().cells_[0]),
+                                        K(cursor->get_current_position()),
+                                        K(row_num), K(iteration_count_));
 #endif
-          cur = cursor->get_current_position();
-          ++cur;
-          cursor->set_current_position(cur);
-          is_fetched = true;
-          if (OB_FAIL(response_row(session, row, &cursor->get_field_columns(), cursor->is_packed(), &result.get_exec_context(), true, &schema_guard))) {
-            LOG_WARN("response row fail at line: ", K(ret), K(row_num));
-          } else {
-            ++row_num;
-          }
-        }
-        if (is_fetched) {
-          // always be set wether there is a error or not
-          cur = cursor->get_current_position();
-          cur = cur - 1;
-          cursor->set_current_position(cur);
-        }
-        if (OB_ITER_END == ret || OB_READ_NOTHING == ret) {
-          ret = OB_SUCCESS;
-          last_row = true;
-        }
-        if (OB_FAIL(ret)) {
-          LOG_WARN("response query result fail", K(ret));
+        cur = cursor->get_current_position();
+        ++cur;
+        cursor->set_current_position(cur);
+        is_fetched = true;
+        if (OB_FAIL(response_row(session, row, fields, cursor->is_packed(), &result.get_exec_context(), true, &schema_guard))) {
+          LOG_WARN("response row fail at line: ", K(ret), K(row_num));
         } else {
-          const ObWarningBuffer *warnings_buf = common::ob_get_tsi_warning_buffer();
-          uint16_t warning_count = 0;
-          if (OB_ISNULL(warnings_buf)) {
-            // ignore ret
-            LOG_WARN("can not get thread warnings buffer");
-          } else {
-            warning_count = static_cast<uint16_t>(warnings_buf->get_readable_warning_count());
+          ++row_num;
+        }
+      }
+      if (is_fetched) {
+        // always be set wether there is a error or not
+        cur = cursor->get_current_position();
+        cur = cur - 1;
+        cursor->set_current_position(cur);
+      }
+      if (OB_ITER_END == ret || OB_READ_NOTHING == ret) {
+        ret = OB_SUCCESS;
+        last_row = true;
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("response query result fail", K(ret));
+      } else {
+        const ObWarningBuffer *warnings_buf = common::ob_get_tsi_warning_buffer();
+        uint16_t warning_count = 0;
+        if (OB_ISNULL(warnings_buf)) {
+          // ignore ret
+          LOG_WARN("can not get thread warnings buffer");
+        } else {
+          warning_count = static_cast<uint16_t>(warnings_buf->get_readable_warning_count());
+        }
+        if (has_result) {
+          OZ (send_eof_packet(session, warning_count, false, !last_row, last_row));
+        }
+        if (OB_SUCC(ret) && (last_row && !cursor->is_scrollable())
+                          && lib::is_oracle_mode()
+                          && OB_NOT_NULL(cursor->get_cursor_store())
+                          && cursor->get_cursor_store()->row_store_.get_row_cnt() > 0) {
+          ps_cursor_has_destroy_ = true;
+          if (OB_FAIL(session.close_cursor(cursor->get_id(), true))) {
+            LOG_WARN("no scrollable cursor close cursor failed at last row.", K(ret));
           }
-          if (has_result) {
-            OZ (send_eof_packet(session, warning_count, false, !last_row, last_row));
+        }
+        if (OB_SUCC(ret)) {
+          bool last_row_ok_param = last_row;
+          if (iteration_count_ > 0
+              && OB_NOT_NULL(cursor->get_cursor_store())
+              && cursor->get_cursor_store()->row_store_.get_row_cnt() == 0) {
+            last_row_ok_param = true;
           }
-          if (OB_SUCC(ret) && (last_row && !cursor->is_scrollable())
-                           && lib::is_oracle_mode()
-                           && !cursor->is_streaming()
-                           && OB_NOT_NULL(cursor->get_spi_cursor())
-                           && cursor->get_spi_cursor()->row_store_.get_row_cnt() > 0) {
-            if (OB_FAIL(session.close_cursor(cursor->get_id()))) {
-              LOG_WARN("no scrollable cursor close cursor failed at last row.", K(ret));
-            }
-          }
-          if (OB_SUCC(ret)) {
-            bool last_row_ok_param = last_row;
-            if (OB_NOT_NULL(cursor->get_spi_cursor())
-                && cursor->get_spi_cursor()->row_store_.get_row_cnt() == 0) {
-              last_row_ok_param = true;
-            }
-            if (OB_FAIL(send_ok_packet(session,
-                                       iteration_count_,
-                                       session.partition_hit().get_bool(),
-                                       false,
-                                       true,
-                                       last_row_ok_param))) {
-              LOG_WARN("fail to send ok packt", K(iteration_count_),
-                       "is_partition_hit" ,session.partition_hit().get_bool(),
-                       K(last_row_ok_param), K(ret));
-            }
+          if (OB_FAIL(send_ok_packet(session,
+                                      iteration_count_,
+                                      session.partition_hit().get_bool(),
+                                      false,
+                                      true,
+                                      last_row_ok_param))) {
+            LOG_WARN("fail to send ok packt", K(iteration_count_),
+                      "is_partition_hit" ,session.partition_hit().get_bool(),
+                      K(last_row_ok_param), K(ret));
           }
         }
       }
     }
     if (OB_SUCCESS != ret) {
       int tmp_ret = ret;
-      if (OB_NOT_NULL(cursor) && OB_FAIL(session.close_cursor(cursor->get_id()))) {
-        LOG_WARN("close cursor failed.", K(ret), K(stmt_id_));
+      if (OB_NOT_NULL(cursor)) {
+        ps_cursor_has_destroy_ = true;
+        if (OB_FAIL(session.close_cursor(cursor->get_id(), true))) {
+          LOG_WARN("close cursor failed.", K(ret), K(stmt_id_));
+        }
       }
+      //overwrite ret
       if (OB_FAIL(clean_ps_stmt(session,
                                 RETRY_TYPE_LOCAL == retry_ctrl.get_retry_type(),
                                 ctx.multi_stmt_item_.is_batched_multi_stmt()))) {

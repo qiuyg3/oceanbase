@@ -14,11 +14,7 @@
 
 #include "ob_async_cmd_driver.h"
 
-#include "lib/profile/ob_perf_event.h"
-#include "obsm_row.h"
-#include "sql/resolver/cmd/ob_variable_set_stmt.h"
 #include "observer/mysql/obmp_query.h"
-#include "observer/mysql/obmp_stmt_prexecute.h"
 
 namespace oceanbase
 {
@@ -85,6 +81,9 @@ int ObAsyncCmdDriver::response_result(ObMySQLResultSet &result)
         LOG_WARN("send error packet fail", K(sret), K(ret));
       }
     }
+  } else if (result.is_with_rows()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async end trans should not have rows", K(ret));
   } else {
     //what if begin;select 1; select 2; commit; commit;
     //we should still have to respond a packet to client in terms of the last commit

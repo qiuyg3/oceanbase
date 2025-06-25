@@ -39,7 +39,7 @@ public:
   ObSessionDDLInfo()
     : is_ddl_(false), is_source_table_hidden_(false), is_dest_table_hidden_(false), is_heap_table_ddl_(false),
       is_ddl_check_default_value_bit_(false), is_mview_complete_refresh_(false), is_refreshing_mview_(false),
-      is_retryable_ddl_(false), reserved_bit_(0)
+      is_retryable_ddl_(false), is_dummy_ddl_for_inner_visibility_(false), is_major_refreshing_mview_(false), reserved_bit_(0)
   {
   }
   ~ObSessionDDLInfo() = default;
@@ -59,6 +59,10 @@ public:
   bool is_refreshing_mview() const { return is_refreshing_mview_; }
   void set_retryable_ddl(const bool flag) { is_retryable_ddl_ = flag; }
   bool is_retryable_ddl() const { return is_retryable_ddl_; }
+  void set_is_dummy_ddl_for_inner_visibility(const bool flag) { is_dummy_ddl_for_inner_visibility_ = flag; }
+  bool is_dummy_ddl_for_inner_visibility() const { return is_dummy_ddl_for_inner_visibility_; }
+  void set_major_refreshing_mview(const bool flag) { is_major_refreshing_mview_ = flag; }
+  bool is_major_refreshing_mview() const { return is_major_refreshing_mview_; }
   inline void reset() { ddl_info_ = 0; }
   TO_STRING_KV(K_(ddl_info));
   OB_UNIS_VERSION(1);
@@ -70,7 +74,9 @@ public:
   static const int64_t IS_MVIEW_COMPLETE_REFRESH_BIT = 1;
   static const int64_t IS_REFRESHING_MVIEW_BIT = 1;
   static const int64_t IS_RETRYABLE_DDL_BIT = 1;
-  static const int64_t RESERVED_BIT = 64 - IS_DDL_BIT - 2 * IS_TABLE_HIDDEN_BIT - IS_HEAP_TABLE_DDL_BIT - IS_DDL_CHECK_DEFAULT_VALUE_BIT - IS_MVIEW_COMPLETE_REFRESH_BIT - IS_REFRESHING_MVIEW_BIT - IS_RETRYABLE_DDL_BIT;
+  static const int64_t IS_DUMMY_DDL_FOR_INNER_VISIBILITY_BIT = 1;
+  static const int64_t IS_MAJOR_REFRESHING_MVIEW_BIT = 1;
+  static const int64_t RESERVED_BIT = 64 - IS_DDL_BIT - 2 * IS_TABLE_HIDDEN_BIT - IS_HEAP_TABLE_DDL_BIT - IS_DDL_CHECK_DEFAULT_VALUE_BIT - IS_MVIEW_COMPLETE_REFRESH_BIT - IS_REFRESHING_MVIEW_BIT - IS_RETRYABLE_DDL_BIT - IS_DUMMY_DDL_FOR_INNER_VISIBILITY_BIT - IS_MAJOR_REFRESHING_MVIEW_BIT;
   union {
     uint64_t ddl_info_;
     struct {
@@ -82,6 +88,13 @@ public:
       uint64_t is_mview_complete_refresh_: IS_MVIEW_COMPLETE_REFRESH_BIT;
       uint64_t is_refreshing_mview_: IS_REFRESHING_MVIEW_BIT;
       uint64_t is_retryable_ddl_: IS_RETRYABLE_DDL_BIT;
+      /**
+      * If is_dummy_ddl_for_inner_visibility_ is enabled, DML/DQL operations on the index table will be allowed.
+      * Currently only available for vector-index fast refresh feature and vector-index offline ddl feature.
+      * When is_ddl_ is also enabled, it will override is_dummy_ddl_for_inner_visibility_.
+      */
+      uint64_t is_dummy_ddl_for_inner_visibility_: IS_DUMMY_DDL_FOR_INNER_VISIBILITY_BIT;
+      uint64_t is_major_refreshing_mview_ : IS_MAJOR_REFRESHING_MVIEW_BIT;
       uint64_t reserved_bit_ : RESERVED_BIT;
     };
   };
@@ -91,8 +104,9 @@ struct ObSessionParam final
 {
 public:
   ObSessionParam()
-    : sql_mode_(nullptr), tz_info_wrap_(nullptr), ddl_info_(), is_load_data_exec_(false), use_external_session_(false), consumer_group_id_(0), nls_formats_{}
-  {}
+      : sql_mode_(nullptr), tz_info_wrap_(nullptr), ddl_info_(), is_load_data_exec_(false),
+        use_external_session_(false), consumer_group_id_(0), nls_formats_{}, enable_pl_cache_(true),
+        secure_file_priv_() {}
   ~ObSessionParam() = default;
 public:
   int64_t *sql_mode_;
@@ -102,6 +116,8 @@ public:
   bool use_external_session_; // need init remote inner sql conn with sess getting from sess mgr
   int64_t consumer_group_id_;
   common::ObString nls_formats_[common::ObNLSFormatEnum::NLS_MAX];
+  bool enable_pl_cache_;
+  common::ObString secure_file_priv_;
 };
 
 // thread safe sql proxy
@@ -193,7 +209,7 @@ public:
   virtual bool is_oracle_mode() const override { return true; }
   virtual int init(sqlclient::ObDbLinkConnectionPool *pool);
   int create_dblink_pool(const sqlclient::dblink_param_ctx &param_ctx,
-                         const ObAddr &server,
+                         const ObString &host_name, int32_t port,
                          const ObString &db_tenant, const ObString &db_user,
                          const ObString &db_pass, const ObString &db_name,
                          const common::ObString &conn_str,
@@ -201,8 +217,8 @@ public:
   int acquire_dblink(const sqlclient::dblink_param_ctx &param_ctx,
                      sqlclient::ObISQLConnection *&dblink_conn);
   int release_dblink(sqlclient::DblinkDriverProto dblink_type, sqlclient::ObISQLConnection *dblink_conn);
-  int dblink_read(sqlclient::ObISQLConnection *dblink_conn, ReadResult &result, const char *sql);
-  int dblink_write(sqlclient::ObISQLConnection *dblink_conn, int64_t &affected_rows, const char *sql);
+  int dblink_read(sqlclient::ObISQLConnection *dblink_conn, ReadResult &result, const ObString &sql);
+  int dblink_write(sqlclient::ObISQLConnection *dblink_conn, int64_t &affected_rows, const ObString &sql);
   int dblink_execute_proc(sqlclient::ObISQLConnection *dblink_conn);
   int dblink_execute_proc(const uint64_t tenant_id,
                           sqlclient::ObISQLConnection *dblink_conn,
@@ -212,14 +228,19 @@ public:
                           const share::schema::ObRoutineInfo &routine_info,
                           const common::ObIArray<const pl::ObUserDefinedType *> &udts,
                           const ObTimeZoneInfo *tz_info,
-                          ObObj *result);
-  int dblink_prepare(sqlclient::ObISQLConnection *dblink_conn, const char *sql);
+                          ObObj *result,
+                          bool is_sql);
+  int dblink_prepare(sqlclient::ObISQLConnection *dblink_conn,
+                     const ObString &sql,
+                     int64_t param_count,
+                     ObIAllocator *allocator = NULL);
   int dblink_bind_basic_type_by_pos(sqlclient::ObISQLConnection *dblink_conn,
                                     uint64_t position,
                                     void *param,
                                     int64_t param_size,
                                     int32_t datatype,
-                                    int32_t &indicator);
+                                    int32_t &indicator,
+                                    bool is_out_param);
   int dblink_bind_array_type_by_pos(sqlclient::ObISQLConnection *dblink_conn,
                                     uint64_t position,
                                     void *array,

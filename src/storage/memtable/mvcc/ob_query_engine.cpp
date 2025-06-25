@@ -11,7 +11,6 @@
  */
 
 #include "storage/memtable/mvcc/ob_query_engine.h"
-#include "storage/memtable/ob_memtable_data.h"
 #include "common/ob_store_range.h"
 #include "storage/blocksstable/ob_row_reader.h"
 
@@ -83,19 +82,23 @@ void ObQueryEngine::dump2text(FILE* fd)
   } else {
     blocksstable::ObRowReader row_reader;
     blocksstable::ObDatumRow datum_row;
-    for (int64_t row_idx = 0; OB_SUCC(ret) && OB_SUCC(iter.next_internal()); row_idx++) {
-      const ObMemtableKey *key = iter.get_key();
-      ObMvccRow *row = iter.get_value();
-      fprintf(fd, "row_idx=%ld %s %s\n", row_idx, to_cstring(*key), to_cstring(*row));
-      for (ObMvccTransNode *node = row->get_list_head(); OB_SUCC(ret) && OB_NOT_NULL(node); node = node->prev_) {
-        const ObMemtableDataHeader *mtd = reinterpret_cast<const ObMemtableDataHeader *>(node->buf_);
-        fprintf(fd, "\t%s dml=%d size=%ld\n", to_cstring(*node), mtd->dml_flag_, mtd->buf_len_);
-        if (OB_FAIL(row_reader.read_row(mtd->buf_, mtd->buf_len_, nullptr, datum_row))) {
-          TRANS_LOG(WARN, "Failed to read datum row", K(ret));
-        } else {
-          for (int64_t i = 0; OB_SUCC(ret) && i < datum_row.get_column_count(); i++) {
-            blocksstable::ObStorageDatum &datum = datum_row.storage_datums_[i];
-            fprintf(fd, "\tcidx=%ld val=%s\n", i, to_cstring(datum));
+    SMART_VAR(ObCStringHelper, helper) {
+      for (int64_t row_idx = 0; OB_SUCC(ret) && OB_SUCC(iter.next_internal()); row_idx++) {
+        const ObMemtableKey *key = iter.get_key();
+        ObMvccRow *row = iter.get_value();
+        fprintf(fd, "row_idx=%ld %s %s\n", row_idx, helper.convert(*key), helper.convert(*row));
+        for (ObMvccTransNode *node = row->get_list_head(); OB_SUCC(ret) && OB_NOT_NULL(node); node = node->prev_) {
+          const ObMemtableDataHeader *mtd = reinterpret_cast<const ObMemtableDataHeader *>(node->buf_);
+          helper.reset();
+          fprintf(fd, "\t%s dml=%d size=%ld\n", helper.convert(*node), mtd->dml_flag_, mtd->buf_len_);
+          if (OB_FAIL(row_reader.read_row(mtd->buf_, mtd->buf_len_, nullptr, datum_row))) {
+            TRANS_LOG(WARN, "Failed to read datum row", K(ret));
+          } else {
+            for (int64_t i = 0; OB_SUCC(ret) && i < datum_row.get_column_count(); i++) {
+              blocksstable::ObStorageDatum &datum = datum_row.storage_datums_[i];
+              helper.reset();
+              fprintf(fd, "\tcidx=%ld val=%s\n", i, helper.convert(datum));
+            }
           }
         }
       }
@@ -572,7 +575,9 @@ int ObQueryEngine::inner_loop_find_level_(const ObMemtableKey *start_key,
     }
   }
 
-  STORAGE_LOG(INFO, "finish find split level", KR(ret), K(top_level), K(btree_node_count), K(total_rows));
+  if (OB_ENTRY_NOT_EXIST != ret) {
+    STORAGE_LOG(INFO, "finish find split level", KR(ret), K(top_level), K(btree_node_count), K(total_rows));
+  }
 
   return ret;
 }

@@ -12,12 +12,8 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_table_estimator.h"
-#include "storage/tablet/ob_table_store_util.h"
-#include "storage/tablet/ob_tablet.h"
 #include "ob_index_sstable_estimator.h"
-#include "storage/memtable/mvcc/ob_mvcc_engine.h"
 #include "storage/memtable/mvcc/ob_mvcc_iterator.h"
-#include "storage/column_store/ob_column_oriented_sstable.h"
 #include "storage/ddl/ob_tablet_ddl_kv.h"
 
 namespace oceanbase
@@ -227,10 +223,9 @@ int ObTableEstimator::estimate_sstable_scan_row_count(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid get arguments", K(ret), K(base_input.table_id_), K(key_range));
   } else {
-    const ObIndexSSTableEstimateContext context(
-        *sstable, base_input.tablet_handle_, base_input.query_flag_, key_range);
+    const ObIndexSSTableEstimateContext context(base_input.tablet_handle_, base_input.query_flag_);
     ObIndexBlockScanEstimator scan_estimator(context);
-    if (OB_FAIL(scan_estimator.estimate_row_count(part_est))) {
+    if (OB_FAIL(scan_estimator.estimate_row_count(*sstable, key_range, part_est))) {
       LOG_WARN("Fail to estimate cost of scan.", K(ret), K(base_input.table_id_));
     } else {
       LOG_DEBUG("estimate_scan_cost", K(ret), K(base_input.table_id_),

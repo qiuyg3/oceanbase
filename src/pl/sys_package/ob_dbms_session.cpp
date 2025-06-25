@@ -11,16 +11,8 @@
  */
 
 #define USING_LOG_PREFIX PL
-#include "pl/sys_package/ob_dbms_session.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "share/ob_common_rpc_proxy.h"
-#include "share/ob_errno.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "lib/oblog/ob_log_module.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/schema/ob_schema_struct.h"
+#include "ob_dbms_session.h"
 #include "pl/ob_pl.h"
-#include "share/ob_dml_sql_splicer.h"
 #include "share/ob_global_context_operator.h"
 #include "sql/monitor/flt/ob_flt_control_info_mgr.h"
 
@@ -50,7 +42,7 @@ int ObDBMSSession::clear_all_context(sql::ObExecContext &ctx,
     ret = OB_ERR_WRONG_FUNC_ARGUMENTS_TYPE;
     LOG_USER_ERROR(OB_ERR_WRONG_FUNC_ARGUMENTS_TYPE, func_name.length(), func_name.ptr());
   } else if (OB_FAIL(check_argument(params.at(0), false, true, 0,
-                                    OB_MAX_CONTEXT_STRING_LENGTH, context_name))) {
+                                    OB_MAX_CONTEXT_STRING_LENGTH, context_name, ctx.get_allocator()))) {
     LOG_WARN("failed to check param 0", K(ret));
   } else if (OB_ISNULL(schema_guard)) {
     ret = OB_ERR_UNEXPECTED;
@@ -106,7 +98,7 @@ int ObDBMSSession::clear_context(sql::ObExecContext &ctx,
     ret = OB_ERR_WRONG_FUNC_ARGUMENTS_TYPE;
     LOG_USER_ERROR(OB_ERR_WRONG_FUNC_ARGUMENTS_TYPE, func_name.length(), func_name.ptr());
   } else if (OB_FAIL(check_argument(params.at(0), false, true, 0,
-                                    OB_MAX_CONTEXT_STRING_LENGTH, context_name))) {
+                                    OB_MAX_CONTEXT_STRING_LENGTH, context_name, ctx.get_allocator()))) {
     LOG_WARN("failed to check param 0", K(ret));
   } else if (OB_ISNULL(schema_guard)) {
     ret = OB_ERR_UNEXPECTED;
@@ -122,10 +114,10 @@ int ObDBMSSession::clear_context(sql::ObExecContext &ctx,
                                       ctx_schema->get_schema_name()))) {
     LOG_WARN("failed to check privileges", K(ret));
   } else if (OB_FAIL(check_client_id(params.at(1),
-                      OB_MAX_CONTEXT_CLIENT_IDENTIFIER_LENGTH_IN_SESSION, client_id))) {
+                      OB_MAX_CONTEXT_CLIENT_IDENTIFIER_LENGTH_IN_SESSION, client_id, ctx.get_allocator()))) {
     LOG_WARN("failed to check param 1", K(ret));
   } else if (OB_FAIL(check_argument(params.at(2), true, true, 2,
-                      OB_MAX_CONTEXT_STRING_LENGTH, attribute))) {
+                      OB_MAX_CONTEXT_STRING_LENGTH, attribute, ctx.get_allocator()))) {
     LOG_WARN("failed to check param 2", K(ret));
   } else {
     if (ACCESSED_GLOBALLY == ctx_schema->get_context_type()) {
@@ -203,7 +195,7 @@ int ObDBMSSession::set_context(sql::ObExecContext &ctx,
     ret = OB_ERR_WRONG_FUNC_ARGUMENTS_TYPE;
     LOG_USER_ERROR(OB_ERR_WRONG_FUNC_ARGUMENTS_TYPE, func_name.length(), func_name.ptr());
   } else if (OB_FAIL(check_argument(params.at(0), false, true, 0,
-                                    OB_MAX_CONTEXT_STRING_LENGTH, context_name))) {
+                                    OB_MAX_CONTEXT_STRING_LENGTH, context_name, ctx.get_allocator()))) {
     LOG_WARN("failed to check param 0", K(ret));
   } else if (OB_ISNULL(schema_guard)) {
     ret = OB_ERR_UNEXPECTED;
@@ -219,18 +211,18 @@ int ObDBMSSession::set_context(sql::ObExecContext &ctx,
                                       ctx_schema->get_schema_name()))) {
     LOG_WARN("failed to check privileges", K(ret));
   } else if (OB_FAIL(check_argument(params.at(1), false, true, 1,
-                                    OB_MAX_CONTEXT_STRING_LENGTH, attribute))) {
+                                    OB_MAX_CONTEXT_STRING_LENGTH, attribute, ctx.get_allocator()))) {
     LOG_WARN("failed to check param 1", K(ret));
   } else if (OB_FAIL(check_argument(params.at(2), true, false, 2,
-                                    OB_MAX_CONTEXT_VALUE_LENGTH, value))) {
+                                    OB_MAX_CONTEXT_VALUE_LENGTH, value, ctx.get_allocator()))) {
     LOG_WARN("failed to check param 2", K(ret));
   } else {
     if (ACCESSED_GLOBALLY == ctx_schema->get_context_type()) {
       if (OB_FAIL(check_argument(params.at(3), true, true, 3,
-                                 OB_MAX_CONTEXT_STRING_LENGTH, username))) {
+                                 OB_MAX_CONTEXT_STRING_LENGTH, username, ctx.get_allocator()))) {
         LOG_WARN("failed to check param 3", K(ret));
       } else if (OB_FAIL(check_client_id(params.at(4),
-                         OB_MAX_CONTEXT_CLIENT_IDENTIFIER_LENGTH_IN_SESSION, client_id))) {
+                         OB_MAX_CONTEXT_CLIENT_IDENTIFIER_LENGTH_IN_SESSION, client_id, ctx.get_allocator()))) {
         LOG_WARN("failed to check param 4", K(ret));
       } else {
         if (client_id.empty()) {
@@ -328,7 +320,8 @@ int ObDBMSSession::reset_package(sql::ObExecContext &ctx,
 
 int ObDBMSSession::check_argument(const ObObj &input_param, bool allow_null,
                                   bool need_case_up, int32_t param_idx,
-                                  int64_t max_len, ObString &output_param)
+                                  int64_t max_len, ObString &output_param,
+                                  ObIAllocator &alloc)
 {
   int ret = OB_SUCCESS;
   if (input_param.is_null()) {
@@ -347,14 +340,17 @@ int ObDBMSSession::check_argument(const ObObj &input_param, bool allow_null,
     ret = OB_ERR_INVALID_INPUT_ARGUMENT;
     LOG_USER_ERROR(OB_ERR_INVALID_INPUT_ARGUMENT, param_idx + 1);
   } else if (need_case_up) {
-    try_caseup(input_param.get_collation_type(), output_param);
+    if (OB_FAIL(try_caseup(input_param.get_collation_type(), output_param, alloc))) {
+      LOG_WARN("failed to case up", K(ret));
+    }
   }
   return ret;
 }
 
 int ObDBMSSession::check_client_id(const ObObj &input_param,
                                    int64_t max_len,
-                                   ObString &output_param)
+                                   ObString &output_param,
+                                   ObIAllocator &alloc)
 {
   int ret = OB_SUCCESS;
   if (input_param.is_null()) {
@@ -367,21 +363,26 @@ int ObDBMSSession::check_client_id(const ObObj &input_param,
   } else if (output_param.length() > max_len) {
     ret = OB_ERR_CLIENT_IDENTIFIER_TOO_LONG;
     LOG_USER_ERROR(OB_ERR_CLIENT_IDENTIFIER_TOO_LONG);
-  } else {
-    try_caseup(input_param.get_collation_type(), output_param);
+  } else if (OB_FAIL(try_caseup(input_param.get_collation_type(), output_param, alloc))) {
+    LOG_WARN("failed to case up", K(ret));
   }
   return ret;
 }
 
-void ObDBMSSession::try_caseup(ObCollationType cs_type, ObString &str_val)
+int ObDBMSSession::try_caseup(ObCollationType cs_type, ObString &str_val, ObIAllocator &alloc)
 {
+  int ret = OB_SUCCESS;
+  ObString dest;
   if (!str_val.empty()) {
     if (str_val.ptr()[0] == '\"' && str_val.ptr()[str_val.length() - 1] == '\"') {
       str_val.assign(str_val.ptr() + 1, str_val.length() - 2);
+    } else if (OB_FAIL(ObCharset::caseup(cs_type, str_val, dest, alloc))) {
+      LOG_WARN("failed to case up", K(ret));
     } else {
-      ObCharset::caseup(cs_type, str_val);
+      str_val = dest;
     }
   }
+  return ret;
 }
 
 int ObDBMSSession::check_privileges(pl::ObPLContext *pl_ctx,

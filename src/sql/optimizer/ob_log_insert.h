@@ -59,6 +59,7 @@ public:
     return is_overwrite_;
   }
   virtual int get_op_exprs(ObIArray<ObRawExpr*> &all_exprs) override;
+  virtual int is_my_fixed_expr(const ObRawExpr *expr, bool &is_fixed) override;
   void set_insert_up(bool insert_up)
   {
     insert_up_ = insert_up;
@@ -104,6 +105,11 @@ public:
   virtual int est_cost() override;
   virtual int do_re_est_cost(EstimateCostInfo &param, double &card, double &op_cost, double &cost) override;
   int inner_est_cost(double child_card, double &op_cost);
+  static int inner_est_cost(const ObOptimizerContext &opt_ctx,
+                            const ObIArray<IndexDMLInfo*> &index_infos,
+                            const ObIArray<IndexDMLInfo*> &insert_up_index_infos,
+                            const double child_card,
+                            double &op_cost);
   inline void set_append_table_id(const uint64_t append_table_id)
   {
     append_table_id_ = append_table_id;
@@ -120,6 +126,9 @@ public:
   virtual int inner_replace_op_exprs(ObRawExprReplacer &replacer) override;
   virtual int get_plan_item_info(PlanText &plan_text,
                                 ObSqlPlanItem &plan_item) override;
+  int is_plain_insert(bool &is_plain_insert);
+  int is_insertup_or_replace_values(bool &is);
+  virtual int op_is_update_pk_with_dop(bool &is_update) override;
 protected:
   int get_constraint_info_exprs(ObIArray<ObRawExpr*> &all_exprs);
   virtual int generate_rowid_expr_for_trigger() override;

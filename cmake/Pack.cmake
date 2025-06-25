@@ -1,4 +1,4 @@
-set(CPACK_PACKAGING_INSTALL_PREFIX /home/admin/oceanbase)
+ob_define(CPACK_PACKAGING_INSTALL_PREFIX /home/admin/oceanbase)
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "OceanBase is a distributed relational database")
 set(CPACK_PACKAGE_VENDOR "OceanBase Inc.")
 set(CPACK_PACKAGE_DESCRIPTION "OceanBase is a distributed relational database")
@@ -32,6 +32,9 @@ if (OB_BUILD_OPENSOURCE)
   configure_file(${CMAKE_CURRENT_SOURCE_DIR}/tools/systemd/profile/telemetry.sh.template
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/systemd/profile/telemetry.sh
                 @ONLY)
+                configure_file(${CMAKE_CURRENT_SOURCE_DIR}/tools/systemd/profile/oceanbase.service.template
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/systemd/profile/oceanbase.service
+                @ONLY)
 endif()
 
 ## server
@@ -50,6 +53,7 @@ install(PROGRAMS
   tools/import_srs_data.py
   ${CMAKE_BINARY_DIR}/tools/ob_admin/ob_admin
   ${CMAKE_BINARY_DIR}/src/logservice/logminer/oblogminer
+  ${CMAKE_BINARY_DIR}/close_modules/oracle_pl/pl/wrap/wrap
   tools/ob_admin/io_bench/bench_io.sh
   ${CMAKE_BINARY_DIR}/src/observer/observer
   DESTINATION bin
@@ -61,17 +65,23 @@ install(FILES
   src/share/parameter/default_parameter.json
   src/share/system_variable/default_system_variable.json
   tools/timezone_V1.log
+  tools/timezone.data
+  tools/timezone_name.data
+  tools/timezone_trans.data
+  tools/timezone_trans_type.data
   tools/default_srs_data_mysql.sql
   tools/upgrade/upgrade_pre.py
   tools/upgrade/upgrade_post.py
   tools/upgrade/upgrade_checker.py
   tools/upgrade/upgrade_health_checker.py
   tools/upgrade/oceanbase_upgrade_dep.yml
+  tools/upgrade/deps_compat.yml
   DESTINATION etc
   COMPONENT server)
 
+message(STATUS "system package release directory: " ${SYS_PACK_RELEASE_DIR})
 install(
-  DIRECTORY src/share/inner_table/sys_package/
+  DIRECTORY ${SYS_PACK_RELEASE_DIR}/
   DESTINATION admin
   COMPONENT server)
 
@@ -81,13 +91,14 @@ install(FILES
   tools/systemd/profile/oceanbase-pre.json
   tools/systemd/profile/oceanbase.service
   tools/systemd/profile/oceanbase-service.sh
+  tools/systemd/profile/telemetry-pre.json
   tools/systemd/profile/telemetry.sh
   DESTINATION profile
   COMPONENT server)
 endif()
 
 ## oceanbase-cdc
-if (NOT OB_SO_CACHE AND OB_BUILD_CDC)
+if (NOT OB_SO_CACHE AND BUILD_CDC_ONLY)
   list(APPEND CPACK_COMPONENTS_ALL cdc)
   include(GNUInstallDirs)
   install(
@@ -352,25 +363,25 @@ if (NOT OB_BUILD_OPENSOURCE)
   endif()
 endif()
 
-if(OB_BUILD_OPENSOURCE)
 ## oceanbase-libs
 list(APPEND CPACK_COMPONENTS_ALL libs)
 install(PROGRAMS
   deps/3rd/usr/local/oceanbase/deps/devel/lib/libaio.so.1
   deps/3rd/usr/local/oceanbase/deps/devel/lib/libaio.so.1.0.1
   deps/3rd/usr/local/oceanbase/deps/devel/lib/libaio.so
-  deps/3rd/usr/local/oceanbase/deps/devel/lib/mariadb/libmariadb.so
-  deps/3rd/usr/local/oceanbase/deps/devel/lib/mariadb/libmariadb.so.3
   DESTINATION lib
   COMPONENT libs
 )
-if(OB_BUILD_OBADMIN)
+
+if(OB_BUILD_OPENSOURCE)
+  if(OB_BUILD_OBADMIN)
     ## oceanbase-utils
     list(APPEND CPACK_COMPONENTS_ALL utils)
     install(PROGRAMS
       ${CMAKE_BINARY_DIR}/tools/ob_admin/ob_admin
       ${CMAKE_BINARY_DIR}/tools/ob_error/src/ob_error
       ${CMAKE_BINARY_DIR}/src/logservice/logminer/oblogminer
+      ${DEVTOOLS_DIR}/bin/obstack
       DESTINATION /usr/bin
       COMPONENT utils
     )

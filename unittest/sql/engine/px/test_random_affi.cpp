@@ -17,7 +17,6 @@ using namespace std;
 #include <gtest/gtest.h>
 
 #include "sql/ob_sql_init.h"
-#include "sql/engine/px/ob_px_util.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
@@ -49,7 +48,7 @@ TEST_F(ObRandomAffiTaskSplitTest, split_task_test) {
     int64_t parallel = 3;
     int64_t tenant_id = 1;
     ObPxTabletInfo px_part_info;
-    ObPxAffinityByRandom affinitize_rule(true);
+    ObPxAffinityByRandom affinitize_rule(true, true);
     for (int i = 0; i < 5; ++i) {
       px_part_info.physical_row_count_ = (10 - i) * 100;
       affinitize_rule.add_partition(i,i,parallel,tenant_id,px_part_info);
@@ -70,7 +69,7 @@ TEST_F(ObRandomAffiTaskSplitTest, split_task_test) {
     int64_t parallel = 16;
     int64_t tenant_id = 1;
     ObPxTabletInfo px_part_info;
-    ObPxAffinityByRandom affinitize_rule(true);
+    ObPxAffinityByRandom affinitize_rule(true, true);
 
     px_part_info.physical_row_count_ = 3000;
     affinitize_rule.add_partition(0,0,parallel,tenant_id,px_part_info);
@@ -100,7 +99,7 @@ TEST_F(ObRandomAffiTaskSplitTest, split_task_test) {
     int64_t parallel = 3;
     int64_t tenant_id = 1;
     ObPxTabletInfo px_part_info;
-    ObPxAffinityByRandom affinitize_rule(true);
+    ObPxAffinityByRandom affinitize_rule(true, true);
 
     px_part_info.physical_row_count_ = 3000;
     affinitize_rule.add_partition(0,0,parallel,tenant_id,px_part_info);

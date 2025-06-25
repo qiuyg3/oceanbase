@@ -11,11 +11,6 @@
  */
 
 #include "ob_tenant_mutil_allocator.h"
-#include "lib/objectpool/ob_concurrency_objpool.h"
-#include "lib/rc/context.h"
-#include "observer/omt/ob_multi_tenant.h"
-#include "logservice/palf/log_io_task.h"
-#include "logservice/palf/fetch_log_engine.h"
 #include "logservice/palf/log_shared_task.h"
 #include "logservice/replayservice/ob_replay_status.h"
 
@@ -341,6 +336,7 @@ LogFillCacheTask *ObTenantMutilAllocator::alloc_log_fill_cache_task(const int64_
   return ret_ptr;
 }
 
+
 void ObTenantMutilAllocator::free_log_fill_cache_task(palf::LogFillCacheTask *ptr)
 {
   if (OB_LIKELY(NULL != ptr)) {
@@ -348,7 +344,6 @@ void ObTenantMutilAllocator::free_log_fill_cache_task(palf::LogFillCacheTask *pt
     log_fill_cache_task_alloc_.free(ptr);
   }
 }
-
 
 void ObTenantMutilAllocator::set_nway(const int32_t nway)
 {

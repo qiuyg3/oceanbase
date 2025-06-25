@@ -32,8 +32,7 @@ public:
   virtual ~ObCreateTableResolverBase();
 
 protected:
-  int resolve_auto_partition(const ParseNode *partition_node);
-  //resolve partitoin option only used in ObCreateTableResolver now.
+  //resolve partition option only used in ObCreateTableResolver now.
   int resolve_partition_option(ParseNode *node,
                                share::schema::ObTableSchema &table_schema,
                                const bool is_partition_option_node_with_opt);
@@ -44,6 +43,13 @@ protected:
                            int64_t &pk_data_length,
                            ObColumnSchemaV2 *&col);
 
+  int resolve_column_group_helper(const ParseNode *cg_node, ObTableSchema &table_schema);
+  // check this type of table_schema should build column_group or not
+  uint64_t gen_column_group_id();
+  virtual int resolve_column_group(const ParseNode *cg_node) final;
+  int resolve_table_organization(omt::ObTenantConfigGuard &tenant_config, ParseNode *node);
+protected:
+  uint64_t cur_column_group_id_;
 };
 
 } // end namespace sql

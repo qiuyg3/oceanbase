@@ -12,10 +12,6 @@
 
 #define USING_LOG_PREFIX STORAGE
 
-#include "storage/blocksstable/ob_block_manager.h"
-#include "storage/blocksstable/ob_micro_block_info.h"
-#include "storage/blocksstable/cs_encoding/ob_cs_micro_block_transformer.h"
-#include "share/rc/ob_tenant_base.h"
 #include "ob_index_block_tree_cursor.h"
 
 namespace oceanbase
@@ -83,6 +79,44 @@ void ObIndexBlockTreePathItem::reset()
   is_block_allocated_ = false;
   is_block_transformed_ = false;
   block_from_cache_ = false;
+}
+
+void ObIndexBlockTreePathItem::move_from(ObIndexBlockTreePathItem& other)
+{
+  macro_block_id_ = other.macro_block_id_;
+  curr_row_idx_ = other.curr_row_idx_;
+  row_count_ = other.row_count_;
+  start_row_offset_ = other.start_row_offset_;
+  block_data_= other.block_data_;
+  cache_handle_.move_from(other.cache_handle_);
+  row_store_type_ = other.row_store_type_;
+  is_root_micro_block_ = other.is_root_micro_block_;
+  is_block_data_held_ = other.is_block_data_held_;
+  is_block_allocated_ = other.is_block_allocated_;
+  is_block_transformed_ = other.is_block_transformed_;
+  block_from_cache_ = other.block_from_cache_;
+}
+
+int ObIndexBlockTreePathItem::assign(const ObIndexBlockTreePathItem& other)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(cache_handle_.assign(other.cache_handle_))) {
+    LOG_WARN("fail to assign handle", K(ret));
+    reset();
+  } else {
+    macro_block_id_ = other.macro_block_id_;
+    curr_row_idx_ = other.curr_row_idx_;
+    row_count_ = other.row_count_;
+    start_row_offset_ = other.start_row_offset_;
+    block_data_ = other.block_data_;
+    row_store_type_ = other.row_store_type_;
+    is_root_micro_block_ = other.is_root_micro_block_;
+    is_block_data_held_ = other.is_block_data_held_;
+    is_block_allocated_ = other.is_block_allocated_;
+    is_block_transformed_ = other.is_block_transformed_;
+    block_from_cache_ = other.block_from_cache_;
+  }
+  return ret;
 }
 
 ObIndexBlockTreePath::ObIndexBlockTreePath()
@@ -289,7 +323,7 @@ int ObIndexBlockTreePath::PathItemStack::expand()
   } else {
     MEMSET(new_var_buf, 0, new_alloc_size);
     for (int64_t i = 0; i < buf_capacity_ - MAX_TREE_FIX_BUF_LENGTH; ++i) {
-      reinterpret_cast<ObIndexBlockTreePathItem *>(new_var_buf)[i] = var_buf_[i];
+      reinterpret_cast<ObIndexBlockTreePathItem *>(new_var_buf)[i].move_from(var_buf_[i]);
     }
     if (nullptr != var_buf_) {
       allocator_->free(var_buf_);
@@ -356,7 +390,7 @@ int ObIndexBlockTreeCursor::init(
   } else if (OB_UNLIKELY(!sstable.is_normal_cg_sstable() && sstable_rowkey_col_cnt != read_info->get_rowkey_count())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Rowkey column count not match between read info and sstable",
-        K(ret), K(read_info), K(sstable_rowkey_col_cnt));
+        K(ret), KPC(read_info), K(sstable_rowkey_col_cnt));
   } else {
     tenant_id_ = MTL_ID();
     ObRowStoreType root_row_store_type
@@ -652,10 +686,10 @@ int ObIndexBlockTreeCursor::locate_rowkey_in_curr_block(
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(read_next_level_row(curr_path_item_->curr_row_idx_))) {
     LOG_WARN("Fail to read next level row", K(ret), KPC(curr_path_item_), K(rowkey));
+  } else {
+    LOG_DEBUG("[INDEX_BLOCK] Index block tree search: ",
+        K(cursor_path_.depth()), KPC(curr_path_item_), K(idx_row_parser_));
   }
-
-  LOG_DEBUG("[INDEX_BLOCK] Index block tree search: ",
-      K(cursor_path_.depth()), KPC(curr_path_item_), K(idx_row_parser_), K_(row));
   return ret;
 }
 
@@ -790,6 +824,113 @@ int ObIndexBlockTreeCursor::pull_up_to_root()
   return ret;
 }
 
+int ObIndexBlockTreeCursor::move_until_cannot_skip(int64_t &remain_step)
+{
+  int ret = OB_SUCCESS;
+  const ObIndexBlockRowHeader *idx_row_header = nullptr;
+
+  while (OB_SUCC(ret) && curr_path_item_->curr_row_idx_ < curr_path_item_->row_count_) {
+    if (OB_FAIL(read_next_level_row(curr_path_item_->curr_row_idx_))) {
+      LOG_WARN("Fail to read next level row", K(ret), KPC(curr_path_item_));
+    } else if (OB_FAIL(idx_row_parser_.get_header(idx_row_header))) {
+      LOG_WARN("Fail to get next level row header", K(ret), KPC(curr_path_item_));
+    } else if (OB_ISNULL(idx_row_header)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("Unexpected null index row header", K(ret));
+    } else if (remain_step > idx_row_header->micro_block_count_) {
+      // we can skip whole node
+      remain_step -= idx_row_header->micro_block_count_;
+      curr_path_item_->curr_row_idx_++;
+    } else {
+      // this node is needed
+      break;
+    }
+  }
+  return ret;
+}
+
+int ObIndexBlockTreeCursor::move_forward_micro(const uint64_t step)
+{
+  int ret = OB_SUCCESS;
+
+  int64_t remain_step = step;
+  int64_t next_idx = 0;
+
+  const ObIndexBlockRowHeader *idx_row_header = nullptr;
+  bool reach_target_depth = false;
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("Tree cursor not inited", K(ret));
+  } else if (FALSE_IT(next_idx = curr_path_item_->curr_row_idx_ + step)) {
+  } else if (next_idx >= curr_path_item_->row_count_) {
+
+    // remain row in current block is less than remain_step, pull up and find next node
+    if (OB_FAIL(idx_row_parser_.get_header(idx_row_header))) {
+      LOG_WARN("Fail to get index block row header", K(ret));
+    } else if (OB_ISNULL(idx_row_header)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("Unexpected null index row header", K(ret));
+    } else if (OB_UNLIKELY(!idx_row_header->is_data_block())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("Invalid depth for cursor to move forward micro", K(ret));
+    } else {
+      // firstly, skip current node
+      remain_step -= curr_path_item_->row_count_ - curr_path_item_->curr_row_idx_ - 1;
+      curr_path_item_->curr_row_idx_ = curr_path_item_->row_count_;
+    }
+
+    while (OB_SUCC(ret) && !cursor_path_.empty() && remain_step > 0
+           && curr_path_item_->curr_row_idx_ >= curr_path_item_->row_count_) {
+      // try to pull up
+      if (OB_FAIL(pull_up(true /* cascade */, false))) {
+        LOG_WARN("Fail to pull up index block tree cursor", K(ret), KPC(curr_path_item_));
+      } else if (FALSE_IT(curr_path_item_->curr_row_idx_++)){
+      } else if (OB_FAIL(move_until_cannot_skip(remain_step))) {
+        LOG_WARN("Fail to move until cannot skip", K(ret), K(remain_step));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (cursor_path_.empty() && curr_path_item_->curr_row_idx_ >= curr_path_item_->row_count_) {
+      // Scan finished
+      ret = OB_ITER_END;
+      LOG_DEBUG("[INDEX_BLOCK] Same level scan end", K(ret), K(curr_path_item_->curr_row_idx_), KPC(curr_path_item_));
+    } else {
+      while (OB_SUCC(ret) && !reach_target_depth && remain_step > 0) {
+        if (OB_FAIL(drill_down())) {
+          LOG_WARN("Fail to drill down to next level",
+                   K(ret),
+                   KPC(curr_path_item_),
+                   K_(cursor_path));
+        } else if (FALSE_IT(curr_path_item_->curr_row_idx_ = 0)) {
+        } else if (OB_FAIL(read_next_level_row(curr_path_item_->curr_row_idx_))) {
+          LOG_WARN("Fail to read next level row", K(ret), KPC(curr_path_item_));
+        } else if (OB_FAIL(check_reach_target_depth(LEAF, reach_target_depth))) {
+          LOG_WARN("Fail to check if reach the target depth", K(ret));
+        } else if (reach_target_depth) {
+          // ! remain_step = 1 means curr_row_idx should be 0 (because we are move from last block)
+          curr_path_item_->curr_row_idx_ = remain_step - 1;
+          if (OB_UNLIKELY(curr_path_item_->curr_row_idx_ >= curr_path_item_->row_count_)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("Fail to move forward micro", K(ret), K(remain_step), KPC(curr_path_item_));
+          } else if (OB_FAIL(read_next_level_row(curr_path_item_->curr_row_idx_))) {
+            LOG_WARN("Fail to read next level row", K(ret), KPC(curr_path_item_));
+          }
+        } else if (OB_FAIL(move_until_cannot_skip(remain_step))) {
+          LOG_WARN("Fail to move until cannot skip", K(ret), K(remain_step));
+        }
+      }
+    }
+
+  } else if (FALSE_IT(curr_path_item_->curr_row_idx_ = next_idx)) {
+  } else if (OB_FAIL(read_next_level_row(curr_path_item_->curr_row_idx_))) {
+    LOG_WARN("Fail to read next level row", K(ret), KPC(curr_path_item_));
+  }
+
+  return ret;
+}
+
 int ObIndexBlockTreeCursor::move_forward(const bool is_reverse_scan)
 {
   int ret = OB_SUCCESS;
@@ -911,6 +1052,41 @@ int ObIndexBlockTreeCursor::get_macro_block_id(MacroBlockId &macro_id)
   return ret;
 }
 
+int ObIndexBlockTreeCursor::get_current_node_macro_id(MacroBlockId &macro_id)
+{
+  int ret = OB_SUCCESS;
+  const ObIndexBlockRowHeader *idx_header = nullptr;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("Not init", K(ret));
+  } else if (OB_FAIL(idx_row_parser_.get_header(idx_header))) {
+    LOG_WARN("Fail to get index block row header", K(ret));
+  } else if (OB_ISNULL(idx_header)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("Got null pointer for index block row header", K(ret));
+  } else {
+    macro_id = idx_header->get_macro_id();
+  }
+  return ret;
+}
+
+int ObIndexBlockTreeCursor::get_parent_node_macro_id(MacroBlockId &macro_id)
+{
+  int ret = OB_SUCCESS;
+  const ObIndexBlockRowHeader *idx_header = nullptr;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("Not init", K(ret));
+  } else {
+    macro_id = curr_path_item_->macro_block_id_;
+    if (OB_UNLIKELY(!macro_id.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("macro_id is invalid.", KR(ret), K(macro_id));
+    }
+  }
+  return ret;
+}
+
 int ObIndexBlockTreeCursor::get_child_micro_infos(
     const ObDatumRange &range,
     ObArenaAllocator &endkey_allocator,
@@ -929,9 +1105,10 @@ int ObIndexBlockTreeCursor::get_child_micro_infos(
     LOG_WARN("Failed to get micro block infos", K(ret));
   } else if (OB_FAIL(get_micro_block_endkeys(range, endkey_allocator, micro_index_infos, endkeys))) {
     LOG_WARN("Failed to get micro block endkeys", K(ret));
-  } else if (FALSE_IT(hold_item = *curr_path_item_)) {
+  } else if (OB_FAIL(hold_item.assign(*curr_path_item_))) {
+    LOG_WARN("Failed to assign path item", K(ret));
   } else if (FALSE_IT(curr_path_item_->is_block_data_held_ = true)) {
-  } else if (OB_FAIL(pull_up())) {
+  } else if (OB_FAIL(pull_up(false /* cascade */, false /* is_reverse_scan */))) {
     LOG_WARN("Failed to pull up to previous micro block", K(ret));
   }
   return ret;
@@ -1060,29 +1237,28 @@ int ObIndexBlockTreeCursor::get_next_level_block(
     absolute_offset = sstable_meta_handle_.get_sstable_meta().get_macro_info().get_nested_offset()
         + idx_row_header.get_block_offset();
   }
-
-  if (OB_FAIL(ret)) {
-    // do nothing
-  } else if (OB_FAIL(index_block_cache_->get_cache_block(
-      tenant_id_,
-      macro_block_id,
-      absolute_offset,
-      idx_row_header.get_block_size(),
-      curr_path_item_->cache_handle_))) {
-    if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST != ret)) {
-      LOG_WARN("Fail to get micro block handle from block cache",
-        K(ret), K(macro_block_id), K(idx_row_header));
-    } else if (OB_FAIL(load_micro_block_data(macro_block_id, absolute_offset, idx_row_header))) {
-      LOG_WARN("fail to load micro block data",
-          K(ret), K(macro_block_id), K(absolute_offset), K(idx_row_header));
+  if (OB_SUCC(ret)) {
+    ObMicroBlockCacheKey key;
+    idx_row_header.has_valid_logic_micro_id() ?
+      key.set(tenant_id_, idx_row_header.get_logic_micro_id(), idx_row_header.get_data_checksum()) :
+      key.set(tenant_id_, macro_block_id, absolute_offset, idx_row_header.get_block_size());
+    if (OB_FAIL(index_block_cache_->get_cache_block(key, curr_path_item_->cache_handle_))) {
+      if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST != ret)) {
+        LOG_WARN("Fail to get micro block handle from block cache",
+          K(ret), K(macro_block_id), K(idx_row_header));
+      } else if (OB_FAIL(load_micro_block_data(macro_block_id, absolute_offset, idx_row_header))) {
+        LOG_WARN("fail to load micro block data",
+            K(ret), K(macro_block_id), K(absolute_offset), K(idx_row_header));
+      }
+    } else {
+      curr_path_item_->block_data_ = *curr_path_item_->cache_handle_.get_block_data();
+      curr_path_item_->block_from_cache_ = true;
+      curr_path_item_->is_block_transformed_ = curr_path_item_->block_data_.get_extra_buf() != nullptr;
+      // curr_path_item_->is_block_transformed_ = false;
     }
-  } else {
-    curr_path_item_->block_data_ = *curr_path_item_->cache_handle_.get_block_data();
-    curr_path_item_->block_from_cache_ = true;
-    curr_path_item_->is_block_transformed_ = curr_path_item_->block_data_.get_extra_buf() != nullptr;
-    // curr_path_item_->is_block_transformed_ = false;
+    curr_path_item_->start_row_offset_ = 0;
+    LOG_DEBUG("get cache block", K(ret), K(key), K(idx_row_header));
   }
-  curr_path_item_->start_row_offset_ = 0;
   if (OB_SUCC(ret) && TreeType::INDEX_BLOCK == tree_type_ && (idx_row_header.is_leaf_block() || idx_row_header.is_data_block())) {
     curr_path_item_->start_row_offset_ = curr_row_offset - idx_row_header.row_count_ + 1;
   }
@@ -1096,25 +1272,30 @@ int ObIndexBlockTreeCursor::load_micro_block_data(const MacroBlockId &macro_bloc
   // TODO: optimize with prefetch
   // Cache miss, read in sync IO
   int ret = OB_SUCCESS;
-  ObMacroBlockHandle macro_handle;
+  // Need to pay attention!!!
+  // The allocator is used to allocate io data buffer, and its memory life cycle needs to be longer than the object handle.
+  ObArenaAllocator io_allocator("IBTC_IOUB", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
+  ObStorageObjectHandle macro_handle;
   ObMacroBlockReader macro_reader;
-  ObMacroBlockReadInfo read_info;
+  ObStorageObjectReadInfo read_info;
   ObMicroBlockDesMeta block_des_meta;
+
   read_info.macro_block_id_ = macro_block_id;
   read_info.offset_ = block_offset;
   read_info.size_ = idx_row_header.get_block_size();
+  read_info.io_desc_.set_mode(ObIOMode::READ);
   read_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_DATA_READ);
-  read_info.io_desc_.set_resource_group_id(THIS_WORKER.get_group_id());
   read_info.io_desc_.set_sys_module_id(ObIOModule::INDEX_BLOCK_TREE_CURSOR_IO);
   read_info.io_timeout_ms_ = GCONF._data_storage_io_timeout / 1000L;
+  read_info.mtl_tenant_id_ = MTL_ID();
+
   idx_row_header.fill_deserialize_meta(block_des_meta);
-  ObArenaAllocator io_allocator("IBTC_IOUB", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
   if (OB_ISNULL(read_info.buf_ =
       reinterpret_cast<char*>(io_allocator.alloc(read_info.size_)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     STORAGE_LOG(WARN, "failed to alloc macro read info buffer", K(ret), K(read_info.size_));
   } else {
-    if (OB_FAIL(ObBlockManager::read_block(read_info, macro_handle))) {
+    if (OB_FAIL(ObObjectManager::read_object(read_info, macro_handle))) {
       LOG_WARN("Fail to read micro block from sync io", K(ret));
     } else {
       const char *src_block_buf = macro_handle.get_buffer();

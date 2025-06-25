@@ -31,6 +31,7 @@ void on_translate_fail(ObRequest* req, int ret)
   } else if (ObRequest::OB_MYSQL == req_type) {
     SQL_REQ_OP.disconnect_sql_conn(req);
     SQL_REQ_OP.finish_sql_request(req);
+    req->reset_diagnostic_info();
   }
 }
 
@@ -46,6 +47,12 @@ int ObRequest::set_trace_point(int trace_point)
     handling_state_ = trace_point;
   }
   return OB_SUCCESS;
+}
+
+int ObRequest::set_traverse_index(int64_t index) {
+  int ret = OB_SUCCESS;
+  traverse_index_ = index;
+  return ret;
 }
 
 } //end of namespace rpc

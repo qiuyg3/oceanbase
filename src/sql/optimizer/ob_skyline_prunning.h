@@ -38,6 +38,7 @@ public:
     INTERESTING_ORDER,
     QUERY_RANGE,
     SHARDING_INFO,
+    UNIQUE_RANGE,
     MAX_DIM //max dimension
   };
   enum CompareStat {
@@ -64,31 +65,15 @@ class ObIndexBackDim : public ObSkylineDim
 {
 public:
   friend class ObOptimizerTraceImpl;
-  ObIndexBackDim() : ObSkylineDim(INDEX_BACK), need_index_back_(false),
-    has_interesting_order_(true),
-    can_extract_range_(true),
-    index_column_cnt_(0),
-    filter_column_cnt_(0)
-  { MEMSET(filter_column_ids_, 0, sizeof(uint64_t) * common::OB_USER_MAX_ROWKEY_COLUMN_NUMBER); }
+  ObIndexBackDim() : ObSkylineDim(INDEX_BACK), need_index_back_(false)
+  {}
 
   virtual ~ObIndexBackDim() {}
   void set_index_back(const bool index_back) { need_index_back_ = index_back; }
-  void set_interesting_order(const bool has) { has_interesting_order_ = has; }
-  void set_extract_range(const bool can) { can_extract_range_ = can;}
-  void set_index_column_cnt(const int64_t size) { index_column_cnt_ = size; }
-  int add_filter_column_ids(const common::ObIArray<uint64_t> &filter_column_ids);
   virtual int compare(const ObSkylineDim &other, CompareStat &status) const;
-  VIRTUAL_TO_STRING_KV(K_(need_index_back), K_(has_interesting_order), K_(can_extract_range),
-               K_(index_column_cnt),
-               "restrcit_ids", common::ObArrayWrap<uint64_t>(filter_column_ids_, filter_column_cnt_));
+  VIRTUAL_TO_STRING_KV(K_(need_index_back));
 private:
   bool need_index_back_;
-  bool has_interesting_order_;
-  bool can_extract_range_;
-  int64_t index_column_cnt_;
-  //some filter conditions on index columns
-  int64_t filter_column_cnt_;
-  uint64_t filter_column_ids_[common::OB_USER_MAX_ROWKEY_COLUMN_NUMBER];
 };
 
 
@@ -166,17 +151,39 @@ private:
   bool contain_always_false_;
 };
 
+class ObUniqueRangeDim: public ObSkylineDim
+{
+public:
+  friend class ObOptimizerTraceImpl;
+  ObUniqueRangeDim() : ObSkylineDim(UNIQUE_RANGE),
+    range_cnt_(0) {}
+  virtual ~ObUniqueRangeDim() {}
+  virtual int compare(const ObSkylineDim &other, CompareStat &status) const;
+  void set_range_count(int64_t range_cnt)
+  {
+    range_cnt_ = range_cnt;
+  }
+  VIRTUAL_TO_STRING_KV(K_(range_cnt));
+private:
+  int64_t range_cnt_;
+  DISALLOW_COPY_AND_ASSIGN(ObUniqueRangeDim);
+};
+
 class ObShardingInfoDim: public ObSkylineDim
 {
 public:
+  friend class ObOptimizerTraceImpl;
   ObShardingInfoDim() : ObSkylineDim(SHARDING_INFO),
-    sharding_info_(NULL)
+    sharding_info_(NULL),
+    is_single_get_(false)
   {}
   virtual ~ObShardingInfoDim() {}
   void set_sharding_info(ObShardingInfo *sharding_info) { sharding_info_ = sharding_info; }
+  void set_is_single_get(bool is_single_get) { is_single_get_ = is_single_get; }
   virtual int compare(const ObSkylineDim &other, CompareStat &status) const;
 private:
   ObShardingInfo *sharding_info_;
+  bool is_single_get_;
 };
 
 struct KeyPrefixComp
@@ -214,7 +221,8 @@ class ObIndexSkylineDim
 public:
   ObIndexSkylineDim() : index_id_(common::OB_INVALID_ID),
     dim_count_(ObSkylineDim::DIM_COUNT),
-    can_prunning_(true)
+    can_prunning_(true),
+    is_get_(false)
   { MEMSET(skyline_dims_, 0, sizeof(const ObSkylineDim *) * ObSkylineDim::DIM_COUNT); }
   virtual ~ObIndexSkylineDim() {}
   int compare(const ObIndexSkylineDim &other, ObSkylineDim::CompareStat &status) const;
@@ -222,10 +230,6 @@ public:
   int add_skyline_dim(const ObSkylineDim &dim);
   void set_index_id(const uint64_t index_id) { index_id_ = index_id; }
   int add_index_back_dim(const bool is_index_back,
-                         const bool has_interest_order,
-                         const bool can_extract_range,
-                         const int64_t index_column_cnt,
-                         const common::ObIArray<uint64_t> &restrict_ids,
                          common::ObIAllocator &allocator);
   int add_interesting_order_dim(const bool is_index_back,
                                 const bool can_extract_range,
@@ -236,16 +240,19 @@ public:
   int add_query_range_dim(const common::ObIArray<uint64_t> &prefix_range_ids,
                           common::ObIAllocator &allocator,
                           bool contain_always_false);
-  int add_sharding_info_dim(ObShardingInfo *sharding_info, ObIAllocator &allocator);
+  int add_unique_range_dim(int64_t range_cnt, ObIAllocator &allocator);
+  int add_sharding_info_dim(ObShardingInfo *sharding_info, bool is_single_get, ObIAllocator &allocator);
   bool can_prunning() const { return can_prunning_; }
   void set_can_prunning(const bool can) { can_prunning_ = can; }
-  TO_STRING_KV(K_(index_id), K_(dim_count),
+  void set_is_get(bool is_get) { is_get_ = is_get; }
+  TO_STRING_KV(K_(index_id), K_(is_get), K_(dim_count),
                "dims", common::ObArrayWrap<const ObSkylineDim *>(skyline_dims_, dim_count_));
 private:
   uint64_t index_id_;
   const int64_t dim_count_;
   bool can_prunning_; //whether this index can prunning other index or not
   const ObSkylineDim *skyline_dims_[ObSkylineDim::DIM_COUNT];
+  bool is_get_;
 };
 
 class ObSkylineDimRecorder

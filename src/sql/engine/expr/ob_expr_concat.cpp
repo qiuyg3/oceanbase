@@ -13,11 +13,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/expr/ob_expr_concat.h"
-#include <string.h>
-#include "lib/oblog/ob_log.h"
-//#include "share/object/ob_obj_cast.h"
-#include "objit/common/ob_item_type.h"
-//#include "sql/engine/expr/ob_expr_promotion_util.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 
@@ -232,10 +227,11 @@ int ObExprConcat::calc_result_typeN(ObExprResType &type,
     OZ (aggregate_charsets_for_string_result(type,
                                              types,
                                              param_num,
-                                             type_ctx.get_coll_type()));
+                                             type_ctx));
     for (int64_t i = 0; i < param_num; ++i) {
       types[i].set_calc_type(type.get_type());
       types[i].set_calc_collation_type(type.get_collation_type());
+      types[i].set_calc_collation_level(type.get_collation_level());
     }
   }
 

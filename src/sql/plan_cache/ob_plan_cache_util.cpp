@@ -12,16 +12,9 @@
 
 #define USING_LOG_PREFIX SQL_PC
 
-#include "sql/plan_cache/ob_plan_cache_util.h"
-#include "sql/plan_cache/ob_plan_set.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/ob_i_tablet_scan.h"
-#include "sql/engine/ob_exec_context.h"
-#include "sql/executor/ob_task_executor.h"
-#include "sql/ob_phy_table_location.h"
-#include "sql/optimizer/ob_phy_table_location_info.h"
+#include "ob_plan_cache_util.h"
 #include "sql/optimizer/ob_log_plan.h"
+#include "sql/optimizer/ob_direct_load_optimizer_ctx.h"
 using namespace oceanbase::share;
 using namespace oceanbase::share::schema;
 using namespace oceanbase::omt;
@@ -73,8 +66,9 @@ int ObGetAllCacheIdOp::operator()(common::hash::HashMapPair<ObCacheObjID, ObILib
   if (NULL == key_array_ || OB_ISNULL(entry.second)) {
     ret = common::OB_NOT_INIT;
     SQL_PC_LOG(WARN, "invalid argument", K(ret));
-  } else if (entry.second->get_ns() >= ObLibCacheNameSpace::NS_CRSR
-            && entry.second->get_ns() <= ObLibCacheNameSpace::NS_PKG) {
+  } else if ((entry.second->get_ns() >= ObLibCacheNameSpace::NS_CRSR
+            && entry.second->get_ns() <= ObLibCacheNameSpace::NS_PKG)
+            ||entry.second->get_ns() == ObLibCacheNameSpace::NS_CALLSTMT) {
     if (OB_ISNULL(entry.second)) {
       // do nothing
     } else if (!entry.second->added_lc()) {
@@ -426,11 +420,6 @@ int ObPhyLocationGetter::get_phy_locations(const ObIArray<ObTableLocation> &tabl
                                                phy_location_info_ptrs))) {
           LOG_WARN("failed to select replicas", K(ret), K(table_locations),
                    K(exec_ctx.get_addr()), K(phy_location_info_ptrs));
-        } else if (!has_duplicate_tbl_not_in_dml || is_retrying) {
-          // do nothing
-        } else if (OB_FAIL(reselect_duplicate_table_best_replica(candi_table_locs,
-                                                                 on_same_server))) {
-          LOG_WARN("failed to reselect replicas", K(ret));
         }
         LOG_TRACE("after select_replicas", K(on_same_server), K(has_duplicate_tbl_not_in_dml),
                   K(candi_table_locs), K(table_locations), K(ret));
@@ -524,6 +513,8 @@ int ObConfigInfoInPC::load_influence_plan_config()
   is_strict_defensive_check_ = GCONF.enable_strict_defensive_check();
   is_enable_px_fast_reclaim_ = GCONF._enable_px_fast_reclaim;
   bloom_filter_ratio_ = GCONF._bloom_filter_ratio;
+  realistic_runtime_bloom_filter_size_ = !GCONF._preset_runtime_bloom_filter_size;
+  ndv_runtime_bloom_filter_size_ = GCONF._ndv_runtime_bloom_filter_size;
 
   // For Tenant configs
   // tenant config use tenant_config to get configs
@@ -538,6 +529,20 @@ int ObConfigInfoInPC::load_influence_plan_config()
     enable_spf_batch_rescan_ = tenant_config->_enable_spf_batch_rescan;
     enable_var_assign_use_das_ = tenant_config->_enable_var_assign_use_das;
     enable_das_keep_order_ = tenant_config->_enable_das_keep_order;
+    enable_index_merge_ = tenant_config->_enable_index_merge;
+    enable_hyperscan_regexp_engine_ =
+        (0 == ObString::make_string("Hyperscan").case_compare(tenant_config->_regex_engine.str()));
+    enable_parallel_das_dml_ = tenant_config->_enable_parallel_das_dml;
+    direct_load_allow_fallback_ = tenant_config->direct_load_allow_fallback;
+    default_load_mode_ = ObDefaultLoadMode::get_type_value(tenant_config->default_load_mode.get_value_string());
+    hash_rollup_policy_ = tenant_config->_use_hash_rollup.case_compare("auto") == 0 ?
+                            0 :
+                            (tenant_config->_use_hash_rollup.case_compare("forced") == 0 ? 1 : 2);
+    enable_nlj_spf_use_rich_format_ = tenant_config->_enable_nlj_spf_use_rich_format;
+    enable_distributed_das_scan_ = tenant_config->_enable_distributed_das_scan;
+    enable_das_batch_rescan_flag_ = tenant_config->_enable_das_batch_rescan_flag;
+    enable_topn_runtime_filter_ = tenant_config->_enable_topn_runtime_filter;
+    min_const_integer_precision_ = static_cast<int8_t>(tenant_config->_min_const_integer_precision);
   }
 
   return ret;
@@ -596,6 +601,43 @@ int ObConfigInfoInPC::serialize_configs(char *buf, int buf_len, int64_t &pos)
   } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
                                "%d,", bloom_filter_ratio_))) {
     SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(bloom_filter_ratio_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                               "%d,", enable_hyperscan_regexp_engine_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(enable_hyperscan_regexp_engine_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                               "%d", realistic_runtime_bloom_filter_size_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(realistic_runtime_bloom_filter_size_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                               "%d,", enable_parallel_das_dml_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(enable_parallel_das_dml_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                               "%d", direct_load_allow_fallback_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(direct_load_allow_fallback_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                               "%d", default_load_mode_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(default_load_mode_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%d", hash_rollup_policy_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(hash_rollup_policy_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                               "%d,", enable_nlj_spf_use_rich_format_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(enable_nlj_spf_use_rich_format_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                               "%d", ndv_runtime_bloom_filter_size_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(ndv_runtime_bloom_filter_size_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                               "%d", enable_index_merge_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(enable_index_merge_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                              "%d,", enable_distributed_das_scan_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(enable_distributed_das_scan_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                              "%ld,", enable_das_batch_rescan_flag_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(enable_das_batch_rescan_flag_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                              "%d,", enable_topn_runtime_filter_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(enable_topn_runtime_filter_));
+  } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%d,", min_const_integer_precision_))) {
+    SQL_PC_LOG(WARN, "failed to databuff_printf", K(ret), K(min_const_integer_precision_));
   } else {
     // do nothing
   }

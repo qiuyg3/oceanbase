@@ -14,24 +14,11 @@
 
 #include "rootserver/freeze/ob_major_merge_info_manager.h"
 
-#include "rootserver/ob_rs_event_history_table_operator.h"
-#include "rootserver/ob_root_utils.h"
-#include "lib/mysqlclient/ob_mysql_transaction.h"
-#include "lib/utility/utility.h"
-#include "share/ob_common_rpc_proxy.h"
-#include "share/config/ob_server_config.h"
-#include "share/ob_zone_table_operation.h"
 #include "share/ob_global_stat_proxy.h"
-#include "rootserver/freeze/ob_zone_merge_manager.h"
 #include "rootserver/ob_ddl_service.h"
 #include "share/ob_global_stat_proxy.h"
-#include "share/ob_snapshot_table_proxy.h"
-#include "observer/ob_server_struct.h"
-#include "lib/utility/ob_tracepoint.h"
 #include "storage/tx/ob_ts_mgr.h"
-#include "storage/tx/wrs/ob_weak_read_util.h"
-#include "share/ob_server_table_operator.h"
-
+#include "rootserver/ob_tenant_balance_service.h"
 namespace oceanbase
 {
 using namespace common;
@@ -97,7 +84,7 @@ int ObMajorMergeInfoManager::reload(const bool reload_zone_merge_info)
 }
 
 // add freeze info to inner_table
-int ObMajorMergeInfoManager::set_freeze_info()
+int ObMajorMergeInfoManager::set_freeze_info(const ObMajorFreezeReason freeze_reason)
 {
   int ret = OB_SUCCESS;
   SCN new_frozen_scn;
@@ -118,6 +105,19 @@ int ObMajorMergeInfoManager::set_freeze_info()
     // In 'ddl_sql_transaction.start()', it implements the semantics of 'lock_all_ddl_operation'.
     if (OB_FAIL(trans.start(GCTX.sql_proxy_, tenant_id_, fake_schema_version))) {
       LOG_WARN("fail to start transaction", KR(ret), K_(tenant_id), K(fake_schema_version));
+#ifdef OB_BUILD_SHARED_STORAGE
+    } else if (GCTX.is_shared_storage_mode()
+            && OB_FAIL(ObTenantBalanceService::lock_and_check_balance_job(trans, tenant_id_))) {
+      if (OB_ENTRY_EXIST == ret) {
+        LOG_WARN("exist balance job, can't update broadcast version now", KR(ret), K_(tenant_id));
+        ROOTSERVICE_EVENT_ADD("ss_major_merge", "root_major_freeze",
+                              K_(tenant_id),
+                              "disabled_reason", "exist balance job",
+                              "freeze_reason", major_freeze_reason_to_str(freeze_reason));
+      } else {
+        LOG_WARN("fail to check balance job", KR(ret), K_(tenant_id));
+      }
+#endif
     // 1. lock snapshot_gc_ts in __all_global_stat
     } else if (OB_FAIL(ObGlobalStatProxy::select_snapshot_gc_scn_for_update(
               trans, tenant_id_, remote_snapshot_gc_scn))) {
@@ -138,7 +138,6 @@ int ObMajorMergeInfoManager::set_freeze_info()
         freeze_info.frozen_scn_ = new_frozen_scn;
         freeze_info.schema_version_ = schema_version_in_frozen_ts;
         freeze_info.data_version_ = data_version;
-
         // 4. insert freeze info
         if (OB_FAIL(freeze_info_proxy.set_freeze_info(trans, freeze_info))) {
           LOG_WARN("fail to set freeze info", KR(ret), K(freeze_info), K_(tenant_id));
@@ -158,8 +157,9 @@ int ObMajorMergeInfoManager::set_freeze_info()
   }
 
   LOG_INFO("finish set freeze info", KR(ret), K(freeze_info), K_(tenant_id));
-  ROOTSERVICE_EVENT_ADD("root_service", "root_major_freeze", K_(tenant_id),
-                        K(ret), "new_frozen_scn", new_frozen_scn.get_val_for_inner_table_field());
+  ROOTSERVICE_EVENT_ADD("major_merge", "root_major_freeze", K_(tenant_id),
+                        K(ret), "new_frozen_scn", new_frozen_scn.get_val_for_inner_table_field(),
+                        "freeze_reason", major_freeze_reason_to_str(freeze_reason));
   return ret;
 }
 

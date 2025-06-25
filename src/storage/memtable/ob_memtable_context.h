@@ -186,9 +186,7 @@ public:
   {
     if (OB_UNLIKELY(ATOMIC_LOAD(&free_count_) != ATOMIC_LOAD(&alloc_count_))) {
       TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "query allocator leak found", K(alloc_count_), K(free_count_), K(alloc_size_));
-#ifdef ENABLE_DEBUG_LOG
-      ob_abort();
-#endif
+      OB_SAFE_ABORT();
     }
     if (!only_check) {
       allocator_.reset();
@@ -278,9 +276,7 @@ public:
   {
     if (OB_UNLIKELY(free_count_ != alloc_count_)) {
       TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "callback memory leak found", K(alloc_count_), K(free_count_), K(alloc_size_));
-#ifdef ENABLE_DEBUG_LOG
-      ob_abort();
-#endif
+      OB_SAFE_ABORT();
     }
     if (!only_check) {
       allocator_.reset();
@@ -379,6 +375,7 @@ public:
                         const share::SCN final_scn);
   virtual int trans_clear();
   virtual int elr_trans_preparing();
+  virtual void elr_trans_revoke();
   virtual int trans_kill();
   virtual int trans_publish();
   virtual int trans_replay_begin();
@@ -438,7 +435,9 @@ public:
   int clean_unlog_callbacks();
   int check_tx_mem_size_overflow(bool &is_overflow);
 public:
-  void on_key_duplication_retry(const ObMemtableKey& key);
+  void on_key_duplication_retry(const ObMemtableKey& key,
+                                const ObMvccRow *value,
+                                const ObMvccWriteResult &res);
   void on_tsc_retry(const ObMemtableKey& key,
                     const share::SCN snapshot_version,
                     const share::SCN max_trans_version,
@@ -471,6 +470,12 @@ public: // callback
 
   bool is_for_replay() const { return trans_mgr_.is_for_replay(); }
   int append_callback(ObITransCallback *cb) { return trans_mgr_.append(cb); }
+  int append_callback(ObITransCallback *head,
+                      ObITransCallback *tail,
+                      const int64_t length)
+  {
+    return trans_mgr_.append(head, tail, length);
+  }
   int64_t get_pending_log_size() { return trans_mgr_.get_pending_log_size(); }
   int64_t get_flushed_log_size() { return trans_mgr_.get_flushed_log_size(); }
   int acquire_callback_list(const bool new_epoch)
@@ -479,7 +484,11 @@ public: // callback
   void set_for_replay(const bool for_replay) { trans_mgr_.set_for_replay(for_replay); }
   void inc_pending_log_size(const int64_t size) { trans_mgr_.inc_pending_log_size(size); }
   void inc_flushed_log_size(const int64_t size) { trans_mgr_.inc_flushed_log_size(size); }
-
+  void *alloc_prio_link_node()
+  { return mem_ctx_obj_pool_.alloc<transaction::tablelock::ObMemCtxLockPrioOpLinkNode>(); }
+  void free_prio_link_node(void *ptr)
+  { mem_ctx_obj_pool_.free<transaction::tablelock::ObMemCtxLockPrioOpLinkNode>(ptr); }
+  int64_t get_write_epoch() const { return trans_mgr_.get_write_epoch(); }
 public:
   // tx_status
   enum ObTxStatus {
@@ -510,6 +519,7 @@ public:
   int check_modify_time_elapsed(const common::ObTabletID &tablet_id,
                                 const int64_t timestamp);
   int iterate_tx_obj_lock_op(ObLockOpIterator &iter) const;
+  int iterate_tx_lock_priority_list(ObPrioOpIterator &iter) const;
   int check_lock_need_replay(const share::SCN &scn,
                              const transaction::tablelock::ObTableLockOp &lock_op,
                              bool &need_replay);
@@ -541,7 +551,11 @@ public:
   {
     return lock_mem_ctx_.get_lock_memtable(memtable);
   }
-
+  int add_priority_record(const transaction::tablelock::ObTableLockPrioArg &arg,
+                          const transaction::tablelock::ObTableLockOp &lock_op);
+  int remove_priority_record(const transaction::tablelock::ObTableLockOp &lock_op);
+  int get_prio_op_array(transaction::tablelock::ObTableLockPrioOpArray &prio_op_array);
+  int prepare_prio_op_list(const transaction::tablelock::ObTableLockPrioOpArray &prio_op_array);
 private:
   int do_trans_end(
       const bool commit,
@@ -563,10 +577,16 @@ public:
   inline ObRedoLogGenerator &get_redo_generator() { return log_gen_; }
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMemtableCtx);
+
+  static const int8_t ELR_STATE_INIT = 0;
+  static const int8_t ELR_STATE_DONE = 1;
+  static const int8_t ELR_STATE_REVOKED = 2;
+
   RWLock rwlock_;
   common::ObByteLock lock_;
   int end_code_;
   int64_t tx_status_;
+  int8_t elr_state_;
   int64_t ref_;
   // allocate memory for callback when query executing
   ObQueryAllocator query_allocator_;

@@ -93,6 +93,9 @@ public:
                          const blocksstable::ObDatumRowkey *rowkey,
                          const blocksstable::ObDataMacroBlockMeta *meta,
                          const int64_t co_sstable_row_offset);
+#ifdef OB_BUILD_SHARED_STORAGE
+  int insert_macro_block(const ObDDLMacroHandle &macro_handle);
+#endif
   int locate_key(const blocksstable::ObDatumRange &range,
                  const blocksstable::ObStorageDatumUtils &datum_utils,
                  blocksstable::DDLBtreeIterator &iter,
@@ -114,6 +117,7 @@ public:
   int64_t get_macro_block_cnt() const { return macro_blocks_.count(); }
   int get_last_rowkey(const blocksstable::ObDatumRowkey *&last_rowkey);
   int get_sorted_meta_array(ObIArray<ObDDLBlockMeta> &meta_array);
+  int get_macro_id_array(ObIArray<blocksstable::MacroBlockId> &macro_id_array) const;
   int exist(const blocksstable::ObDatumRowkey *rowkey, bool &is_exist);
   const blocksstable::ObDataStoreDesc &get_data_desc() const { return data_desc_.get_desc(); }
   bool is_valid() const { return is_inited_; }
@@ -173,7 +177,8 @@ public:
       ObTablet &tablet,
       const ObITable::TableKey &table_key,
       const share::SCN &ddl_start_scn,
-      const uint64_t data_format_version);
+      const uint64_t data_format_version,
+      const bool is_inc_direct_load = false);
   void reset();
   int insert_block_meta_tree(
       const ObDDLMacroHandle &macro_handle,
@@ -196,6 +201,7 @@ private:
       ObTabletCreateSSTableParam &sstable_param);
 private:
   bool is_inited_;
+  bool is_inc_direct_load_;
   ObBlockMetaTree block_meta_tree_;
 };
 
@@ -239,18 +245,6 @@ public:  // derived from ObITable
   virtual bool is_frozen_memtable() override;
   virtual int get_frozen_schema_version(int64_t &schema_version) const;
 
-  virtual int exist(
-    const ObTableIterParam &param,
-    ObTableAccessContext &context,
-    const blocksstable::ObDatumRowkey &rowkey,
-    bool &is_exist,
-    bool &has_found);
-
-  virtual int exist(
-      ObRowsInfo &rowsInfo,
-      bool &is_exist,
-      bool &has_found);
-
   virtual int scan(
       const ObTableIterParam &param,
       ObTableAccessContext &context,
@@ -283,7 +277,6 @@ public:  // derived from ObITable
       const blocksstable::ObDatumRowkey &rowkey,
       ObTableAccessContext &context,
       ObStoreRowLockState &lock_state,
-      ObRowState &row_state,
       bool check_exist = false);
 
   // TODO : @jianyun.sjy ObDDLMemtable adapts check_rows_locked
@@ -320,13 +313,14 @@ public:
   share::SCN get_ddl_start_scn() const { return ddl_start_scn_; }
   int64_t get_macro_block_cnt() const { return macro_block_count_; }
   // not thread safe, external call are limited to ddl merge task
-  int get_ddl_memtable(const int64_t cg_idx, ObDDLMemtable *&ddl_memtable);
+  int get_ddl_memtable(const int64_t slice_idx, const int64_t cg_idx, ObDDLMemtable *&ddl_memtable);
   ObIArray<ObDDLMemtable *> &get_ddl_memtables() { return ddl_memtables_; }
   void inc_pending_cnt(); // used by ddl kv pending guard
   void dec_pending_cnt();
   // const common::ObTabletID &get_tablet_id() const { return tablet_id_; }
   uint64_t get_data_format_version() const { return data_format_version_; }
   const transaction::ObTransID &get_trans_id() const { return trans_id_; }
+  const transaction::ObTxSEQ &get_seq_no() const { return seq_no_; }
   int64_t get_memory_used() const;
   OB_INLINE bool is_inc_ddl_kv() const { return is_inc_ddl_kv_; }
 
@@ -336,9 +330,12 @@ public:
     int64_t &micro_block_count,
     int64_t &row_count) const;
 
+  int64_t get_merge_slice_idx() const { return merge_slice_idx_; }
+
   // for inc_ddl_kv only
   template<class _callback>
   int access_first_ddl_memtable(_callback &callback) const;
+  int check_can_access(ObTableAccessContext &context, bool &can_access);
 
   INHERIT_TO_STRING_KV("ObITabletMemtable",
                        ObITabletMemtable,
@@ -359,7 +356,8 @@ public:
                        K_(freeze_scn),
                        K_(pending_cnt),
                        K_(macro_block_count),
-                       K_(ddl_memtables));
+                       K(ddl_memtables_.count()),
+                       K_(merge_slice_idx));
 
 private:
   bool is_pending() const { return ATOMIC_LOAD(&pending_cnt_) > 0; }
@@ -368,9 +366,11 @@ private:
   int wait_pending();
   int full_load_freeze_(const share::SCN &freeze_scn);
   int inc_load_freeze_();
+#ifdef OB_BUILD_SHARED_STORAGE
+  int warmup_index_block(const ObDDLMacroBlock &macro_block);
+#endif
 
   int create_ddl_memtable(ObTablet &tablet, const ObITable::TableKey &table_key, ObDDLMemtable *&ddl_memtable);
-
 private:
   static const int64_t TOTAL_LIMIT = 10 * 1024 * 1024 * 1024L;
   static const int64_t HOLD_LIMIT = 10 * 1024 * 1024 * 1024L;
@@ -385,6 +385,7 @@ private:
   int64_t ddl_snapshot_version_; // the snapshot version for major sstable which is completed by ddl
   uint64_t data_format_version_;
   transaction::ObTransID trans_id_; // for incremental direct load only
+  transaction::ObTxSEQ seq_no_; // for incremental direct load only
   int64_t data_schema_version_;
   int64_t column_count_;
 
@@ -395,6 +396,7 @@ private:
 
   int64_t macro_block_count_;
   ObArray<ObDDLMemtable *> ddl_memtables_;
+  int64_t merge_slice_idx_; // record max slice idx can be merged, require all data begin from start_scn
 };
 
 template<class _callback>

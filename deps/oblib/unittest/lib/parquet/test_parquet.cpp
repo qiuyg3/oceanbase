@@ -13,25 +13,19 @@
 #define USING_LOG_PREFIX SQL
 
 #include "gtest/gtest.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/oblog/ob_log_module.h"
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
-#include <parquet/exception.h>
 #include <parquet/api/reader.h>
 #include <parquet/api/writer.h>
 #include <arrow/util/logging.h>
 
-#include <iostream>
 
 #include "lib/allocator/page_arena.h"
 #include "lib/file/ob_file.h"
 #include "lib/file/file_directory_utils.h"
-#include "lib/charset/ob_template_helper.h"
-#include "lib/net/ob_net_util.h"
 
 #define USING_LOG_PREFIX SQL
 
@@ -110,7 +104,6 @@ void read_whole_file() {
   PARQUET_ASSIGN_OR_THROW(infile,
                           arrow::io::ReadableFile::Open("parquet-arrow-example.parquet",
                                                         arrow::default_memory_pool()));
-
   std::unique_ptr<parquet::arrow::FileReader> reader;
   PARQUET_THROW_NOT_OK(
       parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader));
@@ -173,7 +166,6 @@ void read_single_column_chunk() {
   PARQUET_THROW_NOT_OK(arrow::PrettyPrint(*array, 4, &std::cout));
   std::cout << std::endl;
 }
-
 class ObParquetAllocator : public ::arrow::MemoryPool
 {
 public:

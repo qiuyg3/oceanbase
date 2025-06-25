@@ -12,15 +12,7 @@
 
 #define USING_LOG_PREFIX SQL_OPT
 #include "sql/optimizer/ob_log_sort.h"
-#include "ob_optimizer_context.h"
-#include "ob_opt_est_cost.h"
-#include "ob_optimizer_util.h"
-#include "sql/optimizer/ob_log_plan.h"
-#include "ob_log_exchange.h"
 #include "sql/rewrite/ob_transform_utils.h"
-#include "sql/optimizer/ob_join_order.h"
-#include "share/ob_order_perserving_encoder.h"
-#include "common/ob_smart_call.h"
 #include "sql/engine/px/p2p_datahub/ob_p2p_dh_mgr.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 
@@ -246,6 +238,15 @@ int ObLogSort::inner_replace_op_exprs(ObRawExprReplacer &replacer)
       LOG_WARN("failed to resolve ref params of hash sortkey", K(hash_sortkey_), K(ret));
     } else { /* Do nothing */ }
   }
+  if (OB_SUCC(ret) && OB_NOT_NULL(topn_filter_info_.pushdown_topn_filter_expr_)) {
+    if (OB_FAIL(replace_expr_action(replacer, topn_filter_info_.pushdown_topn_filter_expr_))) {
+      LOG_WARN("failed to replace pushdown topn filter expr");
+    } else if ((&get_plan()->gen_col_replacer() != &replacer)
+               && OB_FAIL(replace_expr_action(get_plan()->gen_col_replacer(),
+                                              topn_filter_info_.pushdown_topn_filter_expr_))) {
+      LOG_WARN("failed to replace pushdown topn filter expr");
+    }
+  }
   return ret;
 }
 
@@ -352,19 +353,14 @@ int ObLogSort::est_cost()
   double sort_cost = 0.0;
   double double_topn_count = -1;
   ObLogicalOperator *child = get_child(ObLogicalOperator::first_child);
+  EstimateCostInfo param;
+  param.need_parallel_ = get_parallel();
   if (OB_ISNULL(child)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(child), K(ret));
-  } else if (OB_FAIL(inner_est_cost(get_parallel(), child->get_card(), double_topn_count, sort_cost))) {
-    LOG_WARN("failed to est sort cost", K(ret));
+  } else if (OB_FAIL(do_re_est_cost(param, card_, op_cost_, cost_))) {
+    LOG_WARN("failed to est cost", K(ret));
   } else {
-    set_op_cost(sort_cost);
-    set_cost(child->get_cost() + sort_cost);
-    if (double_topn_count >= 0 && child->get_card() > double_topn_count) {
-      set_card(double_topn_count);
-    } else {
-      set_card(child->get_card());
-    }
     LOG_TRACE("cost for sort operator", K(sort_cost), K(get_cost()),
               K(get_card()));
   }
@@ -374,26 +370,40 @@ int ObLogSort::est_cost()
 int ObLogSort::do_re_est_cost(EstimateCostInfo &param, double &card, double &op_cost, double &cost)
 {
   int ret = OB_SUCCESS;
-  double child_card = 0.0;
+  ObLogicalOperator *child = get_child(ObLogicalOperator::first_child);
+  double child_card = OB_ISNULL(child) ? 0.0 : child->get_card();
   double child_cost = 0.0;
   double double_topn_count = -1;
-  card = get_card();
+  int64_t topn_count = -1;
+  bool is_null_value = false;
+  card = child_card;
   const int64_t parallel = param.need_parallel_;
   if (param.need_row_count_ >=0 && param.need_row_count_ < card) {
     card = param.need_row_count_;
   }
-  ObLogicalOperator *child = get_child(ObLogicalOperator::first_child);
   if (OB_ISNULL(child) || OB_ISNULL(get_plan()) || OB_ISNULL(get_stmt())
       || OB_ISNULL(get_stmt()->get_query_ctx())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret));
   } else if (get_stmt()->get_query_ctx()->optimizer_features_enable_version_ < COMPAT_VERSION_4_2_1_BP4) {
     param.need_row_count_ = -1;
-  } else if (-1 == param.need_row_count_) {
-    //do nothing
   } else if (!is_prefix_sort()) {
     param.need_row_count_ = -1;
+  } else if (NULL != topn_expr_ &&
+             OB_FAIL(ObTransformUtils::get_limit_value(topn_expr_,
+                                                       get_plan()->get_optimizer_context().get_params(),
+                                                       get_plan()->get_optimizer_context().get_exec_ctx(),
+                                                       &get_plan()->get_optimizer_context().get_allocator(),
+                                                       topn_count,
+                                                       is_null_value))) {
+    LOG_WARN("failed to get value", K(ret));
+  } else if ((is_null_value || topn_count < 0) &&
+             -1 == param.need_row_count_) {
+    // do nothing
   } else {
+    if (-1 == param.need_row_count_ || (topn_count >= 0 && param.need_row_count_ > topn_count)) {
+      param.need_row_count_ = topn_count;
+    }
     ObSEArray<ObRawExpr*, 4> prefix_ordering;
     for (int64_t i = 0; OB_SUCC(ret) && i < get_prefix_pos(); ++i) {
       if (OB_FAIL(prefix_ordering.push_back(sort_keys_.at(i).expr_))) {
@@ -402,6 +412,7 @@ int ObLogSort::do_re_est_cost(EstimateCostInfo &param, double &card, double &op_
     }
     if (OB_SUCC(ret)) {
       double prefix_ndv = 0.0;
+      get_plan()->get_selectivity_ctx().init_op_ctx(child);
       if (OB_FAIL(ObOptSelectivity::calculate_distinct(get_plan()->get_update_table_metas(),
                                                         get_plan()->get_selectivity_ctx(),
                                                         prefix_ordering,
@@ -462,6 +473,7 @@ int ObLogSort::inner_est_cost(const int64_t parallel, double child_card, double 
     if (NULL != topn_expr_) {
       double_topn_count = static_cast<double>(topn_count);
     }
+    get_plan()->get_selectivity_ctx().init_op_ctx(child);
     double child_card_per_dop = child_card / parallel;
     if (double_topn_count > child_card_per_dop) {
       double_topn_count = child_card_per_dop;
@@ -561,7 +573,7 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
     can_allocate = false;
   } else if (OB_SUCCESS != ecode) {
     can_allocate = false;
-    LOG_TRACE("[TopN Filter]disable push down topn filter by tracepoint");
+    OPT_TRACE("[TopN Filter] disable push down topn filter by tracepoint");
   } else if (OB_ISNULL(get_plan())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("log_plan unexpected null");
@@ -577,10 +589,10 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
     // otherwise if most of the date of c1 is unique, the topn runtime filter
     // can filter on c3.
     // Since we can't distinguish these two scene accurately, topn runtime filter
-    // is forbiddened in the prefix sort scene. Enable it by judging condition
+    // is forbidden in the prefix sort scene. Enable it by judging condition
     // prefix_pos_ < effective_sk_cnt.
     can_allocate = false;
-    LOG_TRACE("[TopN Filter]can not pushdown when prefix sort ", K(prefix_pos_), K(sort_keys_.count()));
+    OPT_TRACE("[TopN Filter] can not pushdown when prefix sort ", prefix_pos_, sort_keys_.count());
   } else if (OB_FAIL(get_candidate_pushdown_sort_keys(table_id, candidate_sk_exprs))) {
     LOG_WARN("failed to get_candidate_pushdown_sort_keys");
   } else if (OB_INVALID_ID == table_id) {
@@ -589,26 +601,26 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
   } else if (0 == candidate_sk_exprs.count()) {
     // such as order by t1.c1 + t2.c1, the sort key is related to 2 tables, can not pushdown
     can_allocate = false;
-    LOG_TRACE("[TopN Filter]the first sort key from different tables");
+    OPT_TRACE("[TopN Filter] the first sort key from different tables");
   } else if (OB_FAIL(check_sort_key_can_pushdown_to_tsc(get_child(first_child), candidate_sk_exprs,
                                                         table_id, node, tsc_has_exchange,
                                                         tsc_has_px_coord, effective_sk_cnt))) {
     LOG_WARN("failed to find check check_sort_key_can_pushdown_to_tsc", K(ret));
   } else if (0 == effective_sk_cnt) {
     can_allocate = false;
-    LOG_TRACE("[TopN Filter]no effective_sk");
+    OPT_TRACE("[TopN Filter] no effective_sk");
   } else if (OB_ISNULL(node)) {
     // tsc node is in block path, or not tsc node
     // can not pushdown topn filter
     can_allocate = false;
-    LOG_TRACE("[TopN Filter]block path, or no tsc node");
+    OPT_TRACE("[TopN Filter] block path, or no tsc node");
   } else if (tsc_has_px_coord) {
     // not support
     can_allocate = false;
   } else if (tsc_has_exchange) {
     // TODO XUNSI: global topn filter, impl topn filter in neighbour dfos scenes.
     can_allocate = false;
-    LOG_TRACE("[TopN Filter]global topn filter is not support now");
+    OPT_TRACE("[TopN Filter] global topn filter is not support now");
   } else {
     const OptTableMetas &table_metas = get_plan()->get_basic_table_metas();
     const OptTableMeta *table_meta = nullptr;
@@ -619,13 +631,13 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
     } else if (FALSE_IT(tsc_output_rows = table_meta->get_rows())) {
     } else if (ecode != OB_SUCCESS) {
       can_allocate = true;
-      LOG_TRACE("[TopN Filter] force enable topn filter ignore less card", K(tsc_output_rows));
+      OPT_TRACE("[TopN Filter] force enable topn filter ignore less card", tsc_output_rows);
     } else if (MIN_TSC_OUTPUT_ROWS_FOR_PD_TOPN_FILTER > tsc_output_rows) {
       // table scan output first batch rows after a batch prepared, after that
       // the topn sort operator can get the first batch data, if the data num
       // of the table is too small, the topn filter will be invalid
       can_allocate = false;
-      LOG_TRACE("[TopN Filter] disable topn filter because of less rows", K(tsc_output_rows));
+      OPT_TRACE("[TopN Filter] disable topn filter because of less rows", tsc_output_rows);
     } else {
       can_allocate = true;
     }
@@ -637,11 +649,15 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
             expr_factory.create_raw_expr(T_OP_PUSHDOWN_TOPN_FILTER, pushdown_topn_filter_expr))) {
       LOG_WARN("fail to create raw expr", K(ret));
     } else {
-      bool only_white_filter =
-          T_REF_COLUMN == candidate_sk_exprs.at(0)->get_expr_type() && effective_sk_cnt > 1;
-      if (only_white_filter) {
-        LOG_TRACE("multi sort keys, and the first column can be pushdown as white");
-        effective_sk_cnt = 1;
+      // TODO: TopN Filter is not support white filter now.
+      // bool only_white_filter =
+      //     T_REF_COLUMN == candidate_sk_exprs.at(0)->get_expr_type() && effective_sk_cnt > 1;
+      // if (only_white_filter) {
+      //    OPT_TRACE("[TopN Filter] multi sort keys, and the first column can be pushdown as white");
+      //   effective_sk_cnt = 1;
+      // }
+      if (OB_FAIL(pushdown_topn_filter_expr->init_param_exprs(effective_sk_cnt))) {
+        LOG_WARN("failed to init param exprs", K(ret));
       }
       for (int64_t i = 0; i < effective_sk_cnt && OB_SUCC(ret); ++i) {
         ObRawExpr *sort_key = candidate_sk_exprs.at(i);
@@ -659,7 +675,7 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
       LOG_WARN("fail to generate p2p dh id", K(ret));
     } else {
       (void)topn_filter_info_.init(p2p_sequence_id, pushdown_topn_filter_expr, effective_sk_cnt,
-                                   tsc_has_exchange);
+                                   tsc_has_exchange, node);
     }
   }
 
@@ -736,6 +752,8 @@ int ObLogSort::is_expr_in_pushdown_whitelist(ObRawExpr *expr, bool &in_pushdown_
     // some system functions can also be pushdown
     switch (expr->get_expr_type()) {
       case T_OP_ABS:
+      case T_OP_CASE:
+      case T_OP_POW:
       case T_FUN_SYS_CAST:
       case T_FUN_SYS_SUBSTR:
       case T_FUN_SYS_LENGTH:
@@ -764,7 +782,7 @@ int ObLogSort::is_expr_in_pushdown_whitelist(ObRawExpr *expr, bool &in_pushdown_
       }
       default: {
         in_pushdown_whitelist = false;
-        LOG_TRACE("this expr can not be pushdown", K(expr->get_expr_type()));
+        OPT_TRACE("[TopN Filter] this expr can not be pushdown", int64_t(expr->get_expr_type()));
         break;
       }
     }

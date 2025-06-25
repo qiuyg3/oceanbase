@@ -16,6 +16,7 @@
 #include "share/ob_rpc_struct.h"
 #include "share/schema/ob_schema_struct.h"
 #include "sql/resolver/ob_schema_checker.h"
+#include "storage/fts/ob_fts_literal.h"
 
 namespace oceanbase
 {
@@ -29,7 +30,11 @@ class ObFtsIndexBuilderUtil
 public:
   static const int64_t OB_FTS_INDEX_TABLE_INDEX_COL_CNT = 2;
   static const int64_t OB_FTS_DOC_WORD_TABLE_INDEX_COL_CNT = 2;
+  static const int64_t OB_FTS_INDEX_OR_DOC_WORD_TABLE_COL_CNT = 4;
 public:
+  static int get_doc_id_column_id(
+      const ObTableSchema *data_schema,
+      uint64_t &doc_id_col_id);
   static int append_fts_rowkey_doc_arg(
       const obrpc::ObCreateIndexArg &index_arg,
       ObIAllocator *allocator,
@@ -39,10 +44,12 @@ public:
       ObIAllocator *allocator,
       ObIArray<obrpc::ObCreateIndexArg> &index_arg_list);
   static int append_fts_index_arg(
+      const share::schema::ObTableSchema &data_schema,
       const obrpc::ObCreateIndexArg &index_arg,
       ObIAllocator *allocator,
       ObIArray<obrpc::ObCreateIndexArg> &index_arg_list);
   static int append_fts_doc_word_arg(
+      const share::schema::ObTableSchema &data_schema,
       const obrpc::ObCreateIndexArg &index_arg,
       ObIAllocator *allocator,
       ObIArray<obrpc::ObCreateIndexArg> &index_arg_list);
@@ -55,6 +62,11 @@ public:
   static int generate_fts_aux_index_name(
       obrpc::ObCreateIndexArg &arg,
       ObIAllocator *allocator);
+  static int generate_fts_aux_index_name(
+        ObIAllocator *allocator,
+        const share::schema::ObIndexType type,
+        const ObString &index_name,
+        ObString &new_index_name);
   static int adjust_fts_args(
       obrpc::ObCreateIndexArg &index_arg,
       ObTableSchema &data_schema, // not const since will add column to data schema
@@ -75,9 +87,58 @@ public:
   static int get_doc_id_col(
       const ObTableSchema &data_schema,
       const ObColumnSchemaV2 *&doc_id_col);
-  static int check_fts_or_multivalue_index_allowed(
-      ObTableSchema &data_schema);
+  static int get_index_column_ids_for_fts(
+      const share::schema::ObTableSchema &data_schema,
+      const share::schema::ObColumnSchemaV2 &column_schema,
+      common::ObIArray<uint64_t> &index_column_ids);
+  static int generate_fts_parser_name_and_property(
+      const share::schema::ObTableSchema &data_schema,
+      obrpc::ObCreateIndexArg &arg,
+      ObIAllocator *allocator);
+  static int check_need_to_load_dic(
+      const uint64_t tenant_id,
+      const ObString &parser_name,
+      bool &need_to_load_dic);
+  static int try_load_and_lock_dictionary_tables(
+      const ObTableSchema &index_schema,
+      ObMySQLTransaction &trans);
+  static int try_load_dictionary_for_all_tenants();
+  static int check_supportability_for_loader_key(
+        const uint64_t tenant_id,
+        const ObString &parser_name,
+        const ObCharsetType charset_type);
+  static int check_supportability_for_building_index(
+        const ObTableSchema *data_schema,
+        const obrpc::ObCreateIndexArg *index_arg);
+  static int get_fts_multivalue_index_column_name(
+      const ObTableSchema &data_table_schema,
+      const ObTableSchema &index_table_schema,
+      ObIArray<ObString> &col_names);
+  static int generate_fts_mtv_index_aux_columns(
+      const ObTableSchema &orig_table_schema,
+      const ObTableSchema &index_table_schema,
+      ObTableSchema &new_table_schema,
+      ObTableSchema &new_index_schema,
+      common::ObIAllocator &allocator,
+      oceanbase::rootserver::ObDDLOperator &ddl_operator,
+      common::ObMySQLTransaction &trans,
+      ObSEArray<obrpc::ObColumnSortItem, 2> &domain_index_columns,
+      ObSEArray<ObString, 1> &domain_store_columns);
+  static int generate_doc_id_column(
+        const obrpc::ObCreateIndexArg *index_arg,
+        const uint64_t col_id,
+        ObTableSchema &data_schema, // not const since will add column to data schema
+        ObColumnSchemaV2 *&doc_id_col);
+  static int decide_parallelism(
+        const share::schema::ObIndexType index_type,
+        const int64_t original_parallelism,
+        int64_t &decided_parallelism);
 private:
+  static int get_multivalue_index_column_name(
+      const ObTableSchema &data_table_schema,
+      const ObTableSchema &index_table_schema,
+      ObIArray<ObString> &col_names);
+  static bool compare_index_column(const std::pair<int64_t, ObString> &lhs, const std::pair<int64_t, ObString> &rhs) { return lhs.first < rhs.first; }
   static int check_ft_cols(
       const obrpc::ObCreateIndexArg *index_arg,
       ObTableSchema &data_schema); // not const since will add cascade flag
@@ -91,11 +152,6 @@ private:
       const ObIArray<const ObColumnSchemaV2 *> &fts_cols,
       const int index_column_cnt,
       ObIAllocator &allocator);
-  static int generate_doc_id_column(
-      const obrpc::ObCreateIndexArg *index_arg,
-      const uint64_t col_id,
-      ObTableSchema &data_schema, // not const since will add column to data schema
-      ObColumnSchemaV2 *&doc_id_col);
   static int generate_word_segment_column(
       const obrpc::ObCreateIndexArg *index_arg,
       const uint64_t col_id,
@@ -120,19 +176,22 @@ private:
       const ObTableSchema &data_schema,
       char *col_name_buf,
       const int64_t buf_len,
-      int64_t &name_pos);
+      int64_t &name_pos,
+      const uint64_t col_id);
   static int construct_word_count_col_name(
       const obrpc::ObCreateIndexArg *index_arg,
       const ObTableSchema &data_schema,
       char *col_name_buf,
       const int64_t buf_len,
-      int64_t &name_pos);
+      int64_t &name_pos,
+      const uint64_t col_id);
   static int construct_doc_length_col_name(
       const obrpc::ObCreateIndexArg *index_arg,
       const ObTableSchema &data_schema,
       char *col_name_buf,
       const int64_t buf_len,
-      int64_t &name_pos);
+      int64_t &name_pos,
+      const uint64_t col_id);
   static int check_fts_gen_col(
       const ObTableSchema &data_schema,
       const uint64_t col_id,
@@ -155,17 +214,29 @@ private:
       ObIArray<const ObColumnSchemaV2 *> &cols,
       const ObColumnSchemaV2 *existing_col,
       ObColumnSchemaV2 *generated_col);
-  static int generate_fts_parser_name(
-      obrpc::ObCreateIndexArg &arg,
-      ObIAllocator *allocator);
   static int get_index_column_ids(
       const ObTableSchema &data_schema,
       const obrpc::ObCreateIndexArg &arg,
-      schema::ColumnReferenceSet &index_column_ids);
+      common::ObIArray<uint64_t> &index_column_ids);
   static int check_index_match(
+      const ObTableSchema &data_schema,
       const schema::ObColumnSchemaV2 &column,
-      const schema::ColumnReferenceSet &index_column_ids,
+      const common::ObIArray<uint64_t> &index_column_ids,
       bool &is_match);
+  static int check_fulltext_index_allowed(
+      const ObTableSchema &data_schema,
+      const obrpc::ObCreateIndexArg *index_arg);
+  static bool is_need_dictionary(const ObString &parser_name)
+  {
+    return 0 == parser_name.case_compare(ObFTSLiteral::PARSER_NAME_IK);
+  }
+  static int generate_fts_parser_name(
+      obrpc::ObCreateIndexArg &arg,
+      ObIAllocator &allocator);
+  static int generate_fts_parser_property(
+      const share::schema::ObTableSchema &data_schema,
+      obrpc::ObCreateIndexArg &arg,
+      ObIAllocator &allocator);
 };
 
 class ObMulValueIndexBuilderUtil
@@ -200,13 +271,18 @@ public:
  static int adjust_mulvalue_index_args(
    obrpc::ObCreateIndexArg &index_arg,
    ObTableSchema &data_schema, // not const since will add column to data schema
-   ObIArray<ObColumnSchemaV2 *> &gen_columns);
+   ObIAllocator &allocator,
+   ObIArray<ObColumnSchemaV2 *> &gen_columns,
+   bool forece_rebuild = false);
  static int build_and_generate_multivalue_column_raw(
    obrpc::ObCreateIndexArg &arg,
    ObTableSchema &data_schema,
+   ObIAllocator &allocator,
    ObColumnSchemaV2 *&mulvalue_col,
-   ObColumnSchemaV2 *&budy_col);
+   ObColumnSchemaV2 *&budy_col,
+   bool force_rebuild = false);
  static int build_and_generate_multivalue_column(
+   ObIAllocator &allocator,
    obrpc::ObColumnSortItem& sort_item,
    sql::ObRawExprFactory &expr_factory,
    const sql::ObSQLSessionInfo &session_info,
@@ -230,6 +306,16 @@ public:
    const obrpc::ObCreateIndexArg &arg,
    const ObTableSchema &data_schema,
    ObTableSchema &index_schema);
+ static int is_matched_budy_column(
+   const share::schema::ObColumnSchemaV2 &ori_column_schema,
+   const share::schema::ObColumnSchemaV2 &budy_column_schema,
+   bool& is_match);
+ static bool is_multivalue_array_column(const ObString& expr_string);
+ static bool is_multivalue_index_column(const ObString& expr_string);
+ static bool is_multivalue_array_column(
+   const share::schema::ObColumnSchemaV2 &budy_column_schema);
+ static bool is_multivalue_index_column(
+   const share::schema::ObColumnSchemaV2 &budy_column_schema);
 };
 
 }//end namespace share

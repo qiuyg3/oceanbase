@@ -103,6 +103,13 @@ enum ObRoutineType
   ROUTINE_UDT_TYPE = 4,
 };
 
+enum class ObExternalRoutineType
+{
+  INTERNAL_ROUTINE = 0,
+  EXTERNAL_JAVA_UDF_FROM_URL = 1,
+  EXTERNAL_JAVA_UDF_FROM_RES = 2,
+};
+
 class ObIRoutineParam
 {
 public:
@@ -173,7 +180,7 @@ public:
   virtual const common::ObString &get_routine_name() const = 0;
   virtual uint64_t get_dblink_id() const { return OB_INVALID_ID; }
   virtual uint64_t get_routine_id() const = 0;
-
+  virtual bool is_function() const = 0;
   TO_STRING_EMPTY();
 };
 
@@ -615,7 +622,12 @@ public:
                K_(comment),
                K_(route_sql),
                K_(type_id),
-               K_(routine_params));
+               K_(routine_params),
+               K_(external_routine_type),
+               K_(external_routine_entry),
+               K_(external_routine_url),
+               K_(external_routine_resource));
+
 private:
   uint64_t tenant_id_;            //set by user,
   uint64_t database_id_;          //set by sys,
@@ -641,6 +653,10 @@ private:
   uint64_t dblink_id_;
   common::ObString dblink_db_name_;
   common::ObString dblink_pkg_name_;
+  ObExternalRoutineType external_routine_type_;  // for external routine such as Java UDF
+  common::ObString external_routine_entry_;      // entry point of external routine, class name for Java UDF
+  common::ObString external_routine_url_;        // URL of external routine
+  common::ObString external_routine_resource_;   // resource name of external routine
 };
 }  // namespace schema
 }  // namespace share

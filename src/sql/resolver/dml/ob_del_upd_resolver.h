@@ -178,6 +178,7 @@ protected:
                             ObIArray<ObRawExpr *> &base_columns);
   
   int view_pullup_column_ref_exprs_recursively(ObRawExpr *&expr,
+                                               uint64_t view_table_id,
                                                uint64_t base_table_id,
                                                const ObDMLStmt *stmt);
 
@@ -236,6 +237,10 @@ protected:
   int add_select_items(ObSelectStmt &select_stmt, const ObIArray<SelectItem>& select_items);
   int add_select_list_for_set_stmt(ObSelectStmt &select_stmt);
   int add_all_lob_columns_to_stmt(const TableItem &table_item, ObIArray<ObColumnRefRawExpr*> &column_exprs);
+  int check_update_vector_col_with_vector_index(const ObTableSchema *table_schema,
+                                                ObSchemaGetterGuard *schema_guard,
+                                                const common::ObIArray<ObAssignment> &assigns,
+                                                bool &update_with_vector_index);
 protected:
   int generate_insert_table_info(const TableItem &table_item,
                                  ObInsertTableInfo &table_info,
@@ -281,6 +286,14 @@ protected:
   int mark_json_partial_update_flag(const ObColumnRefRawExpr *ref_expr, ObRawExpr *expr, int depth, bool &allow_json_partial_update);
   int add_select_item_func(ObSelectStmt &select_stmt, ColumnItem &col);
   int select_items_is_pk(const ObSelectStmt& select_stmt, bool &has_pk);
+  int build_domain_id_function_expr(
+      const ObInsertTableInfo& table_info,
+      const ObColumnSchemaV2 &col_schema,
+      const ObColumnRefRawExpr &column,
+      ObRawExpr *&func_expr);
+  int is_external_table_partition_column(const TableItem &table_item,
+                                         uint64_t column_id,
+                                         bool &is_part_column);
 
 private:
   common::hash::ObPlacementHashSet<uint64_t, 4229> insert_column_ids_;

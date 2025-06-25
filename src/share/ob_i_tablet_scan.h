@@ -24,12 +24,14 @@
 #include "share/schema/ob_schema_getter_guard.h"
 #include "storage/tx/ob_trans_define.h"
 #include "sql/engine/cmd/ob_load_data_parser.h"
-
+#include "share/diagnosis/ob_sql_plan_monitor_node_list.h"
 namespace oceanbase
 {
 namespace share
 {
 class ObLSID;
+class ObExternalTablePartInfoArray;
+class ObExternalObjectCtx;
 }
 namespace sql
 {
@@ -65,16 +67,24 @@ struct ObEstRowCountRecord
 struct SampleInfo
 {
   SampleInfo() { reset(); }
-  enum SampleMethod { NO_SAMPLE = 0, ROW_SAMPLE = 1, BLOCK_SAMPLE = 2 };
+  enum SampleMethod
+  {
+    NO_SAMPLE = 0,
+    ROW_SAMPLE = 1,
+    BLOCK_SAMPLE = 2,
+    HYBRID_SAMPLE = 3
+  };
   enum SampleScope
   {
     SAMPLE_ALL_DATA = 0,
     SAMPLE_BASE_DATA = 1,
     SAMPLE_INCR_DATA = 2
   };
-  bool is_row_sample() const { return ROW_SAMPLE == method_; }
-  bool is_block_sample() const { return BLOCK_SAMPLE == method_; }
-  bool is_no_sample() const { return NO_SAMPLE == method_; }
+  OB_INLINE bool is_trival_sample() const { return ROW_SAMPLE == method_; }
+  OB_INLINE bool is_hybrid_sample() const { return HYBRID_SAMPLE == method_; }
+  OB_INLINE bool is_block_sample() const { return BLOCK_SAMPLE == method_; }
+  OB_INLINE bool is_no_sample() const { return NO_SAMPLE == method_; }
+  OB_INLINE bool is_row_sample() const { return is_trival_sample() || is_hybrid_sample(); }
   uint64_t hash(uint64_t seed) const;
   void reset()
   {
@@ -84,6 +94,16 @@ struct SampleInfo
     percent_ = 100;
     seed_ = -1;
     force_block_ = false;
+  }
+
+  bool same_as(const SampleInfo &oth) const {
+    return table_id_ == oth.table_id_
+           && method_ == oth.method_
+           && scope_ == oth.scope_
+           && percent_ == oth.percent_
+           && seed_ == oth.seed_
+           && force_block_ == oth.force_block_
+           && seed_ != -1;
   }
 
   uint64_t table_id_;
@@ -150,6 +170,103 @@ struct ObLimitParam
   OB_UNIS_VERSION(1);
 };
 
+struct ObTSCMonitorInfo
+{
+  int64_t* io_read_bytes_;
+  int64_t* ssstore_read_bytes_;
+  int64_t* ssstore_read_row_cnt_;
+  int64_t* memstore_read_row_cnt_;
+  uint64_t* block_io_wait_time_us_;
+
+  ObTSCMonitorInfo()
+    : io_read_bytes_(nullptr),
+      ssstore_read_bytes_(nullptr),
+      ssstore_read_row_cnt_(nullptr),
+      memstore_read_row_cnt_(nullptr),
+      block_io_wait_time_us_(nullptr) {}
+
+  ObTSCMonitorInfo(int64_t* io_read_bytes,
+                    int64_t* ssstore_read_bytes,
+                    int64_t* ssstore_read_row_cnt,
+                    int64_t* memstore_read_row_cnt,
+                    uint64_t* block_io_wait_time_us)
+    : io_read_bytes_(io_read_bytes),
+      ssstore_read_bytes_(ssstore_read_bytes),
+      ssstore_read_row_cnt_(ssstore_read_row_cnt),
+      memstore_read_row_cnt_(memstore_read_row_cnt),
+      block_io_wait_time_us_(block_io_wait_time_us) {}
+
+  void init(int64_t* io_read_bytes,
+            int64_t* ssstore_read_bytes,
+            int64_t* ssstore_read_row_cnt,
+            int64_t* memstore_read_row_cnt,
+            uint64_t* block_io_wait_time_us)
+  {
+    io_read_bytes_ = io_read_bytes;
+    ssstore_read_bytes_ = ssstore_read_bytes;
+    ssstore_read_row_cnt_ = ssstore_read_row_cnt;
+    memstore_read_row_cnt_ = memstore_read_row_cnt;
+    block_io_wait_time_us_ = block_io_wait_time_us;
+  }
+
+  void add_io_read_bytes(int64_t io_read_bytes) {
+    if (OB_NOT_NULL(io_read_bytes_)) {
+      *io_read_bytes_ += io_read_bytes;
+    }
+  }
+
+  void add_ssstore_read_bytes(int64_t ssstore_read_bytes) {
+    if (OB_NOT_NULL(ssstore_read_bytes_)) {
+      *ssstore_read_bytes_ += ssstore_read_bytes;
+    }
+  }
+
+  void add_ssstore_read_row_cnt(int64_t ssstore_read_row_cnt) {
+    if (OB_NOT_NULL(ssstore_read_row_cnt_)) {
+      *ssstore_read_row_cnt_ += ssstore_read_row_cnt;
+    }
+  }
+
+  void add_memstore_read_row_cnt(int64_t memstore_read_row_cnt) {
+    if (OB_NOT_NULL(memstore_read_row_cnt_)) {
+      *memstore_read_row_cnt_ += memstore_read_row_cnt;
+    }
+  }
+
+  void add_block_io_wait_time_us(const uint64_t block_io_wait_time_us) {
+    if (OB_NOT_NULL(block_io_wait_time_us_)) {
+      *block_io_wait_time_us_ += block_io_wait_time_us;
+    }
+  }
+
+  void reset_stat()
+  {
+    if (OB_NOT_NULL(io_read_bytes_)) {
+      *io_read_bytes_ = 0;
+    }
+    if (OB_NOT_NULL(ssstore_read_bytes_)) {
+      *ssstore_read_bytes_ = 0;
+    }
+    if (OB_NOT_NULL(ssstore_read_row_cnt_)) {
+      *ssstore_read_row_cnt_ = 0;
+    }
+    if (OB_NOT_NULL(memstore_read_row_cnt_)) {
+      *memstore_read_row_cnt_ = 0;
+    }
+    if (OB_NOT_NULL(block_io_wait_time_us_)) {
+      *block_io_wait_time_us_ += 0;
+    }
+  }
+
+  DEFINE_TO_STRING(
+    OB_ISNULL(io_read_bytes_) ? J_KV(K(io_read_bytes_)) : J_KV(K(*io_read_bytes_));
+    OB_ISNULL(ssstore_read_bytes_) ? J_KV(K(ssstore_read_bytes_)) : J_KV(K(*ssstore_read_bytes_));
+    OB_ISNULL(ssstore_read_row_cnt_) ? J_KV(K(ssstore_read_row_cnt_)) : J_KV(K(*ssstore_read_row_cnt_));
+    OB_ISNULL(memstore_read_row_cnt_) ? J_KV(K(memstore_read_row_cnt_)) : J_KV(K(*memstore_read_row_cnt_));
+    OB_ISNULL(block_io_wait_time_us_) ? J_KV(K(block_io_wait_time_us_)) : J_KV(K(*block_io_wait_time_us_));
+  )
+};
+
 struct ObTableScanStatistic
 {
   //storage access row cnt before filter
@@ -166,6 +283,8 @@ struct ObTableScanStatistic
   int64_t block_cache_hit_cnt_;
   int64_t block_cache_miss_cnt_;
   int64_t rowkey_prefix_;
+  ObTSCMonitorInfo *tsc_monitor_info_;
+
   ObTableScanStatistic()
     : access_row_cnt_(0),
       out_row_cnt_(0),
@@ -178,8 +297,10 @@ struct ObTableScanStatistic
       row_cache_miss_cnt_(0),
       block_cache_hit_cnt_(0),
       block_cache_miss_cnt_(0),
-      rowkey_prefix_(0)
+      rowkey_prefix_(0),
+      tsc_monitor_info_(nullptr)
   {}
+
   OB_INLINE void reset()
   {
     access_row_cnt_ = 0;
@@ -195,6 +316,7 @@ struct ObTableScanStatistic
     block_cache_miss_cnt_ = 0;
     rowkey_prefix_ = 0;
   }
+
   OB_INLINE void reset_cache_stat()
   {
     bf_filter_cnt_ = 0;
@@ -206,6 +328,7 @@ struct ObTableScanStatistic
     block_cache_hit_cnt_ = 0;
     block_cache_miss_cnt_ = 0;
   }
+
   TO_STRING_KV(
       K_(access_row_cnt),
       K_(out_row_cnt),
@@ -216,7 +339,8 @@ struct ObTableScanStatistic
       K_(row_cache_miss_cnt),
       K_(fuse_row_cache_hit_cnt),
       K_(fuse_row_cache_miss_cnt),
-      K_(rowkey_prefix));
+      K_(rowkey_prefix),
+      KPC_(tsc_monitor_info));
 };
 
 static const int64_t OB_DEFAULT_FILTER_EXPR_COUNT = 4;
@@ -269,7 +393,16 @@ ObVTableScanParam() :
       table_scan_opt_(),
       ext_file_column_exprs_(NULL),
       ext_column_convert_exprs_(NULL),
-      schema_guard_(NULL)
+      partition_infos_(NULL),
+      external_object_ctx_(NULL),
+      ext_mapping_column_exprs_(NULL),
+      ext_mapping_column_ids_(NULL),
+      schema_guard_(NULL),
+      auto_split_filter_type_(OB_INVALID_ID),
+      auto_split_filter_(NULL),
+      auto_split_params_(NULL),
+      is_tablet_spliting_(false),
+      ext_tbl_filter_pd_level_(0)
   { }
 
   virtual ~ObVTableScanParam()
@@ -277,7 +410,7 @@ ObVTableScanParam() :
     destroy_schema_guard();
   }
 
-  void destroy()
+  virtual void destroy()
   {
     if (OB_UNLIKELY(column_ids_.get_capacity() > OB_PREALLOCATED_COL_ID_NUM)) {
       column_ids_.destroy();
@@ -349,6 +482,10 @@ ObVTableScanParam() :
   sql::ObExternalFileFormat external_file_format_;
   ObString external_file_location_;
   ObString external_file_access_info_;
+  const share::ObExternalTablePartInfoArray *partition_infos_;
+  const share::ObExternalObjectCtx *external_object_ctx_;
+  const sql::ExprFixedArray *ext_mapping_column_exprs_;
+  const common::ObFixedArray<uint64_t, ObIAllocator> *ext_mapping_column_ids_;
 
   virtual bool is_valid() const {
     return (tablet_id_.is_valid()
@@ -387,6 +524,13 @@ private:
   // New schema, used throughout the life cycle of table_scan
   share::schema::ObSchemaGetterGuard *schema_guard_;
   char schema_guard_buf_[sizeof(share::schema::ObSchemaGetterGuard)];
+
+public:
+  uint64_t auto_split_filter_type_;
+  const sql::ObExpr *auto_split_filter_;
+  sql::ExprFixedArray *auto_split_params_;
+  bool is_tablet_spliting_;
+  int64_t ext_tbl_filter_pd_level_;
 };
 
 class ObITabletScan

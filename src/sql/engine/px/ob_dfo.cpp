@@ -11,11 +11,9 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
-#include "sql/engine/px/ob_dfo.h"
+#include "ob_dfo.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
-#include "sql/engine/px/ob_px_util.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
-#include "share/external_table/ob_external_table_file_mgr.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -67,7 +65,9 @@ OB_SERIALIZE_MEMBER(ObPxSqcMeta,
                     p2p_dh_map_info_,
                     sqc_count_,
                     monitoring_info_,
-                    branch_id_base_);
+                    branch_id_base_,
+                    partition_random_affinitize_,
+                    locations_order_);
 OB_SERIALIZE_MEMBER(ObPxTask,
                     qc_id_,
                     dfo_id_,
@@ -99,12 +99,10 @@ OB_SERIALIZE_MEMBER(ObSqcTableLocationKey,
 OB_SERIALIZE_MEMBER(ObPxCleanDtlIntermResInfo, ch_total_info_, sqc_id_, task_count_);
 OB_SERIALIZE_MEMBER(ObPxCleanDtlIntermResArgs, info_, batch_size_);
 
-int ObQCMonitoringInfo::init(const ObExecContext &exec_ctx) {
+int ObQCMonitoringInfo::init(const ObDfo &dfo) {
   int ret = OB_SUCCESS;
   qc_tid_ = GETTID();
-  if (OB_NOT_NULL(exec_ctx.get_my_session())) {
-    cur_sql_ = exec_ctx.get_my_session()->get_current_query_string();
-  }
+  cur_sql_ = dfo.query_sql();
   if (cur_sql_.length() > OB_TINY_SQL_LENGTH) {
     cur_sql_.assign(cur_sql_.ptr(), OB_TINY_SQL_LENGTH);
   }
@@ -132,6 +130,8 @@ int ObPxSqcMeta::assign(const ObPxSqcMeta &other)
     LOG_WARN("should only add a new sqc. you are adding an inited one", K(ret));
   } else if (OB_FAIL(access_table_locations_.assign(other.access_table_locations_))) {
     LOG_WARN("fail assign tscs locations", K(ret));
+  } else if (OB_FAIL(extra_access_table_locations_.assign(other.extra_access_table_locations_))) {
+    LOG_WARN("fail assign tscs locations", K(ret));
   } else if (OB_FAIL(transmit_channel_.assign(other.transmit_channel_))) {
     LOG_WARN("fail assign data channel", K(ret));
   } else if (OB_FAIL(receive_channel_.assign(other.receive_channel_))) {
@@ -152,6 +152,8 @@ int ObPxSqcMeta::assign(const ObPxSqcMeta &other)
     LOG_WARN("fail to assign p2p dh map info", K(ret));
   } else if (OB_FAIL(monitoring_info_.assign(other.monitoring_info_))) {
     LOG_WARN("fail to assign qc monitoring info", K(ret));
+  } else if (OB_FAIL(locations_order_.assign(other.locations_order_))) {
+    LOG_WARN("fail to assign qc locations order", K(ret));
   } else {
     execution_id_ = other.execution_id_;
     qc_id_ = other.qc_id_;
@@ -186,16 +188,14 @@ int ObPxSqcMeta::assign(const ObPxSqcMeta &other)
     px_detectable_ids_ = other.px_detectable_ids_;
     interrupt_by_dm_ = other.interrupt_by_dm_;
     sqc_count_ = other.sqc_count_;
+    partition_random_affinitize_ = other.partition_random_affinitize_;
   }
   access_external_table_files_.reuse();
   for (int i = 0; OB_SUCC(ret) && i < other.access_external_table_files_.count(); i++) {
     const ObExternalFileInfo &other_file = other.access_external_table_files_.at(i);
     ObExternalFileInfo temp_file;
-    temp_file.file_id_ = other_file.file_id_;
-    temp_file.part_id_ = other_file.part_id_;
-    temp_file.file_addr_ = other_file.file_addr_;
-    if (OB_FAIL(ob_write_string(allocator_, other_file.file_url_, temp_file.file_url_))) {
-      LOG_WARN("fail to write string", K(ret));
+    if (OB_FAIL(temp_file.deep_copy(allocator_, other_file))) {
+      LOG_WARN("fail to deep copy ObExternalFileInfo", K(ret));
     } else if (OB_FAIL(access_external_table_files_.push_back(temp_file))) {
       LOG_WARN("fail to push back", K(ret));
     }
@@ -653,6 +653,9 @@ OB_DEF_SERIALIZE(ObPxRpcInitSqcArgs)
   // can reuse cache from now on
   (const_cast<ObSqcSerializeCache &>(ser_cache_)).cache_serialized_ = ser_cache_.enable_serialize_cache_;
   LST_DO_CODE(OB_UNIS_ENCODE, qc_order_gi_tasks_);
+  if (OB_SUCC(ret) && sqc_.is_fulltree()) {
+    ret = exec_ctx_->serialize_group_pwj_map(buf, buf_len, pos);
+  }
   LOG_TRACE("serialize sqc", K_(sqc));
   LOG_DEBUG("end trace sqc args", K(pos), K(buf_len), K(this->get_serialize_size()));
   return ret;
@@ -704,6 +707,9 @@ OB_DEF_SERIALIZE_SIZE(ObPxRpcInitSqcArgs)
     // always serialize
     LST_DO_CODE(OB_UNIS_ADD_LEN, sqc_);
     LST_DO_CODE(OB_UNIS_ADD_LEN, qc_order_gi_tasks_);
+  }
+  if (OB_SUCC(ret) && sqc_.is_fulltree()) {
+    len += exec_ctx_->get_group_pwj_map_serialize_size();
   }
   return len;
 }
@@ -789,6 +795,9 @@ int ObPxRpcInitSqcArgs::do_deserialize(int64_t &pos, const char *net_buf, int64_
     // if version of qc is old, qc_order_gi_tasks_ will not be serialized and the value will be false.
     qc_order_gi_tasks_ = false;
     LST_DO_CODE(OB_UNIS_DECODE, qc_order_gi_tasks_);
+    if (OB_SUCC(ret) && sqc_.is_fulltree() && pos < data_len) {
+      ret = exec_ctx_->deserialize_group_pwj_map(buf, data_len, pos);
+    }
     LOG_TRACE("deserialize qc order gi tasks", K(qc_order_gi_tasks_), K(sqc_), K(this));
   }
   return ret;
@@ -1007,6 +1016,12 @@ int ObPxRpcInitTaskArgs::deep_copy_assign(ObPxRpcInitTaskArgs &src,
   } else if (ser_pos != des_pos) {
     ret = OB_DESERIALIZE_ERROR;
     LOG_WARN("data_len and pos mismatch", K(ser_arg_len), K(ser_pos), K(des_pos), K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    if (sqc_handler_->get_sqc_init_arg().sqc_.is_fulltree()
+        && nullptr != src.exec_ctx_->get_group_pwj_map()) {
+      exec_ctx_->deep_copy_group_pwj_map(src.exec_ctx_->get_group_pwj_map());
+    }
   }
   return ret;
 }

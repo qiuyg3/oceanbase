@@ -12,8 +12,7 @@
 
 #define USING_LOG_PREFIX SQL_OPT
 
-#include "sql/optimizer/ob_table_partition_info.h"
-#include "sql/session/ob_sql_session_info.h"
+#include "ob_table_partition_info.h"
 #include "sql/engine/ob_exec_context.h"
 
 namespace oceanbase
@@ -66,7 +65,7 @@ int ObTablePartitionInfo::init_table_location(ObSqlSchemaGuard &schema_guard,
     const ObTableSchema *table_schema = NULL;
     if (OB_FAIL(schema_guard.get_table_schema(table_id, ref_table_id, &stmt, table_schema))) {
       LOG_WARN("fail to get table schema", K(ref_table_id), K(ret));
-    } else if (ObDuplicateScope::DUPLICATE_SCOPE_NONE != table_schema->get_duplicate_scope()) {
+    } else if (table_schema->is_duplicate_table()) {
       //如果复制表本身有改动, 只能选择leader, 不再设置duplicate table属性
       candi_table_loc_.set_duplicate_type(is_dml_table ? ObDuplicateType::DUPLICATE_IN_DML :
                                                                ObDuplicateType::DUPLICATE);

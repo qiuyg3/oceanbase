@@ -27,7 +27,6 @@
 #include "ob_table_access_context.h"
 #include "storage/meta_mem/ob_tablet_handle.h"
 #include "storage/lob/ob_lob_data_reader.h"
-#include "storage/compaction/ob_tenant_tablet_scheduler.h"
 
 namespace oceanbase
 {
@@ -60,6 +59,8 @@ public:
   virtual void reuse();
   // used for global cached query iterator
   virtual void reclaim();
+  // used for mview table scan
+  virtual int open(ObTableScanRange &table_scan_range) { return OB_NOT_SUPPORTED; }
 
   void disable_padding() { need_padding_ = false; }
   void disable_fill_default() { need_fill_default_ = false; }
@@ -68,7 +69,11 @@ public:
   OB_INLINE bool is_inited() { return inited_; }
   OB_INLINE bool is_read_memtable_only() const { return read_memtable_only_; }
   OB_INLINE const common::ObIArray<share::schema::ObColDesc> &get_out_project_cells() { return out_project_cols_; }
-
+  OB_INLINE ObNopPos &get_nop_pos() { return nop_pos_; }
+  OB_INLINE bool use_di_merge_scan() const { return di_base_iters_.count() > 0; }
+  OB_INLINE void set_iter_del_row(const bool iter_del_row) { iter_del_row_ = iter_del_row; }
+  OB_INLINE bool need_iter_del_row() const { return iter_del_row_ || use_di_merge_scan(); }
+  OB_INLINE blocksstable::ObDatumRow &get_unprojected_row() { return unprojected_row_; }
 protected:
   int open();
   virtual int calc_scan_range() = 0;
@@ -78,6 +83,9 @@ protected:
   virtual int inner_get_next_row(blocksstable::ObDatumRow &row) = 0;
   virtual int inner_get_next_rows() { return OB_SUCCESS; };
   virtual int can_batch_scan(bool &can_batch) { can_batch = false; return OB_SUCCESS; }
+  virtual int64_t generate_read_tables_version() const;
+  virtual bool check_table_need_read(const ObITable &table, int64_t &major_version) const;
+  virtual int alloc_row_store(ObTableAccessContext &context, const ObTableAccessParam &param);
   int add_iterator(ObStoreRowIterator &iter); // for unit test
   const ObTableIterParam * get_actual_iter_param(const ObITable *table) const;
   int project_row(const blocksstable::ObDatumRow &unprojected_row,
@@ -90,7 +98,9 @@ protected:
   int handle_4377(const char* func);
   void dump_tx_statistic_for_4377(ObStoreCtx *store_ctx);
   void dump_table_statistic_for_4377();
-  int set_base_version() const;
+  void set_base_version() const;
+  ObStoreRowIterator *get_di_base_iter() { return di_base_iters_.count() > 0 ? di_base_iters_[0] : nullptr; }
+  int prepare_di_base_blockscan(bool di_base_only, ObDatumRow *row = nullptr);
 private:
   int get_next_normal_row(blocksstable::ObDatumRow *&row);
   int get_next_normal_rows(int64_t &count, int64_t capacity);
@@ -104,14 +114,15 @@ private:
   // project to output expressions
   int project2output_exprs(blocksstable::ObDatumRow &unprojected_row, blocksstable::ObDatumRow &cur_row);
   int prepare_read_tables(bool refresh = false);
-  int prepare_tables_from_iterator(ObTableStoreIterator &table_iter, const common::SampleInfo *sample_info = nullptr);
+  int prepare_mds_tables(bool refresh);
+  int prepare_tables_from_iterator(ObTableStoreIterator &table_iter, const bool has_split_extra_tables, const common::SampleInfo *sample_info = nullptr);
   int refresh_table_on_demand();
   int refresh_tablet_iter();
   OB_INLINE int check_need_refresh_table(bool &need_refresh);
   int save_curr_rowkey();
   int reset_tables();
+  int check_base_version(const bool is_di_merge_scan) const;
   int check_filtered(const blocksstable::ObDatumRow &row, bool &filtered);
-  int alloc_row_store(ObTableAccessContext &context, const ObTableAccessParam &param);
   int process_fuse_row(const bool not_using_static_engine,
                        blocksstable::ObDatumRow &in_row,
                        blocksstable::ObDatumRow *&out_row);
@@ -119,34 +130,41 @@ private:
   int init_lob_reader(const ObTableIterParam &iter_param,
                      ObTableAccessContext &access_ctx);
   int read_lob_columns_full_data(blocksstable::ObDatumRow &row);
-  bool need_read_lob_columns(const blocksstable::ObDatumRow &row);
+  bool need_handle_lob_columns(const blocksstable::ObDatumRow &row);
   int handle_lob_before_fuse_row();
   void reuse_lob_locator();
   void report_tablet_stat();
-  OB_INLINE int update_and_report_tablet_stat();
+  int update_and_report_tablet_stat();
   void inner_reset();
+  int refresh_filter_params_on_demand(const bool is_open);
+  int prepare_truncate_filter();
 
 protected:
   common::ObArenaAllocator padding_allocator_;
   MergeIterators iters_;
+  MergeIterators di_base_iters_;
   ObTableAccessParam *access_param_;
   ObTableAccessContext *access_ctx_;
   common::ObSEArray<storage::ObITable *, common::DEFAULT_STORE_CNT_IN_STORAGE> tables_;
   blocksstable::ObDatumRow cur_row_;
   blocksstable::ObDatumRow unprojected_row_;
-  int64_t curr_scan_index_;
   blocksstable::ObDatumRowkey curr_rowkey_;
+  blocksstable::ObDatumRowkey di_base_curr_rowkey_;
   ObNopPos nop_pos_;
-  ObRowStat row_stat_;
   int64_t scan_cnt_;
+  int64_t range_idx_delta_;
+  int64_t curr_scan_index_;
+  int64_t di_base_curr_scan_index_;
+  int64_t major_table_version_;
   bool need_padding_;
   bool need_fill_default_; // disabled by join mv scan
   bool need_fill_virtual_columns_; // disabled by join mv scan
   bool need_output_row_with_nop_; // for sampling increment data
   bool inited_;
-  int64_t range_idx_delta_;
-  ObGetTableParam *get_table_param_;
+  bool iter_del_row_;
   bool read_memtable_only_;
+  bool is_unprojected_row_valid_; // whether unprojected_row_ is ready for refresh_table_on_demand currently
+  ObGetTableParam *get_table_param_;
   ObBlockRowStore *block_row_store_;
   ObGroupByCell *group_by_cell_;
   sql::ObBitVector *skip_bit_;
@@ -154,14 +172,15 @@ protected:
   ObStoreRowIterPool<ObStoreRowIterator> *stmt_iter_pool_;
   common::ObSEArray<share::schema::ObColDesc, 32> out_project_cols_;
   ObLobDataReader lob_reader_;
-private:
   enum ScanState
   {
     NONE,
     SINGLE_ROW,
     BATCH,
+    DI_BASE,
   };
   ScanState scan_state_;
+private:
   // disallow copy
   DISALLOW_COPY_AND_ASSIGN(ObMultipleMerge);
 };
@@ -169,7 +188,12 @@ private:
 OB_INLINE int ObMultipleMerge::check_need_refresh_table(bool &need_refresh)
 {
   int ret = OB_SUCCESS;
-  need_refresh = get_table_param_->tablet_iter_.table_iter()->check_store_expire();
+
+  if (access_param_->iter_param_.is_mds_query_) {
+    need_refresh = false;
+  } else {
+    need_refresh = get_table_param_->tablet_iter_.table_iter()->check_store_expire();
+  }
 #ifdef ERRSIM
   ret = OB_E(EventTable::EN_FORCE_REFRESH_TABLE) ret;
   if (OB_FAIL(ret)) {
@@ -177,30 +201,7 @@ OB_INLINE int ObMultipleMerge::check_need_refresh_table(bool &need_refresh)
     need_refresh = true;
   }
 #endif
-  return ret;
-}
 
-OB_INLINE int ObMultipleMerge::update_and_report_tablet_stat()
-{
-  int ret = OB_SUCCESS;
-  EVENT_ADD(ObStatEventIds::STORAGE_READ_ROW_COUNT, scan_cnt_);
-  if (NULL != access_ctx_->table_scan_stat_) {
-    access_ctx_->table_scan_stat_->access_row_cnt_ += access_ctx_->table_store_stat_.logical_read_cnt_;
-    access_ctx_->table_scan_stat_->rowkey_prefix_ = access_ctx_->table_store_stat_.rowkey_prefix_;
-    access_ctx_->table_scan_stat_->bf_filter_cnt_ += access_ctx_->table_store_stat_.bf_filter_cnt_;
-    access_ctx_->table_scan_stat_->bf_access_cnt_ += access_ctx_->table_store_stat_.bf_access_cnt_;
-    access_ctx_->table_scan_stat_->empty_read_cnt_ += access_ctx_->table_store_stat_.empty_read_cnt_;
-    access_ctx_->table_scan_stat_->fuse_row_cache_hit_cnt_ += access_ctx_->table_store_stat_.fuse_row_cache_hit_cnt_;
-    access_ctx_->table_scan_stat_->fuse_row_cache_miss_cnt_ += access_ctx_->table_store_stat_.fuse_row_cache_miss_cnt_;
-    access_ctx_->table_scan_stat_->block_cache_hit_cnt_ += access_ctx_->table_store_stat_.block_cache_hit_cnt_;
-    access_ctx_->table_scan_stat_->block_cache_miss_cnt_ += access_ctx_->table_store_stat_.block_cache_miss_cnt_;
-    access_ctx_->table_scan_stat_->row_cache_hit_cnt_ += access_ctx_->table_store_stat_.row_cache_hit_cnt_;
-    access_ctx_->table_scan_stat_->row_cache_miss_cnt_ += access_ctx_->table_store_stat_.row_cache_miss_cnt_;
-  }
-  if (MTL(compaction::ObTenantTabletScheduler *)->enable_adaptive_compaction()) {
-    report_tablet_stat();
-  }
-  access_ctx_->table_store_stat_.reuse();
   return ret;
 }
 

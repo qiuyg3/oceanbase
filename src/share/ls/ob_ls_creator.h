@@ -52,7 +52,7 @@ struct ObLSReplicaAddr
 
   ObLSReplicaAddr()
       : addr_(),
-        replica_type_(common::REPLICA_TYPE_MAX) {}
+        replica_type_(common::REPLICA_TYPE_INVALID) {}
   void reset() { *this = ObLSReplicaAddr(); }
   int init(const common::ObAddr &addr,
            const common::ObReplicaType replica_type);
@@ -83,7 +83,8 @@ public:
               const ObString &zone_priority,
               const bool create_with_palf,
               const palf::PalfBaseInfo &palf_base_info,
-              const uint64_t source_tenant_id);
+              const uint64_t source_tenant_id,
+              const ObAllTenantInfo &tenant_info);
   int create_user_ls(const share::ObLSStatusInfo &status_info,
                      const int64_t paxos_replica_num,
                      const share::schema::ZoneLocalityIArray &zone_locality,
@@ -97,6 +98,15 @@ public:
   bool is_valid();
 
 private:
+
+  int create_sys_ls_(
+      const ObILSAddr &addr,
+      const int64_t paxos_replica_num,
+      const share::ObAllTenantInfo &tenant_info,
+      const common::ObCompatibilityMode &compat_mode,
+      const bool create_with_palf,
+      const palf::PalfBaseInfo &palf_base_info);
+
  int construct_clone_tenant_ls_addrs_(const uint64_t source_tenant_id,
                                       ObLSAddr &addr);
  int do_create_ls_(const ObLSAddr &addr,
@@ -158,6 +168,7 @@ private:
  int alloc_sys_ls_addr(const uint64_t tenant_id,
                        const ObIArray<share::ObResourcePoolName> &pools,
                        const share::schema::ZoneLocalityIArray &zone_locality,
+                       const bool is_duplicate_ls,
                        common::ObIArray<ObLSReplicaAddr> &addrs);
 
  int alloc_user_ls_addr(const uint64_t tenant_id, const uint64_t unit_group_id,

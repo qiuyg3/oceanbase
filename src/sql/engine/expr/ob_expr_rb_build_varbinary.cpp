@@ -14,9 +14,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/expr/ob_expr_rb_build_varbinary.h"
 #include "sql/engine/expr/ob_expr_rb_func_helper.h"
-#include "lib/roaringbitmap/ob_roaringbitmap.h"
-#include "lib/roaringbitmap/ob_rb_utils.h"
-#include "sql/engine/expr/ob_expr_lob_utils.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -66,31 +63,20 @@ int ObExprRbBuildVarbinary::eval_rb_build_varbinary(const ObExpr &expr,
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   common::ObArenaAllocator &tmp_allocator = tmp_alloc_g.get_allocator();
   lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(ObRbExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session()), "ROARINGBITMAP"));
-  ObDatum *datum = NULL;
+  ObExpr *rb_arg = expr.args_[0];
   bool is_null_result = false;
+  bool is_rb_null = false;
   ObString rb_bin;
+  ObString res_rb_bin;
 
-  // get roaring string
-  if (OB_FAIL(expr.args_[0]->eval(ctx, datum))) {
-    LOG_WARN("failed to eval argument", K(ret));
-  } else if (datum->is_null()) {
-    is_null_result = true;
-  } else {
-    rb_bin = datum->get_string();
-    ObRbBinType bin_type;
-    if (OB_FAIL(ObTextStringHelper::read_real_string_data(tmp_allocator, *datum,
-        expr.args_[0]->datum_meta_, expr.args_[0]->obj_meta_.has_lob_header(), rb_bin))) {
-      LOG_WARN("fail to get real string data", K(ret), K(rb_bin));
-    } else if (OB_FAIL(ObRbUtils::check_get_bin_type(rb_bin, bin_type))) {
-      LOG_WARN("invalid roaringbitmap binary", K(ret), K(rb_bin));
-    }
-  }
-  if (OB_FAIL(ret)) {
-  } else if (is_null_result) {
+  if (OB_FAIL(ObRbExprHelper::get_input_roaringbitmap_bin(ctx, tmp_allocator, rb_arg, rb_bin, is_rb_null))) {
+    LOG_WARN("fail to get input roaringbitmap", K(ret));
+  } else if (is_rb_null || rb_bin == nullptr) {
     res.set_null();
   } else if (OB_FAIL(ObRbExprHelper::pack_rb_res(expr, ctx, res, rb_bin))) {
     LOG_WARN("fail to pack roaringbitmap res", K(ret));
   }
+
   return ret;
 }
 

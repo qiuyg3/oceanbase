@@ -12,8 +12,8 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/iter/ob_das_scan_iter.h"
-#include "sql/das/ob_das_scan_op.h"
 #include "storage/tx_storage/ob_access_service.h"
+#include "src/sql/engine/ob_exec_context.h"
 
 namespace oceanbase
 {
@@ -70,10 +70,12 @@ int ObDASScanIter::inner_release()
 int ObDASScanIter::do_table_scan()
 {
   int ret = OB_SUCCESS;
-  result_ = nullptr;
   if (OB_ISNULL(scan_param_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr scan param", K(ret));
+  } else if (OB_UNLIKELY(nullptr != result_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected not null result iter ptr before do table scan", K(ret), KP_(result));
   } else if (OB_FAIL(tsc_service_->table_scan(*scan_param_, result_))) {
     if (OB_SNAPSHOT_DISCARDED == ret && scan_param_->fb_snapshot_.is_valid()) {
       ret = OB_INVALID_QUERY_TIMESTAMP;
@@ -81,7 +83,7 @@ int ObDASScanIter::do_table_scan()
       LOG_WARN("fail to scan table", KPC_(scan_param), K(ret));
     }
   }
-  LOG_DEBUG("das scan iter do table scan", KPC_(scan_param), K(ret));
+  LOG_DEBUG("[DAS ITER] scan iter do table scan", KPC_(scan_param), K(ret));
 
   return ret;
 }
@@ -93,12 +95,15 @@ int ObDASScanIter::rescan()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr scan param", K(ret));
   } else if (OB_FAIL(tsc_service_->table_rescan(*scan_param_, result_))) {
+      if (OB_SNAPSHOT_DISCARDED == ret && scan_param_->fb_snapshot_.is_valid()) {
+        ret = OB_INVALID_QUERY_TIMESTAMP;
+      }
     LOG_WARN("failed to rescan tablet", K(scan_param_->tablet_id_), K(ret));
   } else {
     // reset need_switch_param_ after real rescan.
     scan_param_->need_switch_param_ = false;
   }
-  LOG_DEBUG("das scan iter rescan", KPC_(scan_param), K(ret));
+  LOG_DEBUG("[DAS ITER] das scan iter rescan", KPC_(scan_param), K(ret));
 
   return ret;
 }
@@ -106,6 +111,8 @@ int ObDASScanIter::rescan()
 int ObDASScanIter::inner_get_next_row()
 {
   int ret = OB_SUCCESS;
+  common::ObASHTabletIdSetterGuard ash_tablet_id_guard(scan_param_ != nullptr? scan_param_->index_id_ : 0);
+
   if (OB_ISNULL(result_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr scan iter", K(ret));
@@ -120,6 +127,8 @@ int ObDASScanIter::inner_get_next_row()
 int ObDASScanIter::inner_get_next_rows(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
+  common::ObASHTabletIdSetterGuard ash_tablet_id_guard(scan_param_ != nullptr? scan_param_->index_id_ : 0);
+
   if (OB_ISNULL(result_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr scan iter", K(ret));
@@ -128,13 +137,18 @@ int ObDASScanIter::inner_get_next_rows(int64_t &count, int64_t capacity)
       LOG_WARN("failed to get next row", K(ret));
     }
   }
+  LOG_TRACE("[DAS ITER] scan iter get next rows", K(count), K(capacity), KPC_(scan_param), K(ret));
+  const ObBitVector *skip = nullptr;
+  PRINT_VECTORIZED_ROWS(SQL, DEBUG, *eval_ctx_, *output_, count, skip);
   return ret;
 }
 
 void ObDASScanIter::clear_evaluated_flag()
 {
   OB_ASSERT(nullptr != scan_param_);
-  scan_param_->op_->clear_evaluated_flag();
+  if (OB_NOT_NULL(scan_param_->op_)) {
+    scan_param_->op_->clear_evaluated_flag();
+  }
 }
 
 }  // namespace sql

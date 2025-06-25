@@ -11,7 +11,6 @@
  */
 
 #define USING_LOG_PREFIX SHARE
-#include "ob_backup_config.h"
 #include "ob_log_restore_config.h"
 #include "share/restore/ob_log_restore_source_mgr.h"  // ObLogRestoreSourceMgr
 #include "share/ob_log_restore_proxy.h"  // ObLogRestoreProxyUtil
@@ -95,7 +94,7 @@ int ObLogRestoreSourceLocationConfigParser::check_before_update_inner_config(
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "set standby itself as log restore source");
     }
   }
-  //TODO (wenjinyu.wjy) need support access permission check
+  //TODO (mingqiao) need support access permission check
   //
   return ret;
 }

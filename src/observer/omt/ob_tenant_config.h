@@ -33,6 +33,7 @@ class ObTenantConfigMgr;
 
 class ObTenantConfig : public ObCommonConfig
 {
+  friend class ObTenantConfigMgr;
 public:
   static const int64_t INITIAL_TENANT_CONF_VERSION = 1;
 public:
@@ -73,6 +74,7 @@ public:
   ObTenantConfig &operator=(const ObTenantConfig &)=delete;
 
   void print() const override;
+  void trace_all_config() const;
   int check_all() const override { return OB_SUCCESS; }
   common::ObServerRole get_server_type() const override { return common::OB_SERVER; }
   void ref() { ATOMIC_INC(&ref_); }
@@ -88,15 +90,16 @@ public:
   int got_version(int64_t version, const bool remove_repeat);
   int update_local(int64_t expected_version, common::ObMySQLProxy::MySQLResult &result,
                    bool save2file = true);
-  int add_extra_config(const char *config_str,
-                       int64_t version = 0 ,
-                       bool check_config = true);
 
   OB_UNIS_VERSION(1);
 private:
 #ifdef ERRSIM
   int build_errsim_module_();
 #endif
+  // whitout lock, only used inner
+  int add_extra_config_unsafe(const char *config_str,
+                       int64_t version = 0 ,
+                       bool check_config = true);
 private:
   uint64_t tenant_id_;
   int64_t current_version_; // 当前 tenant config 正在被 task 更新中的版本

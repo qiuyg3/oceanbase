@@ -13,7 +13,6 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "ob_sql_mem_mgr_processor.h"
-#include "observer/omt/ob_tenant_config_mgr.h"
 
 namespace oceanbase {
 
@@ -316,7 +315,7 @@ int ObSqlMemMgrProcessor::alloc_dir_id(int64_t &dir_id)
 {
   int ret = OB_SUCCESS;
   if (0 == dir_id_) {
-    if (OB_FAIL(ObChunkStoreUtil::alloc_dir_id(dir_id_))) {
+    if (OB_FAIL(ObChunkStoreUtil::alloc_dir_id(tenant_id_, dir_id_))) {
       LOG_WARN("failed to alloc dir id", K(ret));
     }
   }

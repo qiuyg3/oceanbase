@@ -135,6 +135,7 @@ public:
   inline bool is_paxos_replica() const { return common::REPLICA_TYPE_ENCRYPTION_LOGONLY == replica_type_
                                                 || common::REPLICA_TYPE_FULL == replica_type_
                                                 || common::REPLICA_TYPE_LOGONLY == replica_type_; }
+  inline bool is_column_replica() const { return common::REPLICA_TYPE_COLUMNSTORE == replica_type_; }
   int64_t to_string(char *buf, const int64_t buf_len) const;
   // operator-related functions
   int assign(const ObLSReplica &other);
@@ -188,12 +189,12 @@ public:
 private:
   // construct learner addr from a string in IPV$ or IPV6 format
   // @params[in]  input_string: the input
-  // @params[out] the_count_of_colon_already_parsed: how many colon is parsed in this function
   // @params[out] learner_addr: the parsing result(ip:port)
+  // @params[out] remained_string: string without addr part
   static int parse_addr_from_learner_string_(
              const ObString &input_string,
-             int64_t &the_count_of_colon_already_parsed,
-             ObAddr &learner_addr);
+             ObAddr &learner_addr,
+             ObString &remained_string);
 
   // construct negative or positive integer from string
   // @params[in]  input_text: the input
@@ -201,6 +202,7 @@ private:
   static int parsing_int_from_string_(
              const ObString &input_text,
              int64_t &output_value);
+
 private:
   int64_t create_time_us_;               // store utc time
   int64_t modify_time_us_;               // store utc time

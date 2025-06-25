@@ -11,10 +11,7 @@
  */
 
 #define USING_LOG_PREFIX  SQL_ENG
-#include <string.h>
-#include <stdlib.h>
 #include <sys/ioctl.h>
-#include <netinet/in.h>
 #include <net/if.h>
 #include "sql/engine/expr/ob_expr_uuid.h"
 #include "sql/engine/ob_exec_context.h"
@@ -96,8 +93,12 @@ int ObUUIDNode::init()
                 MEMCPY(mac_addr_, ifr.ifr_hwaddr.sa_data, 6);
                 mac_addr_found = true;
                 break;
+              } else {
+                LOG_WARN("ioctl failed, SIOCGIFHWADDR", K(errno), K(it->ifr_name));
               }
             }
+          } else {
+            LOG_WARN("ioctl failed, SIOCGIFFLAGS", K(errno), K(it->ifr_name));
           }
         }
       }//end for

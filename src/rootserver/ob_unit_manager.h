@@ -130,7 +130,6 @@ public:
            share::schema::ObMultiVersionSchemaService &schema_service,
            ObRootBalancer &root_balance,
            ObRootService &root_service);
-  virtual bool check_inner_stat() const { return inited_ && loaded_; }
   virtual int load();
   common::SpinRWLock& get_lock() { return lock_; }
   common::ObMySQLProxy &get_sql_proxy() { return *proxy_; }
@@ -189,9 +188,6 @@ public:
     const uint64_t tenant_id,
     int64_t &job_id,
     common::ObISQLClient &sql_proxy);
-  virtual int check_locality_for_logonly_unit(const share::schema::ObTenantSchema &tenant_schema,
-                                              const common::ObIArray<share::ObResourcePoolName> &pool_names,
-                                              bool &is_permitted);
   virtual int grant_pools(
       common::ObMySQLTransaction &trans,
       common::ObIArray<uint64_t> &new_ug_id_array,
@@ -265,6 +261,10 @@ public:
       common::hash::ObHashSet<uint64_t> &tenant_id_set) const;
   virtual int check_tenant_on_server(const uint64_t tenant_id,
       const common::ObAddr &server, bool &on_server) const;
+  int get_tenant_unit_servers_with_lock(
+      const uint64_t tenant_id,
+      const common::ObZone &zone,
+      common::ObIArray<common::ObAddr> &server_array) const;
   int get_tenant_unit_servers(
       const uint64_t tenant_id,
       const common::ObZone &zone,
@@ -291,7 +291,8 @@ public:
       const common::ObIArray<share::ObZoneReplicaNumSet> &zone_locality,
       bool &is_legal);
   static int calc_sum_load(const common::ObArray<ObUnitLoad> *unit_loads,
-                           share::ObUnitConfig &sum_load);
+                           share::ObUnitConfig &sum_load,
+                           const bool include_ungranted_unit = true);
   // get hard limit
   int get_hard_limit(double &hard_limit) const;
 
@@ -316,6 +317,7 @@ private:
     MAX_CPU,
     MEMORY,
     LOG_DISK,
+    DATA_DISK,
     ALT_ERR
   };
 
@@ -382,6 +384,8 @@ private:
   static const int64_t NOTIFY_RESOURCE_RPC_TIMEOUT = 9 * 1000000; // 9 second
 
 private:
+  // make sure lock_ is held when calling this method
+  int check_inner_stat_() const;
   // for ObServerBalancer
   IdPoolMap& get_id_pool_map() { return id_pool_map_; }
   TenantPoolsMap& get_tenant_pools_map() { return tenant_pools_map_; }
@@ -421,6 +425,9 @@ private:
       const uint64_t tenant_id,
       bool &is_allowed);
   int check_expand_zone_resource_allowed_by_new_unit_stat_(
+      const common::ObIArray<share::ObResourcePoolName> &pool_names);
+  int check_expand_zone_resource_allowed_by_data_disk_size_(
+      const uint64_t tenant_id,
       const common::ObIArray<share::ObResourcePoolName> &pool_names);
   int check_tenant_pools_unit_num_legal_(
       const uint64_t tenant_id,
@@ -892,8 +899,7 @@ private:
       share::ObResourcePool *resource_pool);
   int cancel_migrate_unit(
       const share::ObUnit &unit,
-      const bool migrate_from_server_can_migrate_in,
-      const bool is_gts_unit);
+      const bool migrate_from_server_can_migrate_in);
   int check_split_pool_name_condition(
       const common::ObIArray<share::ObResourcePoolName> &split_pool_name_list);
   int check_split_pool_zone_condition(
@@ -1006,6 +1012,10 @@ private:
       const share::ObUnitResource &expand_resource,
       bool &can_expand,
       AlterResourceErr &err_index) const;
+  int check_data_disk_size_mode_change_(
+      const common::ObIArray<share::ObResourcePool *> &pools,
+      const share::ObUnitResource &old_ur,
+      const share::ObUnitResource &new_ur) const;
   int get_pool_unit_group_id_(
       const share::ObResourcePool &pool,
       common::ObIArray<uint64_t> &new_unit_group_id_array);
@@ -1138,6 +1148,7 @@ private:
       case MAX_CPU: { str = "MAX_CPU"; break; }
       case MEMORY: { str = "MEMORY_SIZE"; break; }
       case LOG_DISK: { str = "LOG_DISK_SIZE"; break; }
+      case DATA_DISK: { str = "DATA_DISK_SIZE"; break; }
       default: { str = "UNKNOWN"; break; }
     }
     return str;
@@ -1192,8 +1203,7 @@ int ObUnitManager::check_schema_zone_unit_enough(
   int ret = OB_SUCCESS;
   enough = true;
   SpinRLockGuard guard(lock_);
-  if (!check_inner_stat()) {
-    ret = OB_INNER_STAT_ERROR;
+  if (OB_FAIL(check_inner_stat_())) {
     RS_LOG(WARN, "variable is not init", K(ret));
   } else if (zone.is_empty()) {
     ret = OB_INVALID_ARGUMENT;
@@ -1220,8 +1230,7 @@ int ObUnitManager::inner_check_schema_zone_unit_enough(
   common::ObArray<share::ObZoneReplicaNumSet> zone_locality_array;
   enough = true;
   UNUSED(logonly_unit_num);
-  if (!check_inner_stat()) {
-    ret = OB_INNER_STAT_ERROR;
+  if (OB_FAIL(check_inner_stat_())) {
     RS_LOG(WARN, "variable is not init", K(ret));
   } else if (zone.is_empty()) {
     ret = OB_INVALID_ARGUMENT;

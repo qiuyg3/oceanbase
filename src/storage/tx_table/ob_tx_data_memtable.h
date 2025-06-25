@@ -308,7 +308,7 @@ public: /* derived from ObIMemtable */
   virtual ObTabletID get_tablet_id() const { return LS_TX_DATA_TABLET; }
 
 public:  // checkpoint
-  share::SCN get_rec_scn()
+  share::SCN get_rec_scn() override
   {
     return get_min_tx_scn();
   }
@@ -396,6 +396,7 @@ private:  // ObTxDataMemtable
                                           ObCommitVersionsArray::Node &node);
 
   int get_past_commit_versions_(ObCommitVersionsArray &past_commit_versions);
+  void clear_fake_node_if_exist_(ObCommitVersionsArray &past_commit_versions);
 
   int merge_cur_and_past_commit_verisons_(const share::SCN recycle_scn,
                                           ObCommitVersionsArray &cur_commit_versions,
@@ -499,15 +500,16 @@ public:
 
   bool operator()(ObTxData *tx_data) {
     // printf basic info
+    ObCStringHelper helper;
     fprintf(fd_,
             "ObTxData : tx_id=%-19ld state=%-8s start_scn=%-19s "
             "end_scn=%-19s "
             "commit_version=%-19s ",
             tx_data->tx_id_.get_id(),
             ObTxData::get_state_string(tx_data->state_),
-            to_cstring(tx_data->start_scn_),
-            to_cstring(tx_data->end_scn_),
-            to_cstring(tx_data->commit_version_));
+            helper.convert(tx_data->start_scn_),
+            helper.convert(tx_data->end_scn_),
+            helper.convert(tx_data->commit_version_));
 
     // printf undo status list
     fprintf(fd_, "Undo Actions [from, to): {");

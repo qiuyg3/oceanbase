@@ -53,6 +53,12 @@ namespace oceanbase
 namespace observer {
 class ObSMConnection;
 }
+namespace common {
+class ObDiagnosticInfo;
+}
+namespace share {
+class ObSwitchCatalogHelper;
+}
 using sql::FLTControlInfo;
 namespace sql
 {
@@ -80,6 +86,31 @@ struct ObSessionNLSParams //oracle nls parameters
   TO_STRING_KV(K(nls_length_semantics_), K(nls_collation_), K(nls_nation_collation_));
 };
 
+struct ObDiagnosisInfo
+{
+  OB_UNIS_VERSION_V(1);
+public:
+  ObDiagnosisInfo()
+    : is_enabled_(false),
+      limit_num_(0),
+      log_file_(),
+      bad_file_()
+  {}
+
+  void reset() {
+    is_enabled_ = false;
+    limit_num_ = 0;
+    log_file_.reset();
+    bad_file_.reset();
+  }
+
+  bool is_enabled_;
+  int64_t limit_num_;
+  common::ObString log_file_;
+  common::ObString bad_file_;
+
+  TO_STRING_KV(K(is_enabled_), K(limit_num_), K(log_file_), K(bad_file_));
+};
 
 #define TZ_INFO(session) \
   (NULL != (session) ? (session)->get_timezone_info() : NULL)
@@ -221,6 +252,7 @@ public:
     }
     inline void set_stmt_type(stmt::StmtType stmt_type)
     {
+      GET_DIAGNOSTIC_INFO->get_ash_stat().stmt_type_ = stmt_type;
       stmt_type_ = stmt_type;
     }
     TO_STRING_KV(K(table_id_),
@@ -296,6 +328,12 @@ public:
     ~UserScopeGuard() { sql_scope_flags_.set_is_in_user_scope(false); }
     SqlScopeFlags &sql_scope_flags_;
   };
+  enum class ForceRichFormatStatus
+  {
+    Disable = 0,
+    FORCE_ON,
+    FORCE_OFF
+  };
   // 切换自治事务一定需要切换嵌套语句，否则切回主事务后语句执行的上下文信息可能已经有变化，比如：
   //
   // 所以原则上TransSavedValue应该包含StmtSavedValue的所有属性，考虑将前者作为后者的子类，
@@ -304,15 +342,23 @@ public:
   class BaseSavedValue
   {
   public:
-    BaseSavedValue()
+    BaseSavedValue() : cur_query_(NULL)
+    {
+      reset();
+    }
+    ~BaseSavedValue()
     {
       reset();
     }
     inline void reset()
     {
+      if (cur_query_ != nullptr) {
+        ob_free(cur_query_);
+      }
       cur_phy_plan_ = NULL;
-      cur_query_[0] = 0;
       cur_query_len_ = 0;
+      cur_query_buf_len_ = 0;
+      cur_query_ = NULL;
       total_stmt_tables_.reset();
       cur_stmt_tables_.reset();
       read_uncommited_ = false;
@@ -322,7 +368,6 @@ public:
   public:
     // 原StmtSavedValue的属性
     ObPhysicalPlan *cur_phy_plan_;
-    char cur_query_[MAX_QUERY_STRING_LEN];
     volatile int64_t cur_query_len_;
 //  int64_t cur_query_start_time_;          // 用于计算事务超时时间，如果在base_save_session接口中操作
                                             // 会导致start_trans报事务超时失败，不放在基类中。
@@ -332,6 +377,9 @@ public:
     bool read_uncommited_;
     bool inc_autocommit_;
     bool need_serial_exec_;
+    int64_t cur_query_buf_len_;
+    char *cur_query_;
+    ForceRichFormatStatus force_rich_format_status_;
   public:
     // 原TransSavedValue的属性
 //  transaction::ObTxDesc trans_desc_;   // 两者都有trans_desc，但执行操作完全不同，不放在基类中。
@@ -344,6 +392,10 @@ public:
   {
   public:
     StmtSavedValue()
+    {
+      reset();
+    }
+    ~StmtSavedValue()
     {
       reset();
     }
@@ -386,13 +438,6 @@ public:
     transaction::ObXATransID xid_;
   };
 
-  enum class ForceRichFormatStatus
-  {
-    Disable = 0,
-    FORCE_ON,
-    FORCE_OFF
-  };
-
 public:
   ObBasicSessionInfo(const uint64_t tenant_id);
   virtual ~ObBasicSessionInfo();
@@ -423,6 +468,13 @@ public:
                  uint64_t &ori_tenant_id);
   int switch_tenant(uint64_t effective_tenant_id);
   int switch_tenant_with_name(uint64_t effective_tenant_id, const common::ObString &tenant_name);
+  int set_default_catalog_db(uint64_t catalog_id,
+                             uint64_t db_id,
+                             const common::ObString &database_name,
+                             share::ObSwitchCatalogHelper* switch_catalog_helper = NULL);
+  int set_internal_catalog_db(share::ObSwitchCatalogHelper* switch_catalog_helper = NULL);
+  bool is_in_internal_catalog();
+  bool is_in_external_catalog();
   int set_default_database(const common::ObString &database_name,
                            common::ObCollationType coll_type = common::CS_TYPE_INVALID);
   int reset_default_database() { return set_default_database(""); }
@@ -430,6 +482,7 @@ public:
   int update_max_packet_size();
   int64_t get_thread_id() const { return thread_id_; }
   void set_thread_id(int64_t t) { thread_id_ = t; }
+  const char* get_thread_name() const { return thread_name_; }
   void set_valid(const bool valid) {is_valid_ = valid;};
   int set_client_version(const common::ObString &client_version);
   int set_driver_version(const common::ObString &driver_version);
@@ -467,9 +520,12 @@ public:
   uint64_t get_local_auto_increment_increment() const;
   uint64_t get_local_auto_increment_offset() const;
   uint64_t get_local_last_insert_id() const;
+  void set_local_ob_enable_pl_cache(bool v) { sys_vars_cache_.set_ob_enable_pl_cache(v); }
   bool get_local_ob_enable_pl_cache() const;
   bool get_local_ob_enable_plan_cache() const;
   bool get_local_ob_enable_sql_audit() const;
+  bool get_local_ob_enable_parameter_anonymous_block() const;
+  bool get_local_ob_enable_ps_parameter_anonymous_block() const;
   bool get_local_cursor_sharing_mode() const;
   ObLengthSemantics get_local_nls_length_semantics() const;
   ObLengthSemantics get_actual_nls_length_semantics() const;
@@ -554,6 +610,10 @@ public:
   common::ObIArray<uint64_t>& get_enable_role_ids() { return enable_role_ids_; }
   const common::ObIArray<uint64_t>& get_enable_role_ids() const { return enable_role_ids_; }
   int get_show_ddl_in_compat_mode(bool &show_ddl_in_compat_mode) const;
+  int get_ob_hnsw_ef_search(uint64_t &ob_hnsw_ef_search) const;
+  int get_ob_ivf_nprobes(uint64_t &ob_ivf_nprobes) const;
+  int get_ob_hnsw_extra_info_max_size(uint64_t &ob_hnsw_extra_info_max_size) const;
+  int get_ob_sparse_drop_ratio_search(uint64_t &ob_sparse_drop_ratio_search) const;
   int get_sql_quote_show_create(bool &sql_quote_show_create) const;
   common::ObConsistencyLevel get_consistency_level() const { return consistency_level_; };
   bool is_zombie() const { return SESSION_KILLED == get_session_state();}
@@ -637,6 +697,11 @@ public:
     sql_select_limit = sys_vars_cache_.get_sql_select_limit();
     return common::OB_SUCCESS;
   }
+  int get_oracle_sql_select_limit(int64_t &oracle_sql_select_limit) const
+  {
+    oracle_sql_select_limit = sys_vars_cache_.get_oracle_sql_select_limit();
+    return common::OB_SUCCESS;
+  }
   // session保留compatible mode，主要用于传递mode，方便后续进行guard切换，如inner sql connection等
   // 其他需要用mode地方请尽量使用线程上的is_oracle|mysql_mode
   // 同时可以使用check_compatibility_mode来检查线程与session上的mode是否一致
@@ -663,6 +728,7 @@ public:
   }
   int get_collation_database(common::ObCollationType &collation_database) const;
   int get_collation_server(common::ObCollationType &collation_server) const;
+  int get_default_collation_for_utf8mb4(ObCollationType &collation_server) const;
   int get_foreign_key_checks(int64_t &foreign_key_checks) const
   {
     foreign_key_checks = sys_vars_cache_.get_foreign_key_checks();
@@ -699,6 +765,7 @@ public:
   int get_regexp_time_limit(int64_t &v) const;
   int get_regexp_session_vars(ObExprRegexpSessionVariables &vars) const;
   int get_activate_all_role_on_login(bool &v) const;
+  int get_mview_refresh_dop(uint64_t &v) const;
   int update_timezone_info();
   const common::ObTimeZoneInfo *get_timezone_info() const { return tz_info_wrap_.get_time_zone_info(); }
   const common::ObTimeZoneInfoWrap &get_tz_info_wrap() const { return tz_info_wrap_; }
@@ -716,13 +783,13 @@ public:
   void eval_sys_var_config_hash_val();
   int gen_sys_var_in_pc_str();
   int gen_configs_in_pc_str();
-  uint32_t get_sessid() const { return sessid_; }
+  uint32_t get_server_sid() const { return sessid_; }
   // Used for view or function compatibility display.
-  uint32_t get_compatibility_sessid() const
+  uint32_t get_sid() const
   {
     return client_sessid_ == INVALID_SESSID ? sessid_ : client_sessid_;
   }
-  uint32_t get_client_sessid() const { return client_sessid_; }
+  uint32_t get_client_sid() const { return client_sessid_; }
   inline void set_client_sessid(uint32_t client_sessid)
   {
     client_sessid_ = client_sessid;
@@ -732,8 +799,9 @@ public:
   {
     client_create_time_ = client_create_time;
   }
+  static int get_client_sid(uint32_t server_sid, uint32_t& client_sid); // get client sid by server sid
   uint64_t get_proxy_sessid() const { return proxy_sessid_; }
-  uint64_t get_sessid_for_table() const { return is_obproxy_mode()? get_proxy_sessid() : (is_master_session() ? get_sessid() : get_master_sessid()); } //用于临时表、查询建表时session id获取
+  uint64_t get_sessid_for_table() const { return is_obproxy_mode()? get_proxy_sessid() : (is_master_session() ? get_sid() : get_master_sessid()); } //用于临时表、查询建表时session id获取
   uint32_t get_master_sessid() const { return master_sessid_; }
   inline const common::ObString get_sess_bt() const { return ObString::make_string(sess_bt_buff_); }
   inline int32_t get_sess_ref_cnt() const { return sess_ref_cnt_; }
@@ -821,6 +889,7 @@ public:
     thread_data_.dis_state_ = dis_state;
   }
   int set_session_state(ObSQLSessionState state);
+  void set_session_state_for_trigger(ObSQLSessionState state);
   int check_session_status();
   ObDisconnectState get_disconnect_state() const { return thread_data_.dis_state_;}
   ObSQLSessionState get_session_state() const { return thread_data_.state_;}
@@ -860,6 +929,9 @@ public:
   bool get_is_in_retry() {
     return SESS_NOT_IN_RETRY != thread_data_.is_in_retry_;
   }
+  bool get_is_in_retry() const {
+    return SESS_NOT_IN_RETRY != thread_data_.is_in_retry_;
+  }
   bool get_is_in_retry_for_dup_tbl() {
     return SESS_IN_RETRY_FOR_DUP_TBL == thread_data_.is_in_retry_;
   }
@@ -878,7 +950,9 @@ public:
   obmysql::ObMySQLCmd get_mysql_cmd() const { return thread_data_.mysql_cmd_; }
   char const *get_mysql_cmd_str() const { return obmysql::get_mysql_cmd_str(thread_data_.mysql_cmd_); }
   int store_query_string(const common::ObString &stmt);
+  int store_top_query_string(const common::ObString &stmt);
   void reset_query_string();
+  void reset_top_query_string();
   void set_session_sleep();
   // for SQL entry point
   int set_session_active(const ObString &sql,
@@ -888,7 +962,11 @@ public:
   // for remote / px task
   int set_session_active(const ObString &label,
                          obmysql::ObMySQLCmd cmd);
+  int set_session_active();
   const common::ObString get_current_query_string() const;
+  const common::ObString get_top_query_string() const;
+  void set_sql_mem_used(int64_t mem_used) { ATOMIC_STORE(&sql_mem_used_, mem_used); }
+  int64_t get_sql_mem_used() const { return ATOMIC_LOAD(&sql_mem_used_); }
   uint64_t get_current_statement_id() const { return thread_data_.cur_statement_id_; }
   int update_session_timeout();
   int is_timeout(bool &is_timeout);
@@ -929,7 +1007,8 @@ public:
                         const common::ObObj &min_val,
                         const common::ObObj &max_val,
                         const int64_t flags,
-                        bool is_from_sys_table);
+                        bool is_from_sys_table,
+                        int64_t store_idx = -1);
   int load_sys_variable(common::ObIAllocator &calc_buf,
                         const common::ObString &name,
                         const int64_t dtype,
@@ -965,12 +1044,15 @@ public:
   int get_sys_variable(const share::ObSysVarClassType sys_var_id, common::ObString &val) const;
   int get_sys_variable(const share::ObSysVarClassType sys_var_id, int64_t &val) const;
   int get_sys_variable(const share::ObSysVarClassType sys_var_id, uint64_t &val) const;
+  int get_sys_variable(const share::ObSysVarClassType sys_var_id, bool &val) const;
   int get_sys_variable(const share::ObSysVarClassType sys_var_id, share::ObBasicSysVar *&val) const;
   /// @note get system variables by id is prefered
   int get_sys_variable_by_name(const common::ObString &var, common::ObObj &val) const;
   int get_sys_variable_by_name(const common::ObString &var, share::ObBasicSysVar *&val) const;
   int get_sys_variable_by_name(const common::ObString &var, int64_t &val) const;
   ///@}
+
+  int reset_sys_vars();
 
   /// check the existence of the system variable
   int sys_variable_exists(const common::ObString &var, bool &is_exist) const;
@@ -1007,7 +1089,9 @@ public:
   const ObString get_cur_sql_id() const { return ObString(sql_id_); }
   void get_cur_sql_id(char *sql_id_buf, int64_t sql_id_buf_size) const;
   void set_cur_sql_id(char *sql_id);
+  void reset_cur_sql_id() { sql_id_[0] = '\0'; }
   int set_cur_phy_plan(ObPhysicalPlan *cur_phy_plan);
+  virtual void set_ash_stat_value(ObActiveSessionStat &ash_stat);
   void reset_cur_phy_plan_to_null();
 
   void get_flt_span_id(ObString &span_id) const;
@@ -1035,6 +1119,7 @@ public:
   int get_query_rewrite_enabled(int64_t &query_rewrite_enabled) const;
   int get_query_rewrite_integrity(int64_t &query_rewrite_integrity) const;
   int is_serial_set_order_forced(bool &force_set_order, bool is_oracle_mode) const;
+  int is_old_charset_aggregation_enabled(bool &is_enable) const;
   int is_storage_estimation_enabled(bool &storage_estimation_enabled) const;
   bool is_use_trace_log() const
   {
@@ -1045,6 +1130,8 @@ public:
   int get_name_case_mode(common::ObNameCaseMode &case_mode) const;
   int get_init_connect(common::ObString &str) const;
   int get_locale_name(common::ObString &str) const;
+  int get_optimizer_cost_based_transformation(int64_t &cbqt_policy) const;
+  int is_push_join_predicate_enabled(bool &push_join_predicate_enabled) const;
   /// @}
 
   ///@{ user variables related:
@@ -1169,6 +1256,7 @@ public:
 
   inline void set_capability(const obmysql::ObMySQLCapabilityFlags cap) { capability_ = cap; }
   inline void set_client_attrbuite_capability(const uint64_t cap) { client_attribute_capability_.capability_ = cap; }
+  inline uint64_t get_client_attrbuite_capability() { return client_attribute_capability_.capability_; }
   inline obmysql::ObMySQLCapabilityFlags get_capability() const { return capability_; }
   inline bool is_track_session_info() const { return capability_.cap_flags_.OB_CLIENT_SESSION_TRACK; }
 
@@ -1187,9 +1275,36 @@ public:
     return capability_.cap_flags_.OB_CLIENT_USE_LOB_LOCATOR;
   }
 
+  // NOTICE: Don't use this function, this is only used in pl clob/blob for oracle tenant
+  inline void set_client_use_lob_locator(bool flag)
+  {
+    capability_.cap_flags_.OB_CLIENT_USE_LOB_LOCATOR = (flag ? 1 : 0);
+  }
+
   inline bool is_client_support_lob_locatorv2() const
   {
     return client_attribute_capability_.cap_flags_.OB_CLIENT_CAP_OB_LOB_LOCATOR_V2;
+  }
+
+  // NOTICE: Don't use this function, this is only used in pl clob/blob for oracle tenant
+  inline void set_client_support_lob_locatorv2(bool flag)
+  {
+    client_attribute_capability_.cap_flags_.OB_CLIENT_CAP_OB_LOB_LOCATOR_V2 = (flag ? 1 : 0);
+  }
+
+  inline bool need_return_lob_locator() const
+  {
+    return is_client_use_lob_locator() || is_client_support_lob_locatorv2();
+  }
+
+  inline bool is_support_new_result_meta_data() const
+  {
+    return client_attribute_capability_.cap_flags_.OB_CLIENT_CAP_NEW_RESULT_META_DATA;
+  }
+
+  inline bool is_support_jdbc_binary_double() const
+  {
+    return client_attribute_capability_.cap_flags_.OB_CLIENT_SUPPORT_JDBC_BINARY_DOUBLE;
   }
 
   void set_proxy_cap_flags(const obmysql::ObProxyCapabilityFlags &proxy_capability)
@@ -1220,6 +1335,7 @@ public:
   int set_partition_hit(const bool is_hit);
   int set_proxy_user_privilege(const int64_t user_priv_set);
   int set_proxy_capability(const uint64_t proxy_cap);
+  int set_client_capability();
   int set_trans_specified(const bool is_spec);
   int set_init_connect(const common::ObString &init_sql);
   int save_trans_status();
@@ -1230,6 +1346,18 @@ public:
   void set_tx_isolation(transaction::ObTxIsolationLevel isolation);
   bool get_tx_read_only() const;
   void set_tx_read_only(const bool last_tx_read_only, const bool cur_tx_read_only);
+  bool enable_mysql_compatible_dates() const { return enable_mysql_compatible_dates_; }
+  void set_enable_mysql_compatible_dates(const bool enable_mysql_compatible_dates) {
+    enable_mysql_compatible_dates_ = enable_mysql_compatible_dates;
+  }
+  bool is_diagnosis_enabled() const { return is_diagnosis_enabled_; }
+  void set_diagnosis_enabled(const bool is_diagnosis_enabled) {
+    is_diagnosis_enabled_ = is_diagnosis_enabled;
+  }
+  void set_diagnosis_limit_num(const int64_t diagnosis_limit_num) {
+    diagnosis_limit_num_ = diagnosis_limit_num;
+  }
+  int64_t get_diagnosis_limit_num() const { return diagnosis_limit_num_; }
   int reset_tx_variable_if_remote_trans(const ObPhyPlanType& type);
   int check_tx_read_only_privilege(const ObSqlTraits &sql_traits);
   int get_group_concat_max_len(uint64_t &group_concat_max_len) const;
@@ -1269,6 +1397,17 @@ public:
   const common::ObCurTraceId::TraceId &get_last_trace_id() const { return last_trace_id_; }
   const common::ObCurTraceId::TraceId &get_current_trace_id() const { return curr_trace_id_; }
   uint64_t get_current_plan_id() const { return plan_id_; }
+  void reset_current_plan_id()
+  {
+    plan_id_ = 0;
+    GET_DIAGNOSTIC_INFO->get_ash_stat().plan_id_ = 0;
+  }
+  uint64_t get_current_plan_hash() const { return plan_hash_; }
+  void reset_current_plan_hash()
+  {
+    plan_hash_ = 0;
+    GET_DIAGNOSTIC_INFO->get_ash_stat().plan_hash_ = 0;
+  }
   uint64_t get_last_plan_id() const { return last_plan_id_; }
   void set_last_plan_id(uint64_t plan_id) { last_plan_id_ = plan_id; }
   void set_current_execution_id(int64_t execution_id) { current_execution_id_ = execution_id; }
@@ -1279,13 +1418,7 @@ public:
       last_trace_id_ = *trace_id;
     }
   }
-  void set_current_trace_id(common::ObCurTraceId::TraceId *trace_id)
-  {
-    if (OB_ISNULL(trace_id)) {
-    } else {
-      curr_trace_id_ = *trace_id;
-    }
-  }
+  void set_current_trace_id(common::ObCurTraceId::TraceId *trace_id);
   // forbid use jit
   int get_jit_enabled_mode(ObJITEnableMode &jit_mode) const
   {
@@ -1303,6 +1436,7 @@ public:
   int64_t get_runtime_filter_max_in_num() const { return sys_vars_cache_.get_runtime_filter_max_in_num(); }
   int64_t get_runtime_bloom_filter_max_size() const { return sys_vars_cache_.get_runtime_bloom_filter_max_size(); }
 
+  bool get_enable_sql_plan_monitor() const { return sys_vars_cache_.get_enable_sql_plan_monitor(); }
 
   const ObString &get_app_trace_id() const { return app_trace_id_; }
   void set_app_trace_id(common::ObString trace_id) {
@@ -1360,6 +1494,8 @@ public:
 
   bool has_explicit_start_trans() const { return tx_desc_ != NULL && tx_desc_->is_explicit(); }
   bool is_in_transaction() const { return tx_desc_ != NULL && tx_desc_->is_in_tx(); }
+  bool has_active_autocommit_trans(transaction::ObTransID &trans_id);
+  bool is_dup_ls_modified() const { return tx_desc_ != NULL && tx_desc_->is_dup_ls_modified(); }
   virtual bool is_txn_free_route_temp() const { return false; }
   bool get_in_transaction() const { return is_in_transaction(); }
   uint64_t get_trans_flags() const { return trans_flags_.get_flags(); }
@@ -1392,7 +1528,11 @@ public:
   inline stmt::StmtType get_first_need_txn_stmt_type() const { return first_need_txn_stmt_type_; }
   inline void set_need_recheck_txn_readonly(bool need) { need_recheck_txn_readonly_ = need; }
   inline bool need_recheck_txn_readonly() const { return need_recheck_txn_readonly_; }
-  void set_stmt_type(stmt::StmtType stmt_type) { stmt_type_ = stmt_type; }
+  void set_stmt_type(stmt::StmtType stmt_type)
+  {
+    stmt_type_ = stmt_type;
+    GET_DIAGNOSTIC_INFO->get_ash_stat().stmt_type_ = stmt_type;
+  }
   stmt::StmtType get_stmt_type() const { return stmt_type_; }
 
   int get_session_label(uint64_t policy_id, share::ObLabelSeSessionLabel &session_label) const;
@@ -1412,13 +1552,17 @@ public:
   int set_session_temp_table_used(const bool is_used);
   int get_session_temp_table_used(bool &is_used) const;
   int get_enable_optimizer_null_aware_antijoin(bool &is_enabled) const;
-  common::ActiveSessionStat &get_ash_stat() {  return ash_stat_; }
   void update_tenant_config_version(int64_t v) { cached_tenant_config_version_ = v; };
   static int check_optimizer_features_enable_valid(const ObObj &val);
   int get_compatibility_control(share::ObCompatType &compat_type) const;
   int get_compatibility_version(uint64_t &compat_version) const;
   int get_security_version(uint64_t &security_version) const;
+  uint64_t get_current_default_catalog() const;
   int check_feature_enable(const share::ObCompatFeatureType feature_type, bool &is_enable) const;
+  void trace_all_sys_vars() const;
+  void reuse_labels() { labels_.reuse(); }
+  bool is_real_inner_session() const { return is_real_inner_session_; }
+  void set_real_inner_session(bool value) { is_real_inner_session_ = value; }
 protected:
   int process_session_variable(share::ObSysVarClassType var, const common::ObObj &value,
                                const bool check_timezone_valid = true,
@@ -1496,6 +1640,7 @@ private:
   int deep_copy_trace_id_var(const common::ObObj &src_val,
                              common::ObObj *dest_val_ptr);
   inline int store_query_string_(const ObString &stmt);
+  inline int store_query_string_(const ObString &stmt, int64_t& buf_len, char *& query, volatile int64_t& query_len);
   inline int set_session_state_(ObSQLSessionState state);
   //写入系统变量的默认值, deserialized scene need use base_value as baseline.
   int init_system_variables(const bool print_info_log, const bool is_sys_tenant, bool is_deserialized = false);
@@ -1515,6 +1660,9 @@ protected:
                          cur_query_buf_len_(0),
                          cur_query_(nullptr),
                          cur_query_len_(0),
+                         top_query_buf_len_(0),
+                         top_query_(nullptr),
+                         top_query_len_(0),
                          cur_statement_id_(0),
                          last_active_time_(0),
                          dis_state_(CLIENT_FORCE_DISCONNECT),
@@ -1555,7 +1703,11 @@ protected:
       if (cur_query_ != nullptr) {
         cur_query_[0] = '\0';
       }
+      if (top_query_ != nullptr) {
+        top_query_[0] = '\0';
+      }
       cur_query_len_ = 0;
+      top_query_len_ = 0;
       cur_statement_id_ = 0;
       last_active_time_ = 0;
       dis_state_ = CLIENT_FORCE_DISCONNECT;
@@ -1596,6 +1748,9 @@ protected:
     int64_t cur_query_buf_len_;
     char *cur_query_;
     volatile int64_t cur_query_len_;
+    int64_t top_query_buf_len_;
+    char *top_query_;
+    volatile int64_t top_query_len_;
     uint64_t cur_statement_id_;
     int64_t last_active_time_;
     ObDisconnectState dis_state_;
@@ -1634,6 +1789,7 @@ public:
         sql_throttle_current_priority_(100),
         ob_last_schema_version_(0),
         sql_select_limit_(0),
+        oracle_sql_select_limit_(0),
         auto_increment_offset_(0),
         last_insert_id_(0),
         binlog_row_image_(2),
@@ -1678,10 +1834,14 @@ public:
         runtime_filter_max_in_num_(0),
         runtime_bloom_filter_max_size_(INT_MAX32),
         enable_rich_vector_format_(false),
-        ncharacter_set_connection_(ObCharsetType::CHARSET_INVALID),
+        ncharacter_set_connection_(ObCharsetType::CHARSET_SESSION_CACHE_NOT_LOADED_MARK),
         compat_type_(share::ObCompatType::COMPAT_MYSQL57),
-        compat_version_(0)
-
+        compat_version_(0),
+        enable_sql_plan_monitor_(false),
+        ob_enable_parameter_anonymous_block_(false),
+        current_default_catalog_(0),
+        security_version_(0),
+        ob_enable_ps_parameter_anonymous_block_(false)
     {
       for (int64_t i = 0; i < ObNLSFormatEnum::NLS_MAX; ++i) {
         MEMSET(nls_formats_buf_[i], 0, MAX_NLS_FORMAT_STR_LEN);
@@ -1695,6 +1855,7 @@ public:
       sql_throttle_current_priority_ = 100;
       ob_last_schema_version_ = 0;
       sql_select_limit_ = 0;
+      oracle_sql_select_limit_ = 0;
       auto_increment_offset_ = 0;
       last_insert_id_ = 0;
       binlog_row_image_ = 2;
@@ -1746,6 +1907,11 @@ public:
       default_lob_inrow_threshold_ = OB_DEFAULT_LOB_INROW_THRESHOLD;
       compat_type_ = share::ObCompatType::COMPAT_MYSQL57;
       compat_version_ = 0;
+      enable_sql_plan_monitor_ = false;
+      ob_enable_parameter_anonymous_block_ = false;
+      security_version_ = 0;
+      ob_enable_ps_parameter_anonymous_block_ = false;
+      current_default_catalog_ = 0;
     }
 
     inline bool operator==(const SysVarsCacheData &other) const {
@@ -1753,6 +1919,7 @@ public:
             sql_throttle_current_priority_ == other.sql_throttle_current_priority_ &&
             ob_last_schema_version_ == other.ob_last_schema_version_ &&
             sql_select_limit_ == other.sql_select_limit_ &&
+            oracle_sql_select_limit_ == other.oracle_sql_select_limit_ &&
             auto_increment_offset_ == other.auto_increment_offset_ &&
             last_insert_id_ == other.last_insert_id_ &&
             binlog_row_image_ == other.binlog_row_image_ &&
@@ -1795,7 +1962,11 @@ public:
             ncharacter_set_connection_ == other.ncharacter_set_connection_ &&
             default_lob_inrow_threshold_ == other.default_lob_inrow_threshold_ &&
             compat_type_ == other.compat_type_ &&
-            compat_version_ == other.compat_version_;
+            compat_version_ == other.compat_version_ &&
+            ob_enable_parameter_anonymous_block_ == other.ob_enable_parameter_anonymous_block_ &&
+            security_version_ == other.security_version_ &&
+            ob_enable_ps_parameter_anonymous_block_ == other.ob_enable_ps_parameter_anonymous_block_ &&
+            current_default_catalog_ == other.current_default_catalog_;
       bool equal2 = true;
       for (int64_t i = 0; i < ObNLSFormatEnum::NLS_MAX; ++i) {
         if (nls_formats_[i] != other.nls_formats_[i]) {
@@ -1908,7 +2079,7 @@ public:
                  K(ob_org_cluster_id_), K(ob_query_timeout_), K(ob_trx_timeout_), K(collation_connection_),
                  K(sql_mode_), K(nls_formats_[0]), K(nls_formats_[1]), K(nls_formats_[2]),
                  K(ob_trx_idle_timeout_), K(ob_trx_lock_timeout_), K(nls_collation_), K(nls_nation_collation_),
-                 K_(sql_throttle_current_priority), K_(ob_last_schema_version), K_(sql_select_limit),
+                 K_(sql_throttle_current_priority), K_(ob_last_schema_version), K_(sql_select_limit), K_(oracle_sql_select_limit),
                  K_(optimizer_use_sql_plan_baselines), K_(optimizer_capture_sql_plan_baselines),
                  K_(is_result_accurate), K_(character_set_results),
                  K_(character_set_connection), K_(ob_pl_block_timeout), K_(ob_plsql_ccflags),
@@ -1921,6 +2092,7 @@ public:
     int64_t sql_throttle_current_priority_;
     int64_t ob_last_schema_version_;
     int64_t sql_select_limit_;
+    int64_t oracle_sql_select_limit_;
     uint64_t auto_increment_offset_;
     uint64_t last_insert_id_;
     int64_t binlog_row_image_;
@@ -1977,6 +2149,12 @@ public:
     ObCharsetType ncharacter_set_connection_;
     share::ObCompatType compat_type_;
     uint64_t compat_version_;
+    // No use. Placeholder.
+    bool enable_sql_plan_monitor_;
+    bool ob_enable_parameter_anonymous_block_;
+    uint64_t current_default_catalog_;
+    uint64_t security_version_;
+    bool ob_enable_ps_parameter_anonymous_block_;
   private:
     char nls_formats_buf_[ObNLSFormatEnum::NLS_MAX][MAX_NLS_FORMAT_STR_LEN];
   };
@@ -2045,6 +2223,7 @@ private:
     DEF_SYS_VAR_CACHE_FUNCS(int64_t, sql_throttle_current_priority);
     DEF_SYS_VAR_CACHE_FUNCS(int64_t, ob_last_schema_version);
     DEF_SYS_VAR_CACHE_FUNCS(int64_t, sql_select_limit);
+    DEF_SYS_VAR_CACHE_FUNCS(int64_t, oracle_sql_select_limit);
     DEF_SYS_VAR_CACHE_FUNCS(uint64_t, auto_increment_offset);
     DEF_SYS_VAR_CACHE_FUNCS(uint64_t, last_insert_id);
     DEF_SYS_VAR_CACHE_FUNCS(int64_t, binlog_row_image);
@@ -2094,6 +2273,11 @@ private:
     DEF_SYS_VAR_CACHE_FUNCS(int64_t, default_lob_inrow_threshold);
     DEF_SYS_VAR_CACHE_FUNCS(share::ObCompatType, compat_type);
     DEF_SYS_VAR_CACHE_FUNCS(uint64_t, compat_version);
+    DEF_SYS_VAR_CACHE_FUNCS(bool, enable_sql_plan_monitor);
+    DEF_SYS_VAR_CACHE_FUNCS(bool, ob_enable_parameter_anonymous_block);
+    DEF_SYS_VAR_CACHE_FUNCS(uint64_t, security_version);
+    DEF_SYS_VAR_CACHE_FUNCS(bool, ob_enable_ps_parameter_anonymous_block);
+    DEF_SYS_VAR_CACHE_FUNCS(uint64_t, current_default_catalog);
     void set_autocommit_info(bool inc_value)
     {
       inc_data_.autocommit_ = inc_value;
@@ -2111,13 +2295,14 @@ private:
     // base_data 是 ObSysVariables 里的 hardcode 变量值
     static SysVarsCacheData base_data_;
     SysVarsCacheData inc_data_;
-    union {
+    union { // FARM COMPAT WHITELIST
       uint64_t inc_flags_;
       struct {
         bool inc_auto_increment_increment_:1;
         bool inc_sql_throttle_current_priority_:1;
         bool inc_ob_last_schema_version_:1;
         bool inc_sql_select_limit_:1;
+        bool inc_oracle_sql_select_limit_:1;
         bool inc_auto_increment_offset_:1;
         bool inc_last_insert_id_:1;
         bool inc_binlog_row_image_:1;
@@ -2167,6 +2352,11 @@ private:
         bool inc_ob_enable_pl_cache_:1;
         bool inc_compat_type_:1;
         bool inc_compat_version_:1;
+        bool inc_enable_sql_plan_monitor_:1;
+        bool inc_ob_enable_parameter_anonymous_block_:1;
+        bool inc_security_version_:1;
+        bool inc_ob_enable_ps_parameter_anonymous_block_:1;
+        bool inc_current_default_catalog_:1;
       };
     };
   };
@@ -2241,7 +2431,8 @@ protected:
   common::ObSmallBlockAllocator<> ps_session_info_allocator_;
   common::ObSmallBlockAllocator<> cursor_info_allocator_; // for alloc memory of PS CURSOR/SERVER REF CURSOR
   common::ObSmallBlockAllocator<> package_info_allocator_; // for alloc memory of session package state
-  common::ObStringBuf name_pool_; // for variables names and statement names
+  common::ObStringBuf sess_level_name_pool_; // will reset when disconnect session
+  common::ObStringBuf conn_level_name_pool_; // will reset when reset connection and disconnect session
   intptr_t json_pl_mngr_; // for pl json manage
   TransFlags trans_flags_;
   SqlScopeFlags sql_scope_flags_;
@@ -2274,6 +2465,10 @@ private:
   ObTimeZoneInfoWrap tz_info_wrap_;
   int64_t next_tx_read_only_;
   transaction::ObTxIsolationLevel next_tx_isolation_;
+  bool enable_mysql_compatible_dates_;
+  bool is_diagnosis_enabled_;
+  int64_t diagnosis_limit_num_;
+  ObDiagnosisInfo diagnosis_info_;
   //===============================================================
 
   //==============系统变量相关的变量，不需序列化到远端==============
@@ -2287,6 +2482,7 @@ private:
   char sql_id_[common::OB_MAX_SQL_ID_LENGTH + 1];
   uint64_t plan_id_; // for ASH sampling, get current SQL's sql_id & plan_id
   uint64_t last_plan_id_;
+  uint64_t plan_hash_;
 
   ObFLTVars flt_vars_;
   //=======================ObProxy && OCJ related============================
@@ -2398,7 +2594,6 @@ private:
   // 构造当前 session 的线程 id，用于 all_virtual_processlist 中的 THREAD_ID 字段
   // 通过本 id 可以快速对 worker 做 `pstack THREADID` 操作
   int64_t thread_id_;
-  common::ActiveSessionStat ash_stat_;
   // indicate whether user password is expired, is set when session is established.
   // will not be changed during whole session lifetime unless user changes password
   // in this session.
@@ -2420,13 +2615,29 @@ private:
 
   common::ObSEArray<uint64_t, 4> enable_role_ids_;
   uint64_t sys_var_config_hash_val_;
+  char thread_name_[OB_THREAD_NAME_BUF_LEN];
+  bool is_real_inner_session_;
+  // Currently, when inner sql is executed, the session will be created from session_mgr in most cases. We think he is an inner session;
+  // In addition, in situations such as PL execution, the external session will be passed to the inner sql Connection. In this case, it is not considered an inner session.
+  // There are differences between the two in terms of ASH statistics and so on, so they should be distinguished.
+  int64_t sql_mem_used_;
+public:
+  bool get_enable_hyperscan_regexp_engine() const;
+  int8_t get_min_const_integer_precision() const;
 };
 
 
 inline const common::ObString ObBasicSessionInfo::get_current_query_string() const
 {
   common::ObString str_ret;
-  str_ret.assign_ptr(const_cast<char *>(thread_data_.cur_query_), static_cast<int32_t>(thread_data_.cur_query_len_));
+  str_ret.assign_ptr(const_cast<char *>(thread_data_.cur_query_), static_cast<int64_t>(thread_data_.cur_query_len_));
+  return str_ret;
+}
+
+inline const common::ObString ObBasicSessionInfo::get_top_query_string() const
+{
+  common::ObString str_ret;
+  str_ret.assign_ptr(const_cast<char *>(thread_data_.top_query_), static_cast<int32_t>(thread_data_.top_query_len_));
   return str_ret;
 }
 
@@ -2503,6 +2714,16 @@ inline bool ObBasicSessionInfo::get_local_ob_enable_plan_cache() const
 inline bool ObBasicSessionInfo::get_local_ob_enable_sql_audit() const
 {
   return sys_vars_cache_.get_ob_enable_sql_audit();
+}
+
+inline bool ObBasicSessionInfo::get_local_ob_enable_parameter_anonymous_block() const
+{
+  return sys_vars_cache_.get_ob_enable_parameter_anonymous_block();
+}
+
+inline bool ObBasicSessionInfo::get_local_ob_enable_ps_parameter_anonymous_block() const
+{
+  return sys_vars_cache_.get_ob_enable_ps_parameter_anonymous_block();
 }
 
 inline ObLengthSemantics ObBasicSessionInfo::get_local_nls_length_semantics() const

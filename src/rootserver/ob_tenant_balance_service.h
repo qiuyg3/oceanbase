@@ -55,9 +55,13 @@ class ObTenantBalanceService : public ObTenantThreadHelper,
                            public logservice::ObIReplaySubHandler
 {
 public:
-  ObTenantBalanceService():inited_(false), loaded_(false), tenant_id_(OB_INVALID_TENANT_ID),
-                           primary_zone_num_(OB_INVALID_COUNT), ls_array_(),
-                           unit_group_array_() {}
+  ObTenantBalanceService()
+      : inited_(false),
+        loaded_(false),
+        tenant_id_(OB_INVALID_TENANT_ID),
+        primary_zone_num_(OB_INVALID_COUNT),
+        ls_array_(),
+        unit_group_array_() {}
   virtual ~ObTenantBalanceService() {}
   int init();
   void destroy();
@@ -80,7 +84,7 @@ public:
       ObIArray<share::ObSimpleUnitGroup> &unit_group_array);
   static int gather_ls_status_stat(const uint64_t &tenant_id, share::ObLSStatusInfoArray &ls_array);
   static int is_ls_balance_finished(const uint64_t &tenant_id, bool &is_finished);
-
+  static int lock_and_check_balance_job(common::ObMySQLTransaction &trans, const uint64_t tenant_id);
 private:
   static int is_primary_tenant_ls_balance_finished_(const uint64_t &tenant_id, bool &is_finished);
   static int is_standby_tenant_ls_balance_finished_(const uint64_t &tenant_id, bool &is_finished);
@@ -107,7 +111,6 @@ private:
                             ObArray<share::ObBalanceTask> &tasks,
                             common::ObMySQLTransaction &trans);
   int construct_dependency_of_each_task_(ObArray<share::ObBalanceTask> &tasks);
-  int lock_and_check_balance_job_(common::ObMySQLTransaction &trans, const uint64_t tenant_id);
   int try_update_job_comment_(const share::ObBalanceJob &job, const common::ObSqlString &comment);
   int try_do_partition_balance_(int64_t &last_partition_balance_time);
   int try_statistic_balance_group_status_(

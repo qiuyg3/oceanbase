@@ -13,8 +13,9 @@
 #ifndef OCEANBASE_SHARE_AGGREGATE_CTX_H_
 #define OCEANBASE_SHARE_AGGREGATE_CTX_H_
 
-#include "sql/engine/aggregate/ob_aggregate_processor.h"
+#include "share/aggregate/aggr_extra.h"
 #include "share/aggregate/util.h"
+#include "lib/roaringbitmap/ob_rb_utils.h"
 
 namespace oceanbase
 {
@@ -25,7 +26,8 @@ namespace aggregate
 using namespace sql;
 class AggBitVector;
 using AggrRowPtr = char *;
-using AggregateExtras = ObAggregateProcessor::ExtraResult **;
+using AggrRowPtrRef = char *&;
+using AggregateExtras = ExtraStores **;
 // examples of aggregate row:
 // with extra idx:
 //
@@ -196,6 +198,25 @@ struct RemovalInfo
   }
 };
 
+struct RollupContext
+{
+  RollupContext() : start_partial_rollup_idx_(0), end_partial_rollup_idx_(0)
+  {}
+  void reset()
+  {
+    start_partial_rollup_idx_ = 0;
+    end_partial_rollup_idx_ = 0;
+  }
+  inline void set_partial_rollup_idx(int64_t start, int64_t end)
+  {
+    start_partial_rollup_idx_ = start;
+    end_partial_rollup_idx_ = end;
+  }
+
+  int64_t start_partial_rollup_idx_; // rollup partial idx
+  int64_t end_partial_rollup_idx_;   // rollup partial idx
+};
+
 struct RuntimeContext
 {
   RuntimeContext(sql::ObEvalCtx &eval_ctx, uint64_t tenant_id, ObIArray<ObAggrInfo> &aggr_infos,
@@ -205,15 +226,16 @@ struct RuntimeContext
     allocator_(label, OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id, ObCtxIds::WORK_AREA),
     op_monitor_info_(nullptr), io_event_observer_(nullptr), agg_row_meta_(),
     agg_rows_(ModulePageAllocator(label, tenant_id, ObCtxIds::WORK_AREA)),
-    agg_extras_(ModulePageAllocator(label, tenant_id, ObCtxIds::WORK_AREA)),
-    removal_info_(), win_func_agg_(false)
+    agg_extras_(ModulePageAllocator(label, tenant_id, ObCtxIds::WORK_AREA)), removal_info_(),
+    win_func_agg_(false), hp_infras_mgr_(nullptr), rollup_context_(nullptr), distinct_count_(0),
+    flag_(0), rb_allocator_(nullptr)
   {}
 
   inline const AggrRowMeta &row_meta() const
   {
     return agg_row_meta_;
   }
-  inline ObAggregateProcessor::ExtraResult *&get_extra(const int64_t agg_col_id, const char *agg_cell)
+  inline ExtraStores *&get_extra_stores(const int64_t agg_col_id, const char *agg_cell)
   {
     OB_ASSERT(agg_col_id < agg_row_meta_.col_cnt_);
     OB_ASSERT(agg_cell != nullptr);
@@ -228,6 +250,31 @@ struct RuntimeContext
               && row_meta().extra_cnt_> agg_extra_id);
     return agg_extras_.at(extra_idx)[agg_extra_id];
   }
+
+  inline HashBasedDistinctVecExtraResult *&get_distinct_store(const int64_t agg_col_id,
+                                                                const char *agg_cell)
+  {
+    return get_extra_stores(agg_col_id, agg_cell)->distinct_extra_store;
+  }
+
+  inline DataStoreVecExtraResult *&get_extra_data_store(const int64_t agg_col_id,
+                                                          const char *agg_cell)
+  {
+    return get_extra_stores(agg_col_id, agg_cell)->data_store;
+  }
+
+  inline TopFreHistVecExtraResult *&get_extra_top_fre_hist_store(const int64_t agg_col_id,
+                                                                 const char *agg_cell)
+  {
+    return get_extra_stores(agg_col_id, agg_cell)->top_fre_hist_store_;
+  }
+
+  inline HybridHistVecExtraResult *&get_extra_hybrid_hist_store(const int64_t agg_col_id,
+                                                                const char* agg_cell)
+  {
+    return get_extra_stores(agg_col_id, agg_cell)->hybrid_hist_store_;
+  }
+
   ObAggrInfo &locate_aggr_info(const int64_t agg_col_idx)
   {
     OB_ASSERT(agg_col_idx < aggr_infos_.count());
@@ -300,6 +347,7 @@ struct RuntimeContext
       MEMCPY(agg_cell, src, data_len);
     }
   }
+
   void reuse()
   {
     agg_rows_.reuse();
@@ -307,11 +355,15 @@ struct RuntimeContext
       if (OB_NOT_NULL(agg_extras_.at(i))) {
         for (int j = 0; j < row_meta().extra_cnt_; j++) {
           if (OB_NOT_NULL(agg_extras_.at(i)[j])) {
-            agg_extras_.at(i)[j]->~ExtraResult();
+            agg_extras_.at(i)[j]->~ExtraStores();
           }
         } // end for
       }
     } // end for
+    // rb_allocator is alloced by allocator_
+    // can not reuse, so just free here
+    free_rb_allocator();
+    distinct_count_ = 0;
     agg_extras_.reuse();
     allocator_.reset_remain_one_page();
     removal_info_.reset();
@@ -322,11 +374,12 @@ struct RuntimeContext
       if (OB_NOT_NULL(agg_extras_.at(i))) {
         for (int j = 0; j < row_meta().extra_cnt_; j++) {
         if (OB_NOT_NULL(agg_extras_.at(i)[j])) {
-            agg_extras_.at(i)[j]->~ExtraResult();
+            agg_extras_.at(i)[j]->~ExtraStores();
           }
         } // end for
       }
     } // end for
+    free_rb_allocator();
     agg_rows_.reset();
     agg_extras_.reset();
     allocator_.reset();
@@ -335,6 +388,23 @@ struct RuntimeContext
     agg_row_meta_.reset();
     removal_info_.reset();
     win_func_agg_ = false;
+  }
+
+  void free_rb_allocator()
+  {
+    if (OB_NOT_NULL(rb_allocator_)) {
+      rb_allocator_->reset();
+      allocator_.free(rb_allocator_);
+      rb_allocator_ = nullptr;
+    }
+  }
+
+  ObRbAggAllocator* get_rb_allocator()
+  {
+    if (OB_ISNULL(rb_allocator_)) {
+      rb_allocator_ = OB_NEWx(ObRbAggAllocator, &allocator_, MTL_ID());
+    }
+    return rb_allocator_;
   }
 
   inline void enable_removal_opt()
@@ -352,6 +422,10 @@ struct RuntimeContext
   }
 
   int init_row_meta(ObIArray<ObAggrInfo> &aggr_infos, ObIAllocator &alloc);
+  bool has_extra() const { return has_extra_; }
+  bool need_advance_collect() const { return need_advance_collect_; }
+  bool is_in_window_func() const { return in_window_func_; }
+
   sql::ObEvalCtx &eval_ctx_;
   ObIArray<ObAggrInfo> &aggr_infos_;
   // used to allocate runtime data memory, such as rows for distinct extra.
@@ -365,6 +439,20 @@ struct RuntimeContext
     agg_extras_;
   RemovalInfo removal_info_;
   bool win_func_agg_;
+  ObHashPartInfrasVecMgr *hp_infras_mgr_;
+  RollupContext *rollup_context_;
+  uint32_t distinct_count_;
+  union {
+    uint16_t flag_;
+    struct {
+      uint16_t has_extra_ : 1;
+      uint16_t need_advance_collect_ : 1;
+      uint16_t in_window_func_ : 1;
+      uint16_t has_rollup_ : 1;
+      uint16_t reserved_ : 12;
+    };
+  };
+  ObRbAggAllocator *rb_allocator_;
 };
 
 /*
@@ -424,14 +512,17 @@ public:
                                                  const int32_t output_start_idx,
                                                  const int32_t expect_batch_size,
                                                  int32_t &output_size,
-                                                 const ObBitVector *skip = nullptr) = 0;
+                                                 const ObBitVector *skip = nullptr,
+                                                 const bool init_vector = true) = 0;
 
   inline virtual int collect_batch_group_results(RuntimeContext &agg_ctx,
                                                  const int32_t agg_col_id,
                                                  const int32_t output_start_idx,
                                                  const int32_t batch_size,
                                                  const ObCompactRow **rows,
-                                                 const RowMeta &row_meta) = 0;
+                                                 const RowMeta &row_meta,
+                                                 const int32_t row_start_idx = 0,
+                                                 const bool need_init_vector = true) = 0;
   inline virtual int add_batch_rows(RuntimeContext &agg_ctx,
                                     int32_t agg_col_idx,
                                     const sql::ObBitVector &skip, const sql::EvalBound &bound,
@@ -462,6 +553,13 @@ public:
   virtual void reuse() = 0;
 
   virtual void destroy() = 0;
+
+  virtual int rollup_aggregation(RuntimeContext &agg_ctx, const int32_t agg_col_idx,
+                                 AggrRowPtr group_row, AggrRowPtr rollup_row,
+                                 int64_t cur_rollup_group_idx,
+                                 int64_t max_group_cnt = INT64_MIN) = 0;
+  inline virtual int eval_group_extra_result(RuntimeContext &agg_ctx, const int32_t agg_col_id,
+                                             const int32_t cur_group_id) = 0;
   DECLARE_PURE_VIRTUAL_TO_STRING;
 };
 

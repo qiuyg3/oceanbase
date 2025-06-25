@@ -12,7 +12,6 @@
 #define USING_LOG_PREFIX SQL_REWRITE
 #include "sql/rewrite/ob_transform_decorrelate.h"
 #include "sql/rewrite/ob_transform_utils.h"
-#include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 namespace oceanbase {
 namespace sql {
@@ -491,17 +490,10 @@ int ObTransformDecorrelate::check_lateral_inline_view_validity(TableItem *table_
   } else if (check_status) {
     is_valid = false;
     OPT_TRACE("lateral inline view select expr contain subquery");
-  } else if (OB_FAIL(ObTransformUtils::is_join_conditions_correlated(table_item->exec_params_,
-                                                                     ref_query,
-                                                                     check_status))) {
-    LOG_WARN("failed to is joined table conditions correlated", K(ret));
-  } else if (check_status) {
-    is_valid = false;
-    OPT_TRACE("lateral inline view contain correlated on condition");
-  } else if (OB_FAIL(ObTransformUtils::is_table_item_correlated(table_item->exec_params_,
-                                                                *ref_query,
-                                                                check_status))) {
-    LOG_WARN("failed to check if subquery contain correlated subquery", K(ret));
+  } else if (OB_FAIL(ObTransformUtils::is_from_item_correlated(table_item->exec_params_,
+                                                               *ref_query,
+                                                               check_status))) {
+    LOG_WARN("failed to check if from items contains correlated subquery", K(ret));
   } else if (check_status) {
     is_valid = false;
     OPT_TRACE("lateral inline view contain correlated table item");
@@ -607,7 +599,7 @@ int ObTransformDecorrelate::do_transform_lateral_inline_view(ObDMLStmt *stmt,
       LOG_WARN("failed to adjust subquery list", K(ret));
     } else if (OB_FAIL(ref_query->adjust_subquery_list())) {
       LOG_WARN("failed to adjust subquery list", K(ret));
-    } else if (OB_FAIL(ref_query->formalize_stmt(ctx_->session_info_))) {
+    } else if (OB_FAIL(ref_query->formalize_stmt(ctx_->session_info_, false))) {
       LOG_WARN("formalize child stmt failed", K(ret));
     }
   }
@@ -698,7 +690,7 @@ int ObTransformDecorrelate::decorrelate_aggr_lateral_derived_table(ObDMLStmt *st
       LOG_WARN("failed to reset table_items", K(ret));
     } else if (OB_FAIL(stmt->get_joined_tables().assign(joined_table_list))) {
       LOG_WARN("failed to reset joined table container", K(ret));
-    } else if (OB_FAIL(stmt->formalize_stmt(ctx_->session_info_))) {
+    } else if (OB_FAIL(stmt->formalize_stmt(ctx_->session_info_, false))) {
       LOG_WARN("failed to formalize stmt", K(ret));
     } else {
       LOG_TRACE("succ to to do decorrelate aggr lateral inline view");

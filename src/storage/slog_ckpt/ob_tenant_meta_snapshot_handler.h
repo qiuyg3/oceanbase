@@ -15,6 +15,7 @@
 
 #include "storage/slog_ckpt/ob_linked_macro_block_struct.h"
 #include "storage/meta_mem/ob_tablet_map_key.h"
+#include "storage/meta_mem/ob_meta_obj_struct.h"
 #include "storage/ob_super_block_struct.h"
 #include "storage/ls/ob_ls_meta.h"
 #include "storage/tx/ob_dup_table_base.h"
@@ -107,7 +108,6 @@ private:
       const char *buf,
       const int64_t buf_len,
       ObIArray<ObUpdateTabletLog> &slog_array);
-  static int batch_report_slog(const ObIArray<ObStorageLogParam> &param_arr);
   static int do_write_slog(ObIArray<ObUpdateTabletLog> &slog_arr);
 };
 }

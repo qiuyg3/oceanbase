@@ -29,6 +29,8 @@
 #include "sql/engine/cmd/ob_table_direct_insert_ctx.h"
 #include "pl/ob_pl_package_guard.h"
 #include "lib/udt/ob_udt_type.h"
+#include "lib/udt/ob_collection_type.h"
+#include "sql/plan_cache/ob_adaptive_auto_dop.h"
 
 #define GET_PHY_PLAN_CTX(ctx) ((ctx).get_physical_plan_ctx())
 #define GET_MY_SESSION(ctx) ((ctx).get_my_session())
@@ -107,6 +109,32 @@ struct ObOperatorKit
   const ObOpSpec *spec_;
   ObOperator *op_;
   ObOpInput *input_;
+};
+
+struct ObDiagnosisManager
+{
+  ObDiagnosisManager() : cur_file_url_(NULL), cur_line_number_(0)
+  {
+    ObMemAttr attr(MTL_ID(), "DiagnosisMgr");
+    idxs_.set_attr(attr);
+    rets_.set_attr(attr);
+    col_names_.set_attr(attr);
+    allocator_.set_attr(attr);
+  }
+
+  void set_cur_file_url(ObString file_url) { cur_file_url_ = file_url; }
+  ObString get_cur_file_url() { return cur_file_url_; }
+  void set_cur_line_number(int64_t line_number) { cur_line_number_  = line_number; }
+  int64_t get_cur_line_number() { return cur_line_number_; }
+  int do_diagnosis(ObBitVector &skip, int64_t limit_num);
+  int add_warning_info(int err_ret, int line_idx);
+
+  common::ObArray<int64_t> idxs_;
+  common::ObArray<int64_t> rets_;
+  common::ObArray<ObString> col_names_;
+  ObString cur_file_url_;
+  int64_t cur_line_number_;
+  ObArenaAllocator allocator_;
 };
 
 // Physical operator kit store
@@ -192,6 +220,7 @@ public:
   void reset_expr_op();
   inline bool is_expr_op_ctx_inited() { return expr_op_size_ > 0 && NULL != expr_op_ctx_store_; }
   int get_convert_charset_allocator(common::ObArenaAllocator *&allocator);
+  int get_malloc_allocator(ObIAllocator *&allocator);
   void try_reset_convert_charset_allocator();
 
   void destroy_eval_allocator();
@@ -452,12 +481,13 @@ public:
 
   ObIArray<ObSqlTempTableCtx>& get_temp_table_ctx() { return temp_ctx_; }
 
-  int get_pwj_map(PWJTabletIdMap *&pwj_map);
-  PWJTabletIdMap *get_pwj_map() { return pwj_map_; }
-  void set_partition_id_calc_type(PartitionIdCalcType calc_type) { calc_type_ = calc_type; }
-  PartitionIdCalcType get_partition_id_calc_type() { return calc_type_; }
-  void set_fixed_id(ObObjectID fixed_id) { fixed_id_ = fixed_id; }
-  ObObjectID get_fixed_id() { return fixed_id_; }
+  int get_group_pwj_map(GroupPWJTabletIdMap *&group_pwj_map);
+  inline GroupPWJTabletIdMap *get_group_pwj_map() { return group_pwj_map_; }
+  int deep_copy_group_pwj_map(const GroupPWJTabletIdMap *src);
+  int64_t get_group_pwj_map_serialize_size() const;
+  int serialize_group_pwj_map(char *buf, const int64_t buf_len, int64_t &pos) const;
+  int deserialize_group_pwj_map(const char *buf, const int64_t data_len, int64_t &pos);
+
   const Ob2DArray<ObPxTabletRange> &get_partition_ranges() const { return part_ranges_; }
   int set_partition_ranges(const Ob2DArray<ObPxTabletRange> &part_ranges,
                            char *buf = NULL, int64_t max_size = 0);
@@ -497,11 +527,26 @@ public:
   void set_errcode(const int errcode) { ATOMIC_STORE(&errcode_, errcode); }
   int get_errcode() const { return ATOMIC_LOAD(&errcode_); }
   hash::ObHashMap<uint64_t, void*> &get_dblink_snapshot_map() { return dblink_snapshot_map_; }
-  int get_sqludt_meta_by_subschema_id(uint16_t subschema_id, ObSqlUDTMeta &udt_meta);
+  int get_sqludt_meta_by_subschema_id(uint16_t subschema_id, ObSqlUDTMeta &udt_meta) const;
+  int get_sqludt_meta_by_subschema_id(uint16_t subschema_id, ObSubSchemaValue &sub_meta) const;
   int get_subschema_id_by_udt_id(uint64_t udt_type_id,
                                  uint16_t &subschema_id,
                                  share::schema::ObSchemaGetterGuard *schema_guard = NULL);
-
+  int get_subschema_id_by_collection_elem_type(ObNestedType coll_type,
+                                               const ObDataType &elem_type,
+                                               uint16_t &subschema_id);
+  int get_subschema_id_by_type_string(const ObString &type_string, uint16_t &subschema_id);
+  int get_subschema_id_by_type_string(const ObString &type_string, uint16_t &subschema_id) const;
+  int get_enumset_meta_by_subschema_id(uint16_t subschema_id,
+                                       bool is_in_pl,
+                                       const ObEnumSetMeta *&meta) const;
+  bool support_enum_set_type_subschema(ObSQLSessionInfo &session);
+  int get_subschema_id_by_type_info(const ObObjMeta &obj_meta,
+                                    const ObIArray<common::ObString> &type_info,
+                                    uint16_t &subschema_id);
+  int get_subschema_id_by_type_info(const ObObjMeta &obj_meta,
+                                    const ObIArray<common::ObString> &type_info,
+                                    uint16_t &subschema_id) const;
   ObExecFeedbackInfo &get_feedback_info() { return fb_info_; };
   inline void set_cur_rownum(int64_t cur_rownum) { user_logging_ctx_.row_num_ = cur_rownum; }
   inline int64_t get_cur_rownum() const { return user_logging_ctx_.row_num_; }
@@ -519,8 +564,39 @@ public:
   int get_local_var_array(int64_t local_var_array_id, const ObSolidifiedVarsContext *&var_array);
   void set_is_online_stats_gathering(bool v) { is_online_stats_gathering_ = v; }
   bool is_online_stats_gathering() const { return is_online_stats_gathering_; }
+  void set_ddl_idempotent_autoinc_params(const int64_t table_slice_count,
+                                         const int64_t table_level_slice_idx,
+                                         const int64_t slice_row_idx,
+                                         const int64_t autoinc_range_interval)
+  {
+    table_all_slice_count_ = table_slice_count;
+    table_level_slice_idx_ = table_level_slice_idx;
+    slice_row_idx_ = slice_row_idx;
+    autoinc_range_interval_ = autoinc_range_interval;
+    is_ddl_idempotent_auto_inc_ = true;
+  }
+  bool is_ddl_idempotent_autoinc() { return is_ddl_idempotent_auto_inc_; }
+  int64_t get_table_all_slice_count() { return table_all_slice_count_; }
+  int64_t get_table_level_slice_idx() { return table_level_slice_idx_; }
+  int64_t get_slice_row_idx() { return slice_row_idx_; }
+  int64_t get_autoinc_range_interval() { return autoinc_range_interval_; }
 
   int get_lob_access_ctx(ObLobAccessCtx *&lob_access_ctx);
+  AutoDopHashMap& get_auto_dop_map() { return auto_dop_map_; }
+  void set_force_gen_local_plan() { force_local_plan_ = true; }
+  bool is_force_gen_local_plan() const { return force_local_plan_; }
+  void set_retry_info(const ObQueryRetryInfo *retry_info) { das_ctx_.get_location_router().set_retry_info(retry_info); }
+  bool is_use_adaptive_px_dop() const { return auto_dop_map_.size() > 0; }
+  ObQueryCtx *get_query_ctx()
+  {
+    ObQueryCtx *query_ctx = NULL;
+    if (OB_NOT_NULL(stmt_factory_)) {
+      query_ctx = stmt_factory_->get_query_ctx();
+    }
+    return query_ctx;
+  }
+
+  ObDiagnosisManager& get_diagnosis_manager() { return diagnosis_manager_; }
 
 private:
   int build_temp_expr_ctx(const ObTempExpr &temp_expr, ObTempExprCtx *&temp_expr_ctx);
@@ -648,11 +724,9 @@ protected:
 
   // just for convert charset in query response result
   lib::MemoryContext convert_allocator_;
+  lib::MemoryContext mem_context_;
   PWJTabletIdMap* pwj_map_;
-  // the following two parameters only used in calc_partition_id expr
-  PartitionIdCalcType calc_type_;
-  ObObjectID fixed_id_;    // fixed part id or fixed subpart ids
-
+  GroupPWJTabletIdMap *group_pwj_map_;
   // sample result
   Ob2DArray<ObPxTabletRange> part_ranges_;
   int64_t check_status_times_;
@@ -700,9 +774,20 @@ protected:
   ObUserLoggingCtx user_logging_ctx_;
   // for online stats gathering
   bool is_online_stats_gathering_;
+
+  // for calculating idempotent auto increment value in DDL
+  bool is_ddl_idempotent_auto_inc_;
+  int64_t table_all_slice_count_;
+  int64_t table_level_slice_idx_;
+  int64_t slice_row_idx_;
+  int64_t autoinc_range_interval_;
+
   //---------------
 
   ObLobAccessCtx *lob_access_ctx_;
+  AutoDopHashMap auto_dop_map_;
+  bool force_local_plan_;
+  ObDiagnosisManager diagnosis_manager_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExecContext);
 };

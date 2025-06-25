@@ -11,15 +11,8 @@
  */
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
-#include "lib/container/ob_array_serialization.h"
 #include "ob_error_info.h"
-#include "ob_schema_getter_guard.h"
 #include "lib/oblog/ob_warning_buffer.h"
-#include "lib/mysqlclient/ob_mysql_transaction.h"
-#include "lib/string/ob_sql_string.h"
-#include "share/ob_dml_sql_splicer.h"
-#include "share/schema/ob_schema_utils.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "observer/ob_server_struct.h"
 
 namespace oceanbase
@@ -447,7 +440,10 @@ int ObErrorInfo::handle_error_info(const IObErrorInfo *info,
   ObMySQLTransaction trans;
   if (OB_FAIL(collect_error_info(info, obj_type))) {
     LOG_WARN("collect error info failed", K(ret));
-  } else if (OB_FAIL(trans.start(GCTX.sql_proxy_, get_tenant_id(), true))) {
+  } else if (!MTL_TENANT_ROLE_CACHE_IS_PRIMARY()) {
+    // do nothing
+  }
+  else if (OB_FAIL(trans.start(GCTX.sql_proxy_, get_tenant_id(), true))) {
     LOG_WARN("fail start trans", K(ret));
   } else if (OB_FAIL(handle_error_info(trans, info, obj_type))) {
     LOG_WARN("handle error info failed.", K(ret));
@@ -462,7 +458,8 @@ int ObErrorInfo::handle_error_info(const IObErrorInfo *info,
   return ret;
 }
 
-int ObErrorInfo::delete_error(const IObErrorInfo *info)
+int ObErrorInfo::delete_error(const IObErrorInfo *info,
+                              const ObObjectType obj_type)
 {
   int ret = OB_SUCCESS;
   ObMySQLProxy *sql_proxy = nullptr;
@@ -471,7 +468,7 @@ int ObErrorInfo::delete_error(const IObErrorInfo *info)
   } else if (OB_ISNULL(sql_proxy = GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    if (OB_FAIL(collect_error_info(info, NULL, true))) {
+    if (OB_FAIL(collect_error_info(info, NULL, true, obj_type))) {
       LOG_WARN("collect error info failed.", K(ret), K(info), K(*this));
     } else {
       if (OB_FAIL(del_error(sql_proxy))) {

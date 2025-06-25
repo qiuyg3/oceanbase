@@ -48,7 +48,7 @@ public:
                                     l.ptr_, l.len_, l.is_null(),
                                     r.ptr_, r.len_, r.is_null(),
                                     cmp_res);
-    // when compare new comming data with origin data, we always want maintan the smaller one.
+    // when compare new coming data with origin data, we always want maintain the smaller one.
     if (!is_ascending_) {
       cmp_res = -cmp_res;
     }
@@ -67,7 +67,7 @@ public:
 public:
   // in join scene, the join cond is T1.a=T2.b, sometimes a and b are not same type but not need to
   // cast if the sql with order by T1.a, the topn filter can pushdown to T2.b, but the compare info
-  // is differnet in build stage and filter stage
+  // is different in build stage and filter stage
   ObTopNFilterCmpMeta build_meta_;
   ObTopNFilterCmpMeta filter_meta_;
   bool is_ascending_;
@@ -102,7 +102,7 @@ public:
   ObP2PDatahubMsgBase::ObP2PDatahubMsgType dh_msg_type_;
   uint32_t expr_ctx_id_;
   bool is_shared_; // whether the filter is shared in sql level
-  bool is_shuffle_; // whether need shuffle topn msg between differnet dfos
+  bool is_shuffle_; // whether need shuffle topn msg between different dfos
   int64_t max_batch_size_;
   double adaptive_filter_ratio_;
   TO_STRING_KV(K(enabled_), K(p2p_dh_id_), K(dh_msg_type_), K(expr_ctx_id_), K(is_shared_),
@@ -121,7 +121,7 @@ public:
   }
   int init(const ObPushDownTopNFilterInfo *pd_topn_filter_info, uint64_t tenant_id,
            const ObIArray<ObSortFieldCollation> *sort_collations, ObExecContext *exec_ctx,
-           int64_t px_seq_id);
+           int64_t px_seq_id, bool is_fetch_with_ties);
   int destroy();
   int assign(const ObP2PDatahubMsgBase &src_msg) override;
   int deep_copy_msg(ObP2PDatahubMsgBase *&dest_msg) override;
@@ -174,7 +174,10 @@ private:
     if (OB_FAIL(compare(col_idx, datum, cmp_res))) {
       SQL_LOG(WARN, "fail to compare", K(ret));
     } else if (cmp_res == 0) {
-      if (col_idx == total_sk_cnt_ - 1) {
+      if (is_fetch_with_ties_) {
+        // still need output duplicate rows
+        cmp_res = -1;
+      } else if (col_idx == total_sk_cnt_ - 1) {
         // this arg is the last one of sort key, we can directly filter
         cmp_res = 1;
       } else if (col_idx == heap_top_datums_.count() - 1) {
@@ -206,6 +209,7 @@ private:
   ObFixedArray<ObDatum, common::ObIAllocator> heap_top_datums_;
   ObFixedArray<int64_t, common::ObIAllocator> cells_size_;
   int64_t data_version_;
+  bool is_fetch_with_ties_;
 };
 
 } // end namespace sql

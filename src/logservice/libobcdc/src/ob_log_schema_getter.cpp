@@ -16,13 +16,9 @@
 
 #include "ob_log_schema_getter.h"
 
-#include "lib/mysqlclient/ob_mysql_server_provider.h"     // ObMySQLServerProvider
-#include "share/config/ob_common_config.h"                // ObCommonConfig
-#include "share/ob_get_compat_mode.h"                     // ObCompatModeGetter
 #include "share/inner_table/ob_inner_table_schema.h"      // OB_CORE_SCHEMA_VERSION
 
 #include "ob_log_utils.h"                                 // is_mysql_client_errno
-#include "ob_log_common.h"                                // GET_SCHEMA_TIMEOUT_ON_START_UP
 #include "ob_log_config.h"                                // TCONF
 
 // NOTICE: retry will exist if func return error code OB_TENANT_HAS_BEEN_DROPPED
@@ -773,7 +769,7 @@ int ObLogSchemaGetter::refresh_to_expected_version_(
 
   if (OB_SUCC(ret)) {
     // If the tenant version is invalid, or if the desired schema version is not reached, then a refresh of the schema is requested
-    LOG_INFO("[SCHEMA_GETTER] begin refresh schema to expected version", K(tenant_id), K(expected_version), K(latest_version));
+    LOG_TRACE("[SCHEMA_GETTER] begin refresh schema to expected version", K(tenant_id), K(expected_version), K(latest_version));
     bool need_refresh_schema = (OB_INVALID_VERSION == latest_version || latest_version < expected_version);
     const static int64_t retry_print_interval = 10 * _SEC_;
 
@@ -790,7 +786,7 @@ int ObLogSchemaGetter::refresh_to_expected_version_(
       need_refresh_schema = (OB_SUCCESS == ret) && ((OB_INVALID_VERSION == latest_version) || (specify_version_mode && latest_version < expected_version));
     }
     int64_t cost_time = get_timestamp() - start_time;
-    LOG_INFO("[SCHEMA_GETTER] refresh schema to expected version", KR(ret), K(tenant_id),
+    LOG_TRACE("[SCHEMA_GETTER] refresh schema to expected version", KR(ret), K(tenant_id),
         K(latest_version), K(expected_version), "delta", latest_version - expected_version,
         "latest_version", TS_TO_STR(latest_version),
         "cost_time", TVAL_TO_STR(cost_time));

@@ -14,10 +14,7 @@
 
 #include "sql/engine/sort/ob_sort_vec_op.h"
 #include "sql/engine/aggregate/ob_hash_groupby_op.h"
-#include "sql/engine/aggregate/ob_hash_groupby_vec_op.h"
-#include "sql/engine/basic/ob_temp_row_store.h"
 #include "sql/engine/px/ob_px_util.h"
-#include "sql/engine/window_function/ob_window_function_op.h"
 #include "sql/engine/expr/ob_expr_topn_filter.h"
 
 namespace oceanbase
@@ -29,14 +26,14 @@ ObSortVecSpec::ObSortVecSpec(common::ObIAllocator &alloc, const ObPhyOperatorTyp
   sk_exprs_(alloc), addon_exprs_(alloc), sk_collations_(alloc), addon_collations_(alloc),
   minimum_row_count_(0), topk_precision_(0), prefix_pos_(0), is_local_merge_sort_(false),
   is_fetch_with_ties_(false), prescan_enabled_(false), enable_encode_sortkey_opt_(false),
-  has_addon_(false), part_cnt_(0), pd_topn_filter_info_(alloc)
+  has_addon_(false), part_cnt_(0), pd_topn_filter_info_(alloc), enable_single_col_compare_opt_(false)
 {}
 
 OB_SERIALIZE_MEMBER((ObSortVecSpec, ObOpSpec), topn_expr_, topk_limit_expr_, topk_offset_expr_,
                     sk_exprs_, addon_exprs_, sk_collations_, addon_collations_, minimum_row_count_,
                     topk_precision_, prefix_pos_, is_local_merge_sort_, is_fetch_with_ties_,
                     prescan_enabled_, enable_encode_sortkey_opt_, has_addon_, part_cnt_, compress_type_,
-                    pd_topn_filter_info_);
+                    pd_topn_filter_info_, enable_single_col_compare_opt_);
 
 ObSortVecOp::ObSortVecOp(ObExecContext &ctx_, const ObOpSpec &spec, ObOpInput *input) :
   ObOperator(ctx_, spec, input), sort_op_provider_(op_monitor_info_), sort_row_count_(0),
@@ -203,6 +200,8 @@ int ObSortVecOp::process_sort_batch()
     if (OB_ITER_END == ret) {
       ret = OB_SUCCESS;
     }
+    op_monitor_info_.otherstat_7_id_ = ObSqlMonitorStatIds::ROW_COUNT;
+    op_monitor_info_.otherstat_7_value_ = sort_row_count_;
     OZ(sort_op_provider_.sort());
     sort_op_provider_.collect_memory_dump_info(op_monitor_info_);
   }
@@ -219,7 +218,7 @@ int ObSortVecOp::init_temp_row_store(const common::ObIArray<ObExpr *> &exprs,
   const bool reorder_fixed_expr = true;
   if (row_store.is_inited()) {
     // do nothing
-  } else if (OB_FAIL(row_store.init(exprs, batch_size, mem_attr, 2 * 1024 * 1024, true,
+  } else if (OB_FAIL(row_store.init(exprs, batch_size, mem_attr, 16 * 1024, true,
                              sort_op_provider_.get_extra_size(is_sort_key) /* row_extra_size */,
                              compress_type, reorder_fixed_expr, enable_trunc))) {
     LOG_WARN("init row store failed", K(ret));
@@ -295,18 +294,13 @@ int ObSortVecOp::get_next_batch_prescan_store(const int64_t max_rows, int64_t &r
       LOG_WARN("failed to get batch row");
     }
   } else if (MY_SPEC.has_addon_) {
-    int64_t addon_max_read_rows = sk_read_rows;
     int64_t addon_read_rows = 0;
-    while (OB_SUCC(ret) && addon_max_read_rows > 0) {
-      addon_read_rows = 0;
-      if (OB_FAIL(addon_row_iter_.get_next_batch(addon_max_read_rows, addon_read_rows,
-                  addon_stored_rows + (sk_read_rows - addon_max_read_rows)))) {
-        if (OB_ITER_END != ret) {
-          LOG_WARN("failed to get batch row");
-        }
-      } else {
-        addon_max_read_rows -= addon_read_rows;
-      }
+    if (OB_FAIL(addon_row_iter_.get_next_batch(sk_read_rows, addon_read_rows, addon_stored_rows))) {
+      LOG_WARN("failed to get batch row");
+    } else if (sk_read_rows != addon_read_rows) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("The count of sk rows does not match the add-on rows.", K(ret),
+        K(sk_read_rows), K(addon_read_rows));
     }
   }
   if (OB_SUCC(ret)) {
@@ -344,19 +338,20 @@ int ObSortVecOp::scan_all_then_sort_batch()
     if (OB_ITER_END == ret) {
       ret = OB_SUCCESS;
     }
+    op_monitor_info_.otherstat_7_id_ = ObSqlMonitorStatIds::ROW_COUNT;
+    op_monitor_info_.otherstat_7_value_ = sort_row_count_;
     if (OB_SUCC(ret)) {
       if (OB_FAIL(finish_add_prescan_store())) {
         LOG_WARN("failed to finish add prescan store", K(ret));
       } else {
-        const ObCompactRow *sk_rows[MY_SPEC.max_batch_size_];
-        const ObCompactRow *addon_rows[MY_SPEC.max_batch_size_];
+        constexpr int64_t MAX_BATCH_SIZE = 256;
+        const ObCompactRow *sk_rows[MAX_BATCH_SIZE];
+        const ObCompactRow *addon_rows[MAX_BATCH_SIZE];
+        int64_t max_batch_size = min(256, MY_SPEC.max_batch_size_);
         int64_t read_rows = -1;
-        if (MY_SPEC.has_addon_) {
-          addon_row_iter_.set_blk_holder(&blk_holder_);
-        }
         while (OB_SUCC(ret)) {
           if (OB_FAIL(
-                get_next_batch_prescan_store(MY_SPEC.max_batch_size_, read_rows, &sk_rows[0],
+                get_next_batch_prescan_store(max_batch_size, read_rows, &sk_rows[0],
                                              MY_SPEC.has_addon_ ? &addon_rows[0] : nullptr))) {
             if (OB_ITER_END != ret) {
               LOG_WARN("failed to get next batch", K(ret));
@@ -367,7 +362,6 @@ int ObSortVecOp::scan_all_then_sort_batch()
           }
         }
         if (MY_SPEC.has_addon_) {
-          blk_holder_.release();
           addon_row_iter_.reset();
           addon_row_store_.reset();
         }
@@ -405,6 +399,7 @@ int ObSortVecOp::init_sort(int64_t tenant_id, int64_t row_count, int64_t topn_cn
   context.eval_ctx_ = &eval_ctx_;
   context.exec_ctx_ = &ctx_;
   context.enable_encode_sortkey_ = MY_SPEC.enable_encode_sortkey_opt_;
+  context.enable_single_col_compare_ = MY_SPEC.enable_single_col_compare_opt_;
   context.topn_cnt_ = topn_cnt;
   context.is_fetch_with_ties_ = MY_SPEC.is_fetch_with_ties_;
   context.has_addon_ = MY_SPEC.has_addon_;
@@ -465,6 +460,10 @@ int ObSortVecOp::inner_get_next_batch(const int64_t max_row_cnt)
     } else {
       ret_row_count_ += brs_.size_;
       if (brs_.end_) {
+        if (ctx_.get_my_session()->get_ddl_info().is_ddl() && ret_row_count_ != sort_row_count_) {
+          ret = OB_CHECKSUM_ERROR;
+          LOG_WARN("output row count not match", K(ret), K(sort_row_count_), K(ret_row_count_));
+        }
         LOG_DEBUG("finish ObSortVecOp::inner_get_next_batch", K(MY_SPEC.output_), K(brs_),
                   K(ret_row_count_));
       }

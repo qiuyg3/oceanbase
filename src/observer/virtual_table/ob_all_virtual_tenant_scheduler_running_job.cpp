@@ -10,11 +10,8 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "lib/string/ob_string.h"
-#include "share/config/ob_server_config.h"
 #include "observer/virtual_table/ob_all_virtual_tenant_scheduler_running_job.h"
 #include "observer/ob_server.h"
-#include "sql/session/ob_sql_session_info.h"
 
 using namespace oceanbase::common;
 namespace oceanbase
@@ -151,6 +148,15 @@ int ObAllVirtualTenantSchedulerRunningJob::FillScanner::operator()(
           cur_row_->cells_[cell_idx].set_null();
           break;
         }
+        case JOB_CLASS: {
+          if (OB_NOT_NULL(sess_info->get_job_info())) {
+            cur_row_->cells_[cell_idx].set_varchar(sess_info->get_job_info()->get_job_class());
+            cur_row_->cells_[cell_idx].set_collation_type(default_collation);
+          } else {
+            cur_row_->cells_[cell_idx].set_null();
+          }
+          break;
+        }
         case JOB_STYLE: {
           cur_row_->cells_[cell_idx].set_null();
           break;
@@ -160,7 +166,7 @@ int ObAllVirtualTenantSchedulerRunningJob::FillScanner::operator()(
           break;
         }
         case SESSION_ID: {
-          cur_row_->cells_[cell_idx].set_uint64(static_cast<uint64_t>(sess_info->get_sessid()));
+          cur_row_->cells_[cell_idx].set_uint64(static_cast<uint64_t>(sess_info->get_server_sid()));
           break;
         }
         case SLAVE_PROCESS_ID: {

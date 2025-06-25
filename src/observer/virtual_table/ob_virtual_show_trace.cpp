@@ -14,13 +14,8 @@
  * ---------------------------------------------------------------------------------------
  */
 #define USING_LOG_PREFIX SERVER
-#include "observer/virtual_table/ob_virtual_span_info.h"
 #include "observer/ob_sql_client_decorator.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/trace/ob_trace.h"
 #include "observer/virtual_table/ob_virtual_show_trace.h"
-#include "lib/mysqlclient/ob_mysql_transaction.h"
-#include "observer/ob_server_struct.h"
 #include "sql/session/ob_sql_session_info.h"
 
 using namespace oceanbase::common;
@@ -109,7 +104,7 @@ int ObVirtualShowTrace::retrive_all_span_info()
                            effective_tenant_id_,
                            trace_id.ptr());
       LOG_TRACE("send inner sql to retrive records", KP(session_), K(session_->get_proxy_sessid()),
-                                                     K(session_->get_sessid()), K(table_name),
+                                                     K(session_->get_server_sid()), K(table_name),
                                                      K(tenant_id_), K(trace_id_), K(trace_id),
                                                      K(effective_tenant_id_), K(ObString(sql_len, sql)));
       if (sql_len >= OB_MAX_SQL_LENGTH || sql_len <= 0) {

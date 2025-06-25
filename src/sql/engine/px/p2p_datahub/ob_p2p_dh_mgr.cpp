@@ -16,7 +16,6 @@
 #include "sql/engine/px/p2p_datahub/ob_runtime_filter_msg.h"
 #include "sql/engine/px/p2p_datahub/ob_runtime_filter_vec_msg.h"
 #include "sql/engine/px/p2p_datahub/ob_pushdown_topn_filter_msg.h"
-#include "lib/rc/context.h"
 #include "sql/engine/px/ob_px_sqc_proxy.h"
 #include "share/ob_rpc_share.h"
 #include "share/detect/ob_detect_manager_utils.h"
@@ -249,14 +248,14 @@ int ObP2PDatahubManager::generate_p2p_dh_id(int64_t &p2p_dh_id)
   // generate p2p dh id
   // |    <16>     |      <28>     |     20
   //    server_id       timestamp     sequence
-  if (!is_valid_server_id(GCTX.server_id_)) {
+  const uint64_t server_index = GCTX.get_server_index();
+  if (OB_UNLIKELY(!is_valid_server_index(server_index))) {
     ret = OB_SERVER_IS_INIT;
-    LOG_WARN("server id is unexpected", K(ret));
+    LOG_WARN("server index is unexpected", KR(ret), K(server_index));
   } else {
-    const uint64_t svr_id = GCTX.server_id_;
     int64_t ts = (common::ObTimeUtility::current_time() / 1000000) << 20;
     int64_t seq_id = ATOMIC_AAF(&p2p_dh_id_, 1);
-    p2p_dh_id = (ts & 0x0000FFFFFFFFFFFF) | (svr_id << 48) | seq_id;
+    p2p_dh_id = (ts & 0x0000FFFFFFFFFFFF) | (server_index << 48) | seq_id;
   }
   return ret;
 }
@@ -282,7 +281,7 @@ int ObP2PDatahubManager::send_p2p_msg(
       LOG_WARN("fail to copy msg", K(ret));
     } else if (OB_ISNULL(new_msg)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpeceted new msg", K(ret));
+      LOG_WARN("unexpected new msg", K(ret));
     }
     if (OB_SUCC(ret)) {
       ObP2PDatahubMsgGuard guard(new_msg);

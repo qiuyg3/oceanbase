@@ -124,6 +124,7 @@ enum ObLogBaseType
 
   // for workload repository service
   WORKLOAD_REPOSITORY_SERVICE_LOG_BASE_TYPE = 38,
+
   TTL_LOG_BASE_TYPE = 39,
 
   // for table load resource manager
@@ -151,6 +152,35 @@ enum ObLogBaseType
   SHARE_STORAGE_PUBLIC_BLOCK_GC_SERVICE_LOG_BASE_TYPE = 47,
 #endif
 
+  // for vector index
+  VEC_INDEX_LOG_BASE_TYPE = 48,
+
+  // for table lock split
+  TABLE_LOCK_LOG_BASE_TYPE = 49,
+
+  // for DBMS_SCHEDULER GC
+  DBMS_SCHEDULER_GC_LOG_BASE_TYPE = 50,
+#ifdef  OB_BUILD_SHARED_STORAGE
+  // for sswriter of shared storage
+  SHARED_STORAGE_SSWRITER_LOG_BASE_TYPE = 51,
+#endif
+
+  // for new DDL scheduler
+  SYS_DDL_SCHEDULER_LOG_BASE_TYPE = 52,
+
+  // for tenant disaster recovery
+  DISASTER_RECOVERY_SERVICE_LOG_BASE_TYPE = 53,
+
+  // for new DDL service
+  DDL_SERVICE_LAUNCHER_LOG_BASE_TYPE = 54,
+#ifdef  OB_BUILD_SHARED_STORAGE
+  // storage cache policy
+  STORAGE_CACHE_POLICY_LOG_BASE_TYPE = 55,
+  // for sslog gts service
+  SSLOG_GTS_LOG_BASE_TYPE = 56,
+  // for sslog uid service
+  SSLOG_UID_LOG_BASE_TYPE = 57,
+#endif
   // pay attention!!!
   // add log type in log_base_type_to_string
   // max value
@@ -257,10 +287,46 @@ int log_base_type_to_string(const ObLogBaseType log_type,
     strncpy(str, "MVIEW_MAINTENANCE_SERVICE_LOG_BASE_TYPE", str_len);
   } else if (log_type == SHARE_STORAGE_NRT_THROT_LOG_BASE_TYPE) {
     strncpy(str ,"SHARE_STORAGE_NRT_THROT_SERVICE", str_len);
+  } else if (log_type == TABLE_LOCK_LOG_BASE_TYPE) {
+    strncpy(str ,"TABLE_LOCK", str_len);
   } else if (log_type == SHARED_STORAGE_PRE_WARM_LOG_BASE_TYPE) {
     strncpy(str ,"SHARED_STORAGE_PRE_WARM_LOG_BASE_TYPE", str_len);
+#ifdef OB_BUILD_SHARED_STORAGE
+  } else if (log_type == SHARE_STORAGE_PUBLIC_BLOCK_GC_SERVICE_LOG_BASE_TYPE) {
+    strncpy(str ,"PUBLIC_BLOCK_GC_SERVICE", str_len);
+  } else if (log_type == SHARED_STORAGE_SSWRITER_LOG_BASE_TYPE) {
+    strncpy(str ,"SSWRITER_LS_HANDLER", str_len);
+#endif
+  } else if (log_type == TABLE_LOCK_LOG_BASE_TYPE) {
+    strncpy(str, "TABLE_LOCK_LOG_BASE_TYPE", str_len);
+  } else if (log_type == VEC_INDEX_LOG_BASE_TYPE) {
+    strncpy(str ,"VEC_INDEX_SERVICE", str_len);
+  } else if (log_type == DBMS_SCHEDULER_LOG_BASE_TYPE) {
+    strncpy(str ,"DBMS_SCHEDULER", str_len);
+  } else if (log_type == DBMS_SCHEDULER_GC_LOG_BASE_TYPE) {
+    strncpy(str ,"DBMS_SCHEDULER_GC", str_len);
+#ifdef OB_BUILD_SHARED_STORAGE
+  } else if (log_type == SHARED_STORAGE_SSWRITER_LOG_BASE_TYPE) {
+    strncpy(str ,"SHARED_STORAGE_SSWRITER", str_len);
+#endif
+  } else if (log_type == SYS_DDL_SCHEDULER_LOG_BASE_TYPE) {
+    strncpy(str ,"SYS_DDL_SCHEDULER", str_len);
+  } else if (log_type == DISASTER_RECOVERY_SERVICE_LOG_BASE_TYPE) {
+    strncpy(str ,"DISASTER_RECOVERY_SERVICE", str_len);
+  } else if (log_type == DDL_SERVICE_LAUNCHER_LOG_BASE_TYPE) {
+    strncpy(str ,"DDL_SERVICE_LAUNCHER", str_len);
+#ifdef OB_BUILD_SHARED_STORAGE
+  } else if (log_type == SSLOG_GTS_LOG_BASE_TYPE) {
+    strncpy(str ,"SSLOG_GTS", str_len);
+  } else if (log_type == SSLOG_UID_LOG_BASE_TYPE) {
+    strncpy(str ,"SSLOG_UID", str_len);
+#endif
   } else {
     ret = OB_INVALID_ARGUMENT;
+  }
+
+  if (str_len > 0) {
+    str[str_len - 1] = '\0';
   }
   return ret;
 }

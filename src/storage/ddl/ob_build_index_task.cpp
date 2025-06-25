@@ -12,25 +12,13 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_build_index_task.h"
-#include "lib/utility/ob_tracepoint.h"
-#include "share/ob_dml_sql_splicer.h"
 #include "share/ob_ddl_checksum.h"
 #include "share/ob_ddl_error_message_table_operator.h"
-#include "share/ob_get_compat_mode.h"
-#include "share/ob_ddl_task_executor.h"
 #include "share/schema/ob_tenant_schema_service.h"
 #include "share/ob_ddl_sim_point.h"
 #include "share/scheduler/ob_dag_warning_history_mgr.h"
-#include "storage/compaction/ob_column_checksum_calculator.h"
-#include "storage/ddl/ob_ddl_redo_log_writer.h"
-#include "storage/ddl/ob_complement_data_task.h"
-#include "storage/ob_i_table.h"
-#include "observer/ob_server_struct.h"
 #include "observer/ob_server_event_history_table_operator.h"
-#include "storage/blocksstable/ob_datum_row.h"
-#include "storage/ob_sstable_struct.h"
 #include "storage/tx_storage/ob_ls_service.h"
-#include "storage/tx/ob_trans_service.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::storage;
@@ -104,14 +92,13 @@ int ObUniqueIndexChecker::calc_column_checksum(
     STORAGE_LOG(WARN, "fail to reserve column", K(ret), K(column_cnt));
   } else {
     const ObDatumRow *row = NULL;
-    const ObDatumRow *unused_row = nullptr;
     for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
       if (OB_FAIL(column_checksum.push_back(0))) {
         STORAGE_LOG(WARN, "fail to push back column checksum", K(ret));
       }
     }
     while (OB_SUCC(ret)) {
-      if (OB_FAIL(iterator.get_next_row(row, unused_row))) {
+      if (OB_FAIL(iterator.get_next_row(row))) {
         if (OB_ITER_END == ret) {
           ret = OB_SUCCESS;
           break;
@@ -156,7 +143,6 @@ int ObUniqueIndexChecker::scan_table_with_column_checksum(
     } else if (OB_FAIL(DDL_SIM(tenant_id_, task_id_, UNIQUE_INDEX_CHECKER_SCAN_TABLE_WITH_CHECKSUM_FAILED))) {
       LOG_WARN("ddl sim failure", K(ret), K(tenant_id_), K(task_id_));
     } else {
-      transaction::ObTransService *trans_service = nullptr;
       ObTabletTableIterator iterator;
       ObQueryFlag query_flag(ObQueryFlag::Forward,
           false, /* daily merge*/
@@ -173,10 +159,7 @@ int ObUniqueIndexChecker::scan_table_with_column_checksum(
       ObLSHandle ls_handle;
       range.set_whole_range();
 
-      if (OB_ISNULL(trans_service = MTL(transaction::ObTransService*))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("trans_service is null", K(ret));
-      } else if (OB_FAIL(MTL(ObLSService *)->get_ls(ls_id_, ls_handle, ObLSGetMod::DDL_MOD))) {
+      if (OB_FAIL(MTL(ObLSService *)->get_ls(ls_id_, ls_handle, ObLSGetMod::DDL_MOD))) {
         LOG_WARN("fail to get log stream", K(ret), K(ls_id_));
       } else if (OB_UNLIKELY(nullptr == ls_handle.get_ls())) {
         ret = OB_ERR_UNEXPECTED;
@@ -184,16 +167,20 @@ int ObUniqueIndexChecker::scan_table_with_column_checksum(
       } else if (OB_FAIL(ls_handle.get_ls()->get_tablet_svr()->get_read_tables(tablet_id_,
                                                                                ObTabletCommon::DEFAULT_GET_TABLET_DURATION_US,
                                                                                param.snapshot_version_,
-                                                                               iterator, allow_not_ready))) {
+                                                                               param.snapshot_version_,
+                                                                               iterator, allow_not_ready,
+                                                                               false/*need_split_src_table*/,
+                                                                               false/*need_split_dst_table*/))) {
         if (OB_REPLICA_NOT_READABLE == ret) {
           ret = OB_EAGAIN;
         } else {
           LOG_WARN("snapshot version has been discarded", K(ret));
         }
       } else if (OB_FAIL(local_scan.init(*param.col_ids_, *param.org_col_ids_, *param.output_projector_,
-              *param.data_table_schema_, param.snapshot_version_, trans_service, *param.index_schema_, true/*output org cols only*/))) {
+              *param.data_table_schema_, param.snapshot_version_, *param.index_schema_,
+              true/*unique_index_checking*/))) {
         LOG_WARN("init local scan failed", K(ret));
-      } else if (OB_FAIL(local_scan.table_scan(*param.data_table_schema_, ls_id_, tablet_id_, iterator, query_flag, range, nullptr))) {
+      } else if (OB_FAIL(local_scan.table_scan(*param.data_table_schema_, ls_id_, tablet_id_, iterator, query_flag, range))) {
         LOG_WARN("fail to table scan", K(ret));
       } else {
         const ObColDescIArray &out_cols = *param.org_col_ids_;
@@ -544,7 +531,7 @@ int ObUniqueIndexChecker::check_unique_index(ObIDag *dag)
         LOG_WARN("fail to get log stream", K(ret), K(ls_id_));
       } else if (OB_FAIL(ObDDLUtil::ddl_get_tablet(ls_handle, tablet_id_, tablet_handle_))) {
         LOG_WARN("fail to get tablet", K(ret), K(tablet_id_), K(tablet_handle_));
-      } else if (index_schema_->is_fts_index()) {
+      } else if (index_schema_->is_fts_index() || index_schema_->is_vec_index()) {
         STORAGE_LOG(INFO, "do not need to check unique for domain index", "index_id", index_schema_->get_table_id());
       } else {
         if (OB_FAIL(ret)) {
@@ -576,6 +563,9 @@ int ObUniqueIndexChecker::check_unique_index(ObIDag *dag)
         } else {
           LOG_INFO("get task id failed, but retry to get it", K(ret), K(tmp_ret), KPC(index_schema_));
         }
+      } else if (OB_UNLIKELY(task_id_ != info.task_id_)) {
+        keep_report_err_msg = false;
+        LOG_INFO("get task id mismatched, check whether index building task is cancled", K(ret), K(task_id_), K(info.task_id_));
       } else if (OB_SUCCESS != (tmp_ret = ObDDLErrorMessageTableOperator::generate_index_ddl_error_message(
           ret, *index_schema_, info.trace_id_str_, info.task_id_, info.parent_task_id_, tablet_id_.id(), self_addr, *GCTX.sql_proxy_, "\0", report_ret_code))) {
         LOG_WARN("fail to generate index ddl error message", K(ret), K(tmp_ret), KPC(index_schema_), K(tablet_id_), K(self_addr));
@@ -831,8 +821,13 @@ int ObUniqueCheckingDag::fill_dag_key(char *buf, const int64_t buf_len) const
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     STORAGE_LOG(WARN, "not inited", K(ret));
-  } else if (OB_FAIL(databuff_printf(buf, buf_len, "tablet_id=%s index_id=%ld", to_cstring(tablet_id_), index_id))) {
-    STORAGE_LOG(WARN, "failed to fill dag key", K(ret), K(tablet_id_), K(index_id));
+  }
+  else {
+    int64_t pos = 0;
+    if (OB_FAIL(databuff_print_multi_objs(buf, buf_len, pos,
+        "tablet_id=", tablet_id_, " index_id=", index_id))) {
+      STORAGE_LOG(WARN, "failed to fill dag key", K(ret), K(tablet_id_), K(index_id), K(pos));
+    }
   }
   return ret;
 }

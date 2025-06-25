@@ -762,7 +762,7 @@ def add_shadow_pk_column(keywords, rowkey_id, column):
 
 def add_index_columns(columns, **keywords):
   rowkey_id = 1
-  is_unique_index = keywords['index_type'] == 'INDEX_TYPE_UNIQUE_LOCAL'
+  is_unique_index = keywords['index_type'] == 'INDEX_TYPE_UNIQUE_LOCAL' or keywords['index_type'] == 'INDEX_TYPE_HEAP_ORGANIZED_TABLE_PRIMARY'
   max_used_column_idx = 1
   if is_unique_index:
     # specified index columns.
@@ -1110,7 +1110,7 @@ def replace_agent_table_columns_def(columns):
       t = "otimestamp"
     elif t == "otimestamp":
       pass
-    elif t == "longtext":
+    elif t in ("longtext", "longblob"):
       pass
     elif t.startswith("varchar:") or t.startswith("varbinary:"):
       if len(column) >= 4 and "false" == column[2] and "" == column[3]:

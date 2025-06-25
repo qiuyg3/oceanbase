@@ -139,6 +139,8 @@ public:
   int64_t repart_pruning_tsc_idx_;
   // for runtime filter extract query range
   ObPxRFStaticInfo px_rf_info_;
+  bool hash_part_;
+  bool enable_adaptive_task_splitting_;
 };
 
 class ObGranuleIteratorOp : public ObOperator
@@ -164,6 +166,7 @@ private:
       rescan_tasks_map_.destroy();
     }
     int insert_rescan_task(int64_t pos, const ObGranuleTaskInfo &info);
+    int64_t get_rescan_task_count() const { return use_opt_ ? rescan_tasks_map_.size() : rescan_tasks_pos_.count(); }
     // use opt means partition_pruning is enabled and pos of task of each tablet is recorded in rescan_tasks_map_.
     bool use_opt_;
     common::ObSEArray<int64_t, OB_MIN_PARALLEL_TASK_COUNT * 2> rescan_tasks_pos_;
@@ -190,12 +193,12 @@ public:
 
   virtual OperatorOpenOrder get_operator_open_order() const override
   { return OPEN_SELF_FIRST; }
-  int get_next_granule_task(bool prepare = false);
+  int get_next_granule_task(bool prepare = false, bool round_robin = false);
 private:
   int parameters_init();
   // 非full partition wise获得task的方式
   // TODO: jiangting.lk 重构下函数名字
-  int try_fetch_task(ObGranuleTaskInfo &info);
+  int try_fetch_task(ObGranuleTaskInfo &info, bool round_robin);
   int get_next_task_pos(int64_t &pos, const ObGITaskSet *&taskset);
   int pw_get_next_task_pos(const common::ObIArray<int64_t> &op_ids);
   /**
@@ -208,7 +211,7 @@ private:
   int fetch_full_pw_tasks(ObIArray<ObGranuleTaskInfo> &infos, const ObIArray<int64_t> &op_ids);
   int try_fetch_tasks(ObIArray<ObGranuleTaskInfo> &infos, const ObIArray<const ObTableScanSpec *> &tscs);
   int try_get_rows(const int64_t max_row_cnt);
-  int do_get_next_granule_task(bool &partition_pruning);
+  int do_get_next_granule_task(bool &partition_pruning, bool round_robin);
   int prepare_table_scan();
   bool is_not_init() { return state_ == GI_UNINITIALIZED; }
   // 获得消费GI task的node：
@@ -276,7 +279,7 @@ private:
   common::ObSEArray<ObGranuleTaskInfo, 2> pwj_rescan_task_infos_;
   // for px batch rescan and dynamic partition pruning
   common::ObSEArray<uint64_t, 2> table_location_keys_;
-  common::ObSEArray<int64_t, 16> pruning_partition_ids_;
+  common::ObSEArray<ObTabletID, 16> pruning_tablet_ids_;
    //for partition pruning
   int64_t filter_count_; // filtered part count when part pruning activated
   int64_t total_count_; // total partition count or block count processed, rescan included
@@ -291,6 +294,8 @@ private:
   bool is_parallel_rf_qr_extracted_; // parallel runtime filter query range extracted
   ObSEArray<ObP2PDhKey, 2> query_range_rf_keys_;
   ObSEArray<ObP2PDatahubMsgBase *, 2> query_range_rf_msgs_;
+  ObGranuleSplitterType splitter_type_;
+  ObGranulePumpArgs *pump_arg_;
 };
 
 } // end namespace sql

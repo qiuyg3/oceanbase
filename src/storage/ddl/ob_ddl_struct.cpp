@@ -12,15 +12,9 @@
 
 #define USING_LOG_PREFIX STORAGE
 
-#include "storage/ls/ob_ls.h"
-#include "storage/ddl/ob_ddl_struct.h"
+#include "ob_ddl_struct.h"
 #include "storage/ddl/ob_tablet_ddl_kv.h"
-#include "storage/ddl/ob_tablet_ddl_kv_mgr.h"
-#include "storage/tablet/ob_tablet.h"
-#include "storage/blocksstable/ob_block_manager.h"
-#include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
 #include "storage/ddl/ob_direct_insert_sstable_ctx_new.h"
-#include "storage/ob_i_table.h"
 
 using namespace oceanbase::storage;
 using namespace oceanbase::blocksstable;
@@ -58,7 +52,7 @@ int ObDDLMacroHandle::set_block_id(const blocksstable::MacroBlockId &block_id)
     LOG_WARN("invalid argument", K(ret));
   } else if (OB_FAIL(reset_macro_block_ref())) {
     LOG_WARN("reset macro block reference failed", K(ret), K(block_id_));
-  } else if (OB_FAIL(OB_SERVER_BLOCK_MGR.inc_ref(block_id))) {
+  } else if (OB_FAIL(OB_STORAGE_OBJECT_MGR.inc_ref(block_id))) {
     LOG_ERROR("failed to increase macro block ref cnt", K(ret), K(block_id));
   } else {
     block_id_ = block_id;
@@ -70,7 +64,7 @@ int ObDDLMacroHandle::reset_macro_block_ref()
 {
   int ret = OB_SUCCESS;
   if (block_id_.is_valid()) {
-    if (OB_FAIL(OB_SERVER_BLOCK_MGR.dec_ref(block_id_))) {
+    if (OB_FAIL(OB_STORAGE_OBJECT_MGR.dec_ref(block_id_))) {
       LOG_ERROR("failed to dec macro block ref cnt", K(ret), K(block_id_));
     } else {
       block_id_.reset();
@@ -85,11 +79,14 @@ ObDDLMacroBlock::ObDDLMacroBlock()
     block_type_(DDL_MB_INVALID_TYPE),
     ddl_start_scn_(SCN::min_scn()),
     scn_(SCN::min_scn()),
-    buf_(nullptr),
-    size_(0),
     table_key_(),
     end_row_id_(-1),
-    trans_id_()
+    trans_id_(),
+    data_macro_meta_(nullptr),
+    buf_(nullptr),
+    size_(0),
+    merge_slice_idx_(0),
+    seq_no_()
 {
 }
 
@@ -104,13 +101,9 @@ int ObDDLMacroBlock::deep_copy(ObDDLMacroBlock &dst_block, common::ObIAllocator 
   if (OB_UNLIKELY(!is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(ret), K(*this));
-  } else if (OB_ISNULL(tmp_buf = allocator.alloc(size_))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("allocate memory for macro block buffer failed", K(ret));
+  } else if (OB_FAIL(data_macro_meta_->deep_copy(dst_block.data_macro_meta_, allocator))) {
+    LOG_WARN("failed to copy", K(ret));
   } else {
-    memcpy(tmp_buf, buf_, size_);
-    dst_block.buf_ = reinterpret_cast<const char*>(tmp_buf);
-    dst_block.size_ = size_;
     dst_block.block_type_ = block_type_;
     dst_block.block_handle_ = block_handle_;
     dst_block.logic_id_ = logic_id_;
@@ -118,19 +111,75 @@ int ObDDLMacroBlock::deep_copy(ObDDLMacroBlock &dst_block, common::ObIAllocator 
     dst_block.scn_ = scn_;
     dst_block.table_key_ = table_key_;
     dst_block.end_row_id_ = end_row_id_;
+    dst_block.buf_ = nullptr;
+    dst_block.size_ = 0;
+    dst_block.merge_slice_idx_ = merge_slice_idx_;
+    dst_block.trans_id_ = trans_id_;
+    dst_block.seq_no_ = seq_no_;
+  }
+
+  if (OB_FAIL(ret) || !GCTX.is_shared_storage_mode() || ObDDLMacroBlockType::DDL_MB_INDEX_TYPE != block_type_) {
+    /* if fail or not shared storage, skip copy buf*/
+  } else if (OB_ISNULL(tmp_buf = allocator.alloc(size_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory for macro block buffer failed", K(ret));
+  } else {
+    memcpy(tmp_buf, buf_, size_);
+    dst_block.buf_ = static_cast<const char*>(tmp_buf);
+    dst_block.size_ = size_;
+  }
+  return ret;
+}
+
+int ObDDLMacroBlock::set_data_macro_meta(const MacroBlockId &macro_id, const char* macro_block_buf, const int64_t size, const ObDDLMacroBlockType &block_type,
+                                         const bool force_set_macro_meta)
+{
+  int ret = OB_SUCCESS;
+  if (!macro_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), K(macro_id));
+  } else if (ObDDLMacroBlockType::DDL_MB_SS_EMPTY_DATA_TYPE == block_type) {
+    /* skip no logging type, not need to set meta*/
+  } else if (nullptr == macro_block_buf || 0 >= size) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(macro_block_buf), K(size));
+  } else {
+    /* shared nothing need macro_meta*/
+    if (GCTX.is_shared_storage_mode() && !force_set_macro_meta) {
+    } else if (OB_FAIL(ObIndexBlockRebuilder::get_macro_meta(macro_block_buf, size, macro_id, allocator_, data_macro_meta_))) {
+      LOG_WARN("failed to set macro meta", K(ret),  K(macro_id), KP(macro_block_buf), K(size));
+    }
+
+    /* shared nothing need buf*/
+    void *tmp_buf = nullptr;
+    if (OB_FAIL(ret)) {
+    } else if (ObDDLMacroBlockType::DDL_MB_INDEX_TYPE != block_type || !GCTX.is_shared_storage_mode()) {
+      /* skip only index need deep copy*/
+    } else if (nullptr != buf_) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("buf should be null when set maro meta", K(ret), K(ret));
+    } else if (OB_ISNULL(tmp_buf = static_cast<char*>(allocator_.alloc(size)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail to allocate mem", K(ret), K(size));
+    } else {
+      memcpy(tmp_buf, macro_block_buf, size);
+      buf_ = static_cast<char*>(tmp_buf);
+      size_ = size;
+    }
   }
   return ret;
 }
 
 bool ObDDLMacroBlock::is_valid() const
 {
-  return block_handle_.get_block_id().is_valid()
-    && logic_id_.is_valid()
-    && DDL_MB_INVALID_TYPE != block_type_
-    && ddl_start_scn_.is_valid_and_not_min()
-    && scn_.is_valid_and_not_min()
-    && nullptr != buf_
-    && size_ > 0;
+  bool ret =  block_handle_.get_block_id().is_valid()
+              && DDL_MB_INVALID_TYPE != block_type_
+              && ddl_start_scn_.is_valid_and_not_min()
+              && scn_.is_valid_and_not_min();
+  if (!GCTX.is_shared_storage_mode()) {
+    ret = ret && logic_id_.is_valid() && nullptr != data_macro_meta_ && data_macro_meta_->is_valid();
+  }
+  return ret;
 }
 
 bool ObDDLMacroBlock::is_column_group_info_valid() const
@@ -150,6 +199,15 @@ ObDDLKVHandle &ObDDLKVHandle::operator =(const ObDDLKVHandle &other)
     }
   }
   return *this;
+}
+
+DEF_TO_STRING(ObDDLKVHandle)
+{
+  int64_t pos = 0;
+  J_OBJ_START();
+  J_KV(KPC_(ddl_kv), KP_(t3m), KP_(allocator));
+  J_OBJ_END();
+  return pos;
 }
 
 bool ObDDLKVHandle::is_valid() const
@@ -224,21 +282,44 @@ void ObDDLKVHandle::reset()
   allocator_ = nullptr;
 }
 
-ObDDLKVPendingGuard::ObDDLKVPendingGuard(ObTablet *tablet, const SCN &scn, const SCN &start_scn,
-  ObTabletDirectLoadMgrHandle &direct_load_mgr_handle)
+ObDDLKVPendingGuard::ObDDLKVPendingGuard(
+    ObTablet *tablet,
+    const SCN &scn,
+    const SCN &start_scn,
+    const int64_t snapshot_version, // used for shared-storage mode.
+    const uint64_t data_format_version, // used for shared-storage mode.
+    ObTabletDirectLoadMgrHandle &direct_load_mgr_handle)
   : tablet_(tablet), scn_(scn), kv_handle_(), ret_(OB_SUCCESS)
 {
   int ret = OB_SUCCESS;
   ObDDLKV *curr_kv = nullptr;
   ObDDLKvMgrHandle ddl_kv_mgr_handle;
-  if (OB_UNLIKELY(nullptr == tablet || !scn.is_valid_and_not_min() || !direct_load_mgr_handle.is_valid())) {
+  if (OB_UNLIKELY(nullptr == tablet
+      || !scn.is_valid_and_not_min()
+      || !start_scn.is_valid_and_not_min()
+      || snapshot_version <= 0
+      || data_format_version <= 0)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid arguments", K(ret), KP(tablet), K(scn), KPC(direct_load_mgr_handle.get_obj()));
-  } else if (OB_FAIL(tablet->get_ddl_kv_mgr(ddl_kv_mgr_handle))) {
-    LOG_WARN("get ddl kv mgr failed", K(ret));
-  } else if (OB_FAIL(ddl_kv_mgr_handle.get_obj()->get_or_create_ddl_kv(
-    scn, start_scn, direct_load_mgr_handle, kv_handle_))) {
-    LOG_WARN("acquire ddl kv failed", K(ret));
+    LOG_WARN("invalid arguments", K(ret), KP(tablet), K(scn), K(start_scn), K(snapshot_version), K(data_format_version));
+#ifdef OB_BUILD_SHARED_STORAGE
+  } else if (ObDDLUtil::use_idempotent_mode(data_format_version)) {
+    if (OB_FAIL(tablet->get_ddl_kv_mgr(ddl_kv_mgr_handle, true/*try_create*/))) {
+      LOG_WARN("get ddl kv mgr failed", K(ret));
+    } else if (OB_FAIL(ddl_kv_mgr_handle.get_obj()->get_or_create_shared_storage_ddl_kv(
+        scn, start_scn, snapshot_version, data_format_version, kv_handle_))) {
+      LOG_WARN("acquire ddl kv failed", K(ret));
+    }
+#endif
+  } else {
+    if (OB_FAIL(tablet->get_ddl_kv_mgr(ddl_kv_mgr_handle))) {
+      LOG_WARN("get ddl kv mgr failed", K(ret));
+    } else if (OB_FAIL(ddl_kv_mgr_handle.get_obj()->get_or_create_shared_nothing_ddl_kv(
+        scn, start_scn, direct_load_mgr_handle, kv_handle_))) {
+      LOG_WARN("acquire ddl kv failed", K(ret));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(curr_kv = kv_handle_.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("error unexpected, active ddl kv must not be nullptr", K(ret));
@@ -293,7 +374,8 @@ int ObDDLKVPendingGuard::set_macro_block(
     int64_t try_count = 0;
     while ((OB_SUCCESS == ret || OB_EAGAIN == ret) && try_count < MAX_RETRY_COUNT) {
       ObDDLKV *ddl_kv = nullptr;
-      ObDDLKVPendingGuard guard(tablet, macro_block.scn_, macro_block.ddl_start_scn_, direct_load_mgr_handle);
+      ObDDLKVPendingGuard guard(tablet, macro_block.scn_, macro_block.ddl_start_scn_,
+          snapshot_version, data_format_version, direct_load_mgr_handle);
       if (OB_FAIL(guard.get_ddl_kv(ddl_kv))) {
         LOG_WARN("get ddl kv failed", K(ret));
       } else if (OB_ISNULL(ddl_kv)) {
@@ -321,7 +403,13 @@ ObDDLMacroBlockRedoInfo::ObDDLMacroBlockRedoInfo()
     data_format_version_(0/*for compatibility*/),
     end_row_id_(-1),
     type_(ObDirectLoadType::DIRECT_LOAD_INVALID),
-    trans_id_()
+    trans_id_(),
+    with_cs_replica_(false),
+    macro_block_id_(MacroBlockId::mock_valid_macro_id()),
+    parallel_cnt_(0),
+    cg_cnt_(0),
+    merge_slice_idx_(0),
+    seq_no_()
 {
 }
 
@@ -336,19 +424,57 @@ void ObDDLMacroBlockRedoInfo::reset()
   end_row_id_ = -1;
   type_ = ObDirectLoadType::DIRECT_LOAD_INVALID;
   trans_id_.reset();
+  with_cs_replica_ = false;
+  macro_block_id_ = MacroBlockId::mock_valid_macro_id();
+  parallel_cnt_ = 0;
+  cg_cnt_ = 0;
+  merge_slice_idx_ = 0;
+  seq_no_.reset();
 }
 
 bool ObDDLMacroBlockRedoInfo::is_valid() const
 {
-  return table_key_.is_valid() && data_buffer_.ptr() != nullptr && block_type_ != ObDDLMacroBlockType::DDL_MB_INVALID_TYPE
-         && logic_id_.is_valid() && start_scn_.is_valid_and_not_min() && data_format_version_ >= 0
-         && type_ < ObDirectLoadType::DIRECT_LOAD_MAX
-         && (is_incremental_direct_load(type_) ? trans_id_.is_valid() : !trans_id_.is_valid());
+  bool ret = table_key_.is_valid() && block_type_ != ObDDLMacroBlockType::DDL_MB_INVALID_TYPE
+              && start_scn_.is_valid_and_not_min() && data_format_version_ >= 0 && macro_block_id_.is_valid()
+              // the type is default invalid, allow default value for compatibility
+              && type_ >= ObDirectLoadType::DIRECT_LOAD_INVALID && type_ < ObDirectLoadType::DIRECT_LOAD_MAX;
+  if (ret && is_incremental_direct_load(type_)) {
+    ret = logic_id_.is_valid() && trans_id_.is_valid();
+  }
+
+  if (ret && ObDDLMacroBlockType::DDL_MB_SS_EMPTY_DATA_TYPE != block_type_){
+    /* when in ss empty type, nullptr is allowded*/
+    ret = ret && !((data_buffer_.ptr() == nullptr || data_buffer_.length() == 0));
+  }
+
+  if (ret && !GCTX.is_shared_storage_mode()) {  /* for shared nothing */
+    ret = logic_id_.is_valid();
+  #ifdef OB_BUILD_SHARED_STORAGE
+  } else if (ret && GCTX.is_shared_storage_mode()) { /* for shared storage*/
+    ret = ret && (parallel_cnt_ > 0 && cg_cnt_ >0);
+  #endif
+  }
+  return ret;
 }
 
 bool ObDDLMacroBlockRedoInfo::is_column_group_info_valid() const
 {
   return table_key_.is_column_store_sstable() && end_row_id_ >= 0;
+}
+
+bool ObDDLMacroBlockRedoInfo::is_not_compat_cs_replica() const
+{
+  return !with_cs_replica_;
+}
+
+bool ObDDLMacroBlockRedoInfo::is_cs_replica_row_store() const
+{
+  return with_cs_replica_ && !table_key_.is_column_store_sstable();
+}
+
+bool ObDDLMacroBlockRedoInfo::is_cs_replica_column_store() const
+{
+  return with_cs_replica_ && table_key_.is_column_store_sstable();
 }
 
 OB_SERIALIZE_MEMBER(ObDDLMacroBlockRedoInfo,
@@ -360,7 +486,13 @@ OB_SERIALIZE_MEMBER(ObDDLMacroBlockRedoInfo,
                     data_format_version_,
                     end_row_id_,
                     type_,
-                    trans_id_);
+                    trans_id_,
+                    with_cs_replica_,
+                    macro_block_id_,
+                    parallel_cnt_,
+                    cg_cnt_,
+                    merge_slice_idx_,
+                    seq_no_);
 
 ObTabletDirectLoadMgrHandle::ObTabletDirectLoadMgrHandle()
   : tablet_mgr_(nullptr)
@@ -432,3 +564,43 @@ int ObTabletDirectLoadMgrHandle::assign(const ObTabletDirectLoadMgrHandle &other
   }
   return ret;
 }
+
+#ifdef OB_BUILD_SHARED_STORAGE
+ObDDLFinishLogInfo::ObDDLFinishLogInfo()
+ : ls_id_(), table_key_(), data_buffer_(), macro_block_id_()
+{
+}
+
+bool ObDDLFinishLogInfo::is_valid() const
+{
+  return ls_id_.is_valid() && table_key_.is_valid() && data_buffer_.ptr() != nullptr
+         &&  macro_block_id_.is_valid() && data_format_version_ >= 0 ;
+}
+
+void ObDDLFinishLogInfo::reset()
+{
+  ls_id_.reset();
+  table_key_.reset();
+  data_buffer_.reset();
+  macro_block_id_.reset();
+  data_format_version_ = 0;
+}
+
+int ObDDLFinishLogInfo::assign(const ObDDLFinishLogInfo &other)
+{
+  int ret = OB_SUCCESS;
+  if (!other.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(other));
+  } else {
+    ls_id_ = other.ls_id_;
+    table_key_ = other.table_key_;
+    macro_block_id_ = other.macro_block_id_;
+    data_buffer_ = other.data_buffer_;
+    data_format_version_ = other.data_format_version_;
+  }
+  return ret;
+}
+
+OB_SERIALIZE_MEMBER(ObDDLFinishLogInfo, ls_id_, table_key_, data_buffer_, macro_block_id_, data_format_version_);
+#endif

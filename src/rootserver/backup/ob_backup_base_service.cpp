@@ -9,8 +9,6 @@
 // See the Mulan PubL v2 for more details.
 #define USING_LOG_PREFIX RS
 #include "ob_backup_base_service.h"
-#include "observer/ob_sql_client_decorator.h"
-#include "share/backup/ob_backup_data_table_operator.h"
 #include "logservice/ob_log_service.h"
 
 using namespace oceanbase;
@@ -132,6 +130,7 @@ void ObBackupBaseService::idle()
   if (has_set_stop() || wakeup_cnt_ > 0) {
     wakeup_cnt_ = 0;
   } else {
+    ObBKGDSessInActiveGuard inactive_guard;
     thread_cond_.wait_us(interval_idle_time_us_);
   }
 }

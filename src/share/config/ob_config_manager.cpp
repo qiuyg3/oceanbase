@@ -12,17 +12,9 @@
 
 #define USING_LOG_PREFIX SHARE
 
-#include "share/config/ob_config_manager.h"
 
-#include "lib/file/file_directory_utils.h"
-#include "lib/profile/ob_trace_id.h"
-#include "lib/thread/thread_mgr.h"
-#include "share/ob_cluster_version.h"
-#include "lib/worker.h"
+#include "ob_config_manager.h"
 #include "observer/ob_sql_client_decorator.h"
-#include "observer/ob_server_struct.h"
-#include "observer/omt/ob_tenant_config_mgr.h"
-#include "lib/utility/ob_tracepoint.h"
 #include "observer/ob_server.h"
 
 namespace oceanbase
@@ -105,6 +97,8 @@ int ObConfigManager::reload_config()
     LOG_WARN("reload config for tde encrypt engine fail", K(ret));
   } else if (OB_FAIL(GCTX.omt_->update_hidden_sys_tenant())) {
     LOG_WARN("update hidden sys tenant failed", K(ret));
+  } else {
+    g_enable_ob_error_msg_style = GCONF.enable_ob_error_msg_style;
   }
   return ret;
 }
@@ -144,7 +138,7 @@ int ObConfigManager::load_config(const char *path)
       ret = OB_BUF_NOT_ENOUGH;
       LOG_ERROR("Config file is too long", K(path), K(ret));
     } else {
-      ret = server_config_.deserialize_with_compat(buf, len, pos);
+      ret = server_config_.deserialize(buf, len, pos);
     }
     if (OB_FAIL(ret)) {
       LOG_ERROR("Deserialize server config failed", K(path), K(ret));
@@ -207,7 +201,7 @@ int ObConfigManager::check_header_change(const char* path, const char* buf) cons
   return ret;
 }
 
-int ObConfigManager::dump2file(const char* path) const
+int ObConfigManager::dump2file_unsafe(const char* path) const
 {
   int ret = OB_SUCCESS;
   int fd = 0;
@@ -314,6 +308,12 @@ int ObConfigManager::dump2file(const char* path) const
   return ret;
 }
 
+int ObConfigManager::dump2file(const char* path) const
+{
+  DRWLock::RDLockGuard guard(OTC_MGR.rwlock_);
+  return dump2file_unsafe(path);
+}
+
 int ObConfigManager::config_backup()
 {
   int ret = OB_SUCCESS;
@@ -327,7 +327,7 @@ int ObConfigManager::config_backup()
           LOG_ERROR("create additional configure directory fail", K(path), K(ret));
         } else if (STRLEN(path) + STRLEN(CONF_COPY_NAME) < static_cast<uint64_t>(MAX_PATH_SIZE)) {
           strcat(path, CONF_COPY_NAME);
-          if (OB_FAIL(dump2file(path))) {
+          if (OB_FAIL(dump2file_unsafe(path))) {
             LOG_WARN("make additional configure file copy fail", K(path), K(ret));
             ret = OB_SUCCESS;  // ignore ret code.
           }
@@ -356,8 +356,13 @@ int ObConfigManager::update_local(int64_t expected_version)
           "from __all_sys_parameter";
       if (OB_FAIL(sql_client_retry_weak.read(result, sqlstr))) {
         LOG_WARN("read config from __all_sys_parameter failed", K(sqlstr), K(ret));
-      } else if (OB_FAIL(system_config_.update(result))) {
-        LOG_WARN("failed to load system config", K(ret));
+      } else {
+        DRWLock::WRLockGuard guard(OTC_MGR.rwlock_);
+        if (OB_FAIL(system_config_.update(result))) {
+          LOG_WARN("failed to load system config", K(ret));
+        }
+      }
+      if (OB_FAIL(ret)) {
       } else if (expected_version != ObSystemConfig::INIT_VERSION && (system_config_.get_version() < current_version_
                  || system_config_.get_version() < expected_version)) {
         ret = OB_EAGAIN;
@@ -382,7 +387,7 @@ int ObConfigManager::update_local(int64_t expected_version)
       LOG_WARN("Reload configuration failed", K(ret));
     } else {
       DRWLock::RDLockGuard guard(OTC_MGR.rwlock_); // need protect tenant config because it will also serialize tenant config
-      if (OB_FAIL(dump2file())) {
+      if (OB_FAIL(dump2file_unsafe())) {
         LOG_WARN("Dump to file failed", K_(dump_path), K(ret));
       } else {
         GCONF.cluster.set_dumped_version(GCONF.cluster.version());

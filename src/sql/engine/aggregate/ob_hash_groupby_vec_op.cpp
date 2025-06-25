@@ -14,10 +14,6 @@
 
 #include "sql/engine/aggregate/ob_hash_groupby_vec_op.h"
 #include "sql/engine/px/ob_px_util.h"
-#include "observer/omt/ob_tenant_config_mgr.h"
-#include "lib/charset/ob_charset.h"
-#include "src/sql/engine/expr/ob_expr_util.h"
-#include "src/sql/engine/basic/ob_hp_infras_vec_op.h"
 
 namespace oceanbase
 {
@@ -82,6 +78,11 @@ void ObHashGroupByVecOp::reset(bool for_rescan)
   by_pass_batch_size_ = 0;
   force_by_pass_ = false;
   by_pass_vec_holder_.reset();
+  by_pass_rows_ = 0;
+  total_load_rows_ = 0;
+  popular_map_.reuse();
+  popular_array_temp_.reuse();
+  stores_mgr_.reset();
   reorder_aggr_rows_ = eval_ctx_.max_batch_size_ >= MIN_BATCH_SIZE_REORDER_AGGR_ROWS
                            && MY_SPEC.aggr_stage_ != ObThreeStageAggrStage::THIRD_STAGE;
 }
@@ -91,6 +92,8 @@ int ObHashGroupByVecOp::inner_open()
   int ret = OB_SUCCESS;
   reset(false);
   void *store_row_buf = nullptr;
+  ObMemAttr bucket_attr(MTL_ID(), "GbyPMapBkt");
+  ObMemAttr node_attr(MTL_ID(), "GbyPMapBktNod");
   if (OB_FAIL(BaseClass::inner_open())) {
     LOG_WARN("failed to inner_open", K(ret));
   } else if (OB_FAIL(init_mem_context())) {
@@ -168,8 +171,7 @@ int ObHashGroupByVecOp::inner_open()
                 MY_SPEC.id_,
                 use_sstr_aggr_,
                 aggr_processor_.get_aggregate_row_size() + sizeof(int64_t),
-                init_size,
-                true))) {
+                init_size))) {
       LOG_WARN("fail to init hash map", K(ret));
     } else if (OB_FAIL(sql_mem_processor_.update_used_mem_size(get_mem_used_size()))) {
       LOG_WARN("fail to update_used_mem_size", "size", get_mem_used_size(), K(ret));
@@ -194,6 +196,8 @@ int ObHashGroupByVecOp::inner_open()
                      && GCONF.is_sql_operator_dump_enabled());
       op_monitor_info_.otherstat_1_value_ = init_size;
       op_monitor_info_.otherstat_1_id_ = ObSqlMonitorStatIds::HASH_INIT_BUCKET_COUNT;
+      op_monitor_info_.otherstat_4_value_ = 0;
+      op_monitor_info_.otherstat_4_id_ = ObSqlMonitorStatIds::HASH_POPULAR_MAP_SIZE;
       omt::ObTenantConfigGuard tenant_config(TENANT_CONF(
                                         ctx_.get_my_session()->get_effective_tenant_id()));
       if (tenant_config.is_valid()) {
@@ -210,6 +214,43 @@ int ObHashGroupByVecOp::inner_open()
         K(aggr_processor_.get_aggregate_row_size()));
     }
     if (OB_SUCC(ret)) {
+      skew_detection_enabled_ = bypass_ctrl_.by_pass_ctrl_enabled_ && MY_SPEC.skew_detection_enabled_ && !force_by_pass_;
+      if (skew_detection_enabled_) {
+        popular_array_temp_.set_block_allocator(
+                  ModulePageAllocator(mem_context_->get_malloc_allocator(),
+                  "PopularTopN"));
+        null_hash_func_for_expr_.set_allocator(&mem_context_->get_allocator());
+        hash_func_for_expr_.set_allocator(&mem_context_->get_allocator());
+        if (OB_FAIL(popular_map_.create(SKEW_HEAP_SIZE * 2, bucket_attr, node_attr))) {
+          LOG_WARN("failed to init popular_map_", K(ret));
+        } else if (OB_FAIL(popular_array_temp_.prepare_allocate(SKEW_HEAP_SIZE))) {
+          LOG_WARN("failed to prepare allocate popular_array_temp_", K(ret));
+        } else if (OB_FAIL(null_hash_func_for_expr_.prepare_allocate(all_groupby_exprs_.count()))) {
+          LOG_WARN("failed to prepare allocate null_hash_func_for_expr_", K(ret));
+        } else if (OB_FAIL(hash_func_for_expr_.prepare_allocate(all_groupby_exprs_.count()))) {
+          LOG_WARN("failed to prepare allocate hash_func_for_expr_", K(ret));
+        } else {
+          for (int i = 0; i < all_groupby_exprs_.count() && OB_SUCC(ret); i++) {
+            NullHashFuncTypeForTc null_hash_func = NULL;
+            HashFuncTypeForTc hash_func = NULL;
+            const sql::ObDatumMeta &l_meta = all_groupby_exprs_.at(i)->datum_meta_;
+            VecValueTypeClass l_tc = get_vec_value_tc(l_meta.type_, l_meta.scale_,
+                                                        l_meta.precision_);
+            if (OB_ISNULL(null_hash_func = get_null_hashfunc_by_tc(l_tc))) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("unexpected null_hash_func", K(null_hash_func), K(l_tc), K(i), K(ret));
+            } else if (OB_ISNULL(hash_func = get_hashfunc_by_tc(l_tc))) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("unexpected hash_func", K(hash_func), K(l_tc), K(i), K(ret));
+            } else {
+              null_hash_func_for_expr_.at(i) = null_hash_func;
+              hash_func_for_expr_.at(i) = hash_func;
+            }
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
       int64_t max_size = MY_SPEC.max_batch_size_;
       int64_t mem_size = max_size
                            * (sizeof(ObCompactRow *)
@@ -219,7 +260,7 @@ int ObHashGroupByVecOp::inner_open()
                               + sizeof(aggregate::AggrRowPtr *)
                               + sizeof(aggregate::AggrRowPtr *)
                               + sizeof(ObCompactRow *)
-                              + sizeof(uint16_t))
+                              + 2 * sizeof(uint16_t))
                          + sizeof(ObIVector *) * MY_SPEC.aggr_infos_.count()
                          + ObBitVector::memory_size(max_size);
       char *buf = (char *)mem_context_->get_arena_allocator().alloc(mem_size);
@@ -236,7 +277,8 @@ int ObHashGroupByVecOp::inner_open()
         int64_t batch_new_rows_pos =
           batch_old_rows_pos + max_size * sizeof(aggregate::AggrRowPtr *);
         int64_t return_rows_pos = batch_new_rows_pos + max_size * sizeof(aggregate::AggrRowPtr *);
-        int64_t old_row_pos = return_rows_pos + max_size * sizeof(ObCompactRow *);
+        int64_t new_row_pos = return_rows_pos + max_size * sizeof(ObCompactRow *);
+        int64_t old_row_pos = new_row_pos + max_size * sizeof(uint16_t);
         int64_t aggr_vectors_pos = old_row_pos + max_size * sizeof(uint16_t);
         int64_t dumped_batch_rows_pos = aggr_vectors_pos + MY_SPEC.aggr_infos_.count() * sizeof(ObIVector *);
 
@@ -248,6 +290,7 @@ int ObHashGroupByVecOp::inner_open()
         batch_old_rows_ = reinterpret_cast<aggregate::AggrRowPtr *>(buf + batch_old_rows_pos);
         batch_new_rows_ = reinterpret_cast<aggregate::AggrRowPtr *>(buf + batch_new_rows_pos);
         return_rows_ = reinterpret_cast<const ObCompactRow **>(buf + return_rows_pos);
+        new_row_selector_ = reinterpret_cast<uint16_t *> (buf + new_row_pos);
         old_row_selector_ = reinterpret_cast<uint16_t *> (buf + old_row_pos);
         aggr_vectors_ = reinterpret_cast<ObIVector **> (buf + aggr_vectors_pos);
         dumped_batch_rows_.skip_ = to_bit_vector(buf + dumped_batch_rows_pos);
@@ -263,7 +306,7 @@ int ObHashGroupByVecOp::inner_open()
 
   if (OB_SUCC(ret)) {
     if (ObThreeStageAggrStage::FIRST_STAGE == MY_SPEC.aggr_stage_) {
-      no_non_distinct_aggr_ = (0 == MY_SPEC.aggr_infos_.count());
+      can_skip_last_group_ = (0 == MY_SPEC.aggr_infos_.count() && !MY_SPEC.need_last_group_in_3stage_);
     } else if (ObThreeStageAggrStage::SECOND_STAGE == MY_SPEC.aggr_stage_) {
       if (OB_FAIL(append(distinct_origin_exprs_, MY_SPEC.group_exprs_))) {
         LOG_WARN("failed to append distinct_origin_exprs", K(ret));
@@ -314,6 +357,7 @@ int ObHashGroupByVecOp::inner_open()
 int ObHashGroupByVecOp::reinit_group_store()
 {
   local_group_rows_.reset_group_store();
+  popular_array_temp_.reuse();
   return OB_SUCCESS;
 }
 
@@ -323,6 +367,10 @@ int ObHashGroupByVecOp::inner_close()
   distinct_sql_mem_processor_.unregister_profile();
   group_expr_fixed_lengths_.destroy();
   dump_vectors_.destroy();
+  popular_array_temp_.destroy();
+  hash_func_for_expr_.destroy();
+  null_hash_func_for_expr_.destroy();
+  stores_mgr_.reset();
   curr_group_id_ = common::OB_INVALID_INDEX;
   return ObGroupByVecOp::inner_close();
 }
@@ -352,6 +400,7 @@ void ObHashGroupByVecOp::destroy()
   local_group_rows_.destroy();
   sql_mem_processor_.destroy();
   distinct_sql_mem_processor_.destroy();
+  popular_map_.destroy();
   is_dumped_ = nullptr;
   distinct_data_set_.destroy();
   if (NULL != mem_context_) {
@@ -464,7 +513,7 @@ int ObHashGroupByVecOp::next_duplicate_data_permutation(
       }
     }
     LOG_DEBUG("debug write aggr code", K(ret), K(last_group), K(nth_group), K(first_idx),
-      K(no_non_distinct_aggr_), K(start_idx), K(end_idx), K(dup_groupby_exprs_));
+      K(can_skip_last_group_), K(start_idx), K(end_idx), K(dup_groupby_exprs_));
   } else if (ObThreeStageAggrStage::SECOND_STAGE == MY_SPEC.aggr_stage_) {
     if (!use_distinct_data_) {
       //get the aggr_code and then insert group hash-table or insert duplicate hash-table
@@ -840,7 +889,35 @@ int ObHashGroupByVecOp::setup_dump_env(const int64_t part_id, const int64_t inpu
     LOG_TRACE("trace setup dump", K(part_cnt), K(pre_part_cnt), K(part_id));
   }
 
-  if (OB_SUCC(ret) && part_cnt <= MAX_BATCH_DUMP_PART_CNT && need_reinit_vectors_) {
+  if (OB_FAIL(ret)) {
+  } else if (part_idxes_ == nullptr &&  // 只会被调用一次
+             (OB_ISNULL(part_idxes_ =
+             static_cast<int64_t *>
+             (mem_context_->get_arena_allocator().alloc(sizeof(int64_t)
+                                                   * MY_SPEC.max_batch_size_))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to init part_idxes_", K(ret));
+  }
+  if (OB_FAIL(ret)) {
+  } else {
+    // inited只会调用一次
+    if (!stores_mgr_.inited()) {
+      if (OB_FAIL(stores_mgr_.init(MY_SPEC.max_batch_size_, part_cnt, mem_context_->get_malloc_allocator()))) {
+        LOG_WARN("failed to init stores mgr", K(ret));
+      }
+    } else {
+      // reset_part_cnt之后每次都会调
+      if (OB_FAIL(stores_mgr_.reset_part_cnt(part_cnt))) {
+        LOG_WARN("reset stores_mgr_.part_cnt failed", K(part_cnt), K(ret));
+      }
+    }
+    for (int64_t part_idx = 0; OB_SUCC(ret) && part_idx < part_cnt; ++part_idx) {
+      // 这个应该每次都调
+      OZ (stores_mgr_.set_temp_store(part_idx, &parts[part_idx]->row_store_));
+    }
+  }
+
+  if (OB_SUCC(ret) && need_reinit_vectors_) {
     // only_init_once
     dump_vectors_.set_allocator(&mem_context_->get_allocator());
     if (OB_ISNULL(dump_rows_ = static_cast<ObCompactRow **>
@@ -849,22 +926,7 @@ int ObHashGroupByVecOp::setup_dump_env(const int64_t part_id, const int64_t inpu
       LOG_WARN("failed to alloc dump_rows_", K(ret), K(MY_SPEC.max_batch_size_));
     } else if (OB_FAIL(dump_vectors_.prepare_allocate(child_->get_spec().output_.count()))) {
       LOG_WARN("failed to init dump_vectors prepare_allocate", K(ret), K(child_->get_spec().output_.count()));
-    } else if (OB_ISNULL(dump_add_row_selectors_ =
-                  static_cast<uint16_t **> (mem_context_->get_arena_allocator().alloc(sizeof(uint16_t *) * MAX_BATCH_DUMP_PART_CNT)))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to init temp_add_row_selectors_", K(ret));
-    } else if (OB_ISNULL(dump_add_row_selectors_item_cnt_ =
-                      static_cast<uint16_t *> (mem_context_->get_arena_allocator().alloc(sizeof(uint16_t) * MAX_BATCH_DUMP_PART_CNT)))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to init temp_add_row_selectors_item_cnt_", K(ret));
     } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < MAX_BATCH_DUMP_PART_CNT; ++i) {
-        if (OB_ISNULL(dump_add_row_selectors_[i] = static_cast<uint16_t *> (mem_context_->get_arena_allocator().alloc(sizeof(uint16_t)
-                                                              * MY_SPEC.max_batch_size_)))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-          LOG_WARN("failed to init temp_add_row_selectors_item_cnt_[index]", K(ret), K(i));
-        }
-      }
       for (int64_t i = 0; OB_SUCC(ret) && i < child_->get_spec().output_.count() ; i++) {
         ObIVector *col_vec = child_->get_spec().output_.at(i)->get_vector(eval_ctx_);
         dump_vectors_.at(i) = col_vec;
@@ -1007,7 +1069,7 @@ int ObHashGroupByVecOp::inner_get_next_batch(const int64_t max_row_cnt)
 
   if (OB_SUCC(ret) && !brs_.end_) {
     clear_evaluated_flag();
-    if (curr_group_id_ >= local_group_rows_.size()) {
+    if (!bypass_ctrl_.by_passing() && curr_group_id_ >= local_group_rows_.size()) {
       if (bypass_ctrl_.processing_ht()
           && bypass_ctrl_.rebuild_times_exceeded()) {
         bypass_ctrl_.start_by_pass();
@@ -1015,17 +1077,18 @@ int ObHashGroupByVecOp::inner_get_next_batch(const int64_t max_row_cnt)
         bypass_ctrl_.reset_state();
         by_pass_vec_holder_.restore();
         calc_avg_group_mem();
-        if (llc_est_.enabled_ && llc_est_.est_cnt_ != agged_group_cnt_) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected est_cnt number", K(ret), K(agged_group_cnt_), K(agged_row_cnt_), K(llc_est_.est_cnt_));
-        }
       }
-      if (!bypass_ctrl_.by_passing()) {
-        if (OB_FAIL(by_pass_restart_round())) {
-          LOG_WARN("failed to restart", K(ret));
-        } else if (OB_FAIL(init_by_pass_group_batch_item())) {
-          LOG_WARN("failed to init by pass row", K(ret));
-        } else if (OB_FAIL(load_data_batch(MY_SPEC.max_batch_size_))) {
+
+      // restart cond1 : a normal new round
+      // restart cond2 : become bypassing, need to init currgroupid、hashtable..., see it as a new round
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(by_pass_restart_round())) {
+        LOG_WARN("failed to restart", K(ret));
+      } else if (OB_FAIL(init_by_pass_group_batch_item())) {
+        LOG_WARN("failed to init by pass row", K(ret));
+      } else if (!bypass_ctrl_.by_passing()) {
+        // cond1 : a normal new round, load data
+        if (OB_FAIL(load_data_batch(MY_SPEC.max_batch_size_))) {
           LOG_WARN("failed to laod data", K(ret));
         } else if (curr_group_id_ >= local_group_rows_.size()) {
           iter_end_ = true;
@@ -1038,8 +1101,8 @@ int ObHashGroupByVecOp::inner_get_next_batch(const int64_t max_row_cnt)
     if (OB_FAIL(ret)) {
     } else if (brs_.end_) {
     } else if (bypass_ctrl_.by_passing()) {
-      if (OB_FAIL(by_pass_prepare_one_batch(op_max_batch_size))) {
-        LOG_WARN("failed to prepare batch", K(ret));
+      if (OB_FAIL(by_pass_return_batch(op_max_batch_size))) {
+        LOG_WARN("by_pass_return_batch failed", K(ret), K(op_max_batch_size));
       }
     } else if (ObThreeStageAggrStage::SECOND_STAGE == MY_SPEC.aggr_stage_) {
       clear_evaluated_flag();
@@ -1053,9 +1116,11 @@ int ObHashGroupByVecOp::inner_get_next_batch(const int64_t max_row_cnt)
     } else {
       int64_t read_rows = 0;
       clear_evaluated_flag();
-      if (OB_FAIL(local_group_rows_.get_next_batch(return_rows_, op_max_batch_size, read_rows))) {
+      if (OB_FAIL(local_group_rows_.get_next_batch(return_rows_, op_max_batch_size, read_rows,
+        popular_array_temp_, total_load_rows_, skew_detection_enabled_))) {
         LOG_WARN("failed to get batch", K(ret));
       } else if (OB_UNLIKELY(0 == read_rows)) {
+        // this can not get
         brs_.size_ = 0;
       } else if (OB_FAIL(aggr_processor_.collect_group_results(local_group_rows_.get_row_meta(),
                                                                all_groupby_exprs_, read_rows,
@@ -1066,6 +1131,15 @@ int ObHashGroupByVecOp::inner_get_next_batch(const int64_t max_row_cnt)
       }
       if (OB_SUCC(ret)) {
         brs_.all_rows_active_ = true;
+        if (curr_group_id_ >= local_group_rows_.size() && skew_detection_enabled_) {
+          // after read all rows in local_group_rows, has put top_n item in popular_array_temp_,
+          // update popular_map_ here according to popular_array_temp_
+          if (OB_FAIL(update_popular_map())) {
+            LOG_WARN("update popular map failed", K(ret));
+          } else {
+            popular_array_temp_.reuse();
+          }
+        }
       }
     }
   }
@@ -1086,6 +1160,129 @@ int ObHashGroupByVecOp::inner_get_next_batch(const int64_t max_row_cnt)
             K(get_mem_used_size()), K(get_mem_bound_size()),
             K(agged_dumped_cnt_), K(agged_group_cnt_), K(agged_row_cnt_),
             K(curr_group_id_), K(brs_), K(local_group_rows_.size()), K(MY_SPEC.aggr_stage_));
+  return ret;
+}
+
+int ObHashGroupByVecOp::by_pass_return_batch(int64_t op_max_batch_size) {
+  int ret = OB_SUCCESS;
+  if (skew_detection_enabled_ && !by_pass_rows_) {
+    if (OB_FAIL(init_popular_values())) {
+      LOG_WARN("failed to get initial popular map", K(ret));
+    }
+    by_pass_rows_++;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(by_pass_prepare_one_batch(op_max_batch_size))) {
+    LOG_WARN("failed to prepare batch", K(ret));
+  } else if (brs_.end_ && skew_detection_enabled_) {
+    // by_pass处理完毕，接下来处理ht中的，结果应该是比较小的才对,理论上只需要调用一次就行了
+    // 如果batch_size<=1,也需要确保这里的数据被取完，一下子没拿完ht中的数据下一次会继续调
+    // by_pass_prepare_one_batch（里面会将brs_.end_变为true）,然后继续走这里从哈希表
+    // 里拿数据，终究会拿完。
+    LOG_DEBUG("here check op_max_batch_size", K(op_max_batch_size), K(curr_group_id_), K(local_group_rows_.size()));
+    brs_.end_ = false;
+    int64_t read_rows = 0;
+    // curr_group_id_ = 0;
+    if (op_monitor_info_.otherstat_4_value_ > 0 ) {
+      if (popular_map_.size() == 0) {
+        // negetive represent popular_map is out
+        op_monitor_info_.otherstat_4_value_ = -op_monitor_info_.otherstat_4_value_;
+      }
+      op_monitor_info_.otherstat_5_value_ = by_pass_agg_rows_;
+      op_monitor_info_.otherstat_5_id_ = ObSqlMonitorStatIds::HASH_BY_PASS_AGG_CNT;
+    }
+    clear_evaluated_flag();
+    if (OB_FAIL(local_group_rows_.get_next_batch(return_rows_, op_max_batch_size, read_rows,
+      popular_array_temp_, total_load_rows_, false))) {
+      LOG_WARN("failed to get batch", K(ret));
+    } else if (OB_UNLIKELY(0 == read_rows)) {
+      // empty hashtable, no popular_map hit
+      brs_.size_ = 0;
+      brs_.end_ = true;
+    } else if (OB_FAIL(aggr_processor_.collect_group_results(local_group_rows_.get_row_meta(),
+                                                            all_groupby_exprs_, read_rows,
+                                                            return_rows_, brs_))) {
+      LOG_WARN("failed to get batch result", K(ret));
+    } else {
+      curr_group_id_ += read_rows;
+    }
+  }
+  return ret;
+}
+
+int ObHashGroupByVecOp::update_popular_map() {
+  int ret = OB_SUCCESS;
+  for (int i = 0; i < popular_array_temp_.count() && OB_SUCC(ret); i++) {
+    uint64_t hash_val = HASH_SEED;
+    const ObCompactRow *row = popular_array_temp_.at(i).first;
+    int32_t cnt = popular_array_temp_.at(i).second;
+    const char *r_v = NULL;
+    ObLength r_len = 0;
+
+    if (MY_SPEC.aggr_stage_ == ObThreeStageAggrStage::FIRST_STAGE) {
+      int64_t nth_group;
+      row->get_cell_payload(local_group_rows_.get_row_meta(), MY_SPEC.aggr_code_idx_, r_v, r_len);
+      // judge dup col by aggr_code
+      nth_group = static_cast<int64_t> (*r_v);
+
+      int64_t first_idx = MY_SPEC.aggr_code_idx_ + 1;
+      int64_t start_idx = nth_group < MY_SPEC.dist_col_group_idxs_.count() ?
+                          0 == nth_group ? first_idx : MY_SPEC.dist_col_group_idxs_.at(nth_group - 1):
+                          all_groupby_exprs_.count();
+      int64_t end_idx = nth_group < MY_SPEC.dist_col_group_idxs_.count() ?
+                        MY_SPEC.dist_col_group_idxs_.at(nth_group):
+                        all_groupby_exprs_.count();
+
+      // calc base hash (groupby + aggr_code)
+      for(int j = 0; j < first_idx; j++) {
+        if (row->is_null(j)) {
+          null_hash_func_for_expr_.at(j)(hash_val, hash_val);
+        } else {
+          row->get_cell_payload(local_group_rows_.get_row_meta(), j, r_v, r_len);
+          hash_func_for_expr_.at(j)(all_groupby_exprs_.at(j)->obj_meta_, r_v,
+            r_len, hash_val, hash_val);
+        }
+      }
+      for (int64_t j = start_idx; j < end_idx && OB_SUCC(ret); j++) {
+        // set original distinct expr???
+        if (row->is_null(j)) {
+          null_hash_func_for_expr_.at(j)(hash_val, hash_val);
+        } else {
+          row->get_cell_payload(local_group_rows_.get_row_meta(), j, r_v, r_len);
+          hash_func_for_expr_.at(j)(all_groupby_exprs_.at(j)->obj_meta_, r_v,
+            r_len, hash_val, hash_val);
+        }
+      }
+    } else {
+      // no distinct
+      // calc hash_val for row
+      for (int j = 0; j < dup_groupby_exprs_.count(); j++) {
+        if (row->is_null(j)) {
+          null_hash_func_for_expr_.at(j)(hash_val, hash_val);
+        } else {
+          row->get_cell_payload(local_group_rows_.get_row_meta(), j, r_v, r_len);
+          hash_func_for_expr_.at(j)(all_groupby_exprs_.at(j)->obj_meta_, r_v,
+            r_len, hash_val, hash_val);
+        }
+      }
+    }
+
+    // try find and update popular_map
+    uint64_t mask_hash = (hash_val & ObGroupRowBucketBase::HASH_VAL_MASK);
+    uint64_t elem_exist_cnt = 0;
+    if (OB_HASH_NOT_EXIST != popular_map_.get_refactored(mask_hash, elem_exist_cnt)) {
+      if (OB_SUCC(ret)
+          && OB_FAIL(popular_map_.set_refactored(mask_hash, cnt + elem_exist_cnt, 1))) {
+        LOG_WARN("popular map update value fail", K(mask_hash), K(cnt), K(elem_exist_cnt));
+      }
+    } else {
+      // new elem
+      ret = OB_SUCCESS; // error code converd, but satify expection
+      if (OB_FAIL(popular_map_.set_refactored(mask_hash, cnt, 0))) {
+        LOG_WARN("popular map add value fail", K(mask_hash), K(cnt));
+      }
+    }
+  }
   return ret;
 }
 
@@ -1126,7 +1323,7 @@ int ObHashGroupByVecOp::load_data_batch(int64_t max_row_cnt)
                                    local_group_rows_.size(),
                                    get_actual_mem_used_size());
     if (bypass_ctrl_.processing_ht()) {
-      by_pass_vec_holder_.save(last_batch_size);
+      ret = by_pass_vec_holder_.save(last_batch_size);
       break;
     }
     const ObBatchRows *child_brs = NULL;
@@ -1161,7 +1358,7 @@ int ObHashGroupByVecOp::load_data_batch(int64_t max_row_cnt)
                                              loop_cnt, *child_brs, part_cnt, parts, est_part_cnt,
                                              bloom_filter))) {
           LOG_WARN("fail to group child batch rows", K(ret), K(start_dump));
-        } else if (no_non_distinct_aggr_) {
+        } else if (can_skip_last_group_) {
         } else if (OB_FAIL(aggr_processor_.eval_aggr_param_batch(*child_brs))) {
           LOG_WARN("fail to eval aggr param batch", K(ret), K(*child_brs));
         }
@@ -1185,8 +1382,9 @@ int ObHashGroupByVecOp::load_data_batch(int64_t max_row_cnt)
         } else if (OB_FAIL(aggr_processor_.prepare_adding_one_row())) {
           LOG_WARN("prepare add one row failed", K(ret));
         }
-        if (OB_SUCC(ret) && calc_multi_groups) {
-          if (OB_FAIL(process_multi_groups(batch_new_rows_, *child_brs))) {
+        if (OB_SUCC(ret) && calc_multi_groups && new_row_selector_cnt_ > 0) {
+          if (OB_FAIL(process_multi_groups(batch_new_rows_, *child_brs,
+                                           new_row_selector_, new_row_selector_cnt_))) {
             LOG_WARN("process multiple groups failed", K(ret));
           }
         }
@@ -1212,6 +1410,7 @@ int ObHashGroupByVecOp::load_data_batch(int64_t max_row_cnt)
           } else if (OB_FAIL(aggr_processor_.add_one_row(start_agg_id, end_agg_id,
                                                          batch_new_rows_[i], i,
                                                          child_brs->size_, aggr_vectors_))) {
+
             LOG_WARN("fail to process row", K(ret));
           }
         }
@@ -1219,8 +1418,9 @@ int ObHashGroupByVecOp::load_data_batch(int64_t max_row_cnt)
         end_agg_id = -1;
         if (OB_FAIL(ret)) {
         } else if (!reorder_aggr_rows_ || !batch_aggr_rows_table_.is_valid()) {
-          if (calc_multi_groups) {
-            if (OB_FAIL(process_multi_groups(batch_old_rows_, *child_brs))) {
+          if (calc_multi_groups && old_row_selector_cnt_ > 0) {
+            if (OB_FAIL(process_multi_groups(batch_old_rows_, *child_brs,
+                                             old_row_selector_, old_row_selector_cnt_))) {
               LOG_WARN("process multiple groups failed", K(ret));
             }
           }
@@ -1292,6 +1492,10 @@ int ObHashGroupByVecOp::load_data_batch(int64_t max_row_cnt)
       break;
     }
   } // while end
+
+  if (skew_detection_enabled_) {
+    popular_array_temp_.reuse();
+  }
 
   row_store_iter.reset();
   if (OB_SUCC(ret) && llc_est_.enabled_ && local_group_rows_.is_sstr_aggr_valid()) {
@@ -1432,7 +1636,7 @@ int ObHashGroupByVecOp::calc_groupby_exprs_hash_batch(
   int64_t ret = OB_SUCCESS;
   if (ObThreeStageAggrStage::FIRST_STAGE == MY_SPEC.aggr_stage_ && !has_calc_base_hash_) {
     // first calc hash values of groupby_expr
-    for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.aggr_code_idx_ + 1; ++i) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.aggr_code_idx_; ++i) {
       ObExpr *expr = groupby_exprs.at(i);
       if (OB_ISNULL(expr)) {
         ret = OB_ERR_UNEXPECTED;
@@ -1455,7 +1659,7 @@ int ObHashGroupByVecOp::calc_groupby_exprs_hash_batch(
       }
     }
     has_calc_base_hash_ = true;
-    start_calc_hash_idx_ = MY_SPEC.aggr_code_idx_ + 1;
+    start_calc_hash_idx_ = MY_SPEC.aggr_code_idx_;
   }
   if (OB_SUCC(ret) && 0 < start_calc_hash_idx_) {
     for (int64_t i = 0; i < child_brs.size_; ++i) {
@@ -1588,7 +1792,6 @@ int ObHashGroupByVecOp::batch_process_duplicate_data(
       memset(static_cast<void *> (batch_new_rows_), 0, sizeof(char *) * MY_SPEC.max_batch_size_);
       if (nullptr == store_rows && !local_group_rows_.is_sstr_aggr_valid()) {
         ret = calc_groupby_exprs_hash_batch(dup_groupby_exprs_, child_brs);
-        local_group_rows_.prefetch(child_brs, hash_vals_);
       }
       bool can_append_batch = (NULL == bloom_filter
                               && (!enable_dump_
@@ -1610,7 +1813,11 @@ int ObHashGroupByVecOp::batch_process_duplicate_data(
                                                   agged_row_cnt_,
                                                   agged_group_cnt_,
                                                   nullptr,
-                                                  true))) {
+                                                  true,
+                                                  new_row_selector_,
+                                                  old_row_selector_,
+                                                  new_row_selector_cnt_,
+                                                  old_row_selector_cnt_))) {
         LOG_WARN("failed to get batch rows", K(ret));
       } else if (!can_append_batch) {
         if (OB_UNLIKELY(NULL == bloom_filter)) {
@@ -1622,11 +1829,15 @@ int ObHashGroupByVecOp::batch_process_duplicate_data(
           }
         }
         // need dump
-        if (1 != nth_dup_data) {
+        if (OB_FAIL(ret)) {
+        } else if (1 != nth_dup_data) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected status: dump is not expected", K(ret));
-        } else if (part_cnt <= MAX_BATCH_DUMP_PART_CNT) {
-          reuse_dump_selectors();
+        } else if (OB_ISNULL(part_idxes_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected part_idxes_: part_idxes_ is null", K(ret));
+        } else {
+          MEMSET(part_idxes_, -1, sizeof(int64_t) * child_brs.size_);
           for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; i++) {
             if (child_brs.skip_->exist(i)
                 || nullptr != batch_new_rows_[i]
@@ -1635,42 +1846,17 @@ int ObHashGroupByVecOp::batch_process_duplicate_data(
             }
             is_dumped_[i] = true;
             ++agged_dumped_cnt_;
-            const int64_t part_idx = (hash_vals_[i] >> part_shift) & (part_cnt - 1);
-            dump_add_row_selectors_[part_idx][dump_add_row_selectors_item_cnt_[part_idx]++] = i;
+            part_idxes_[i] = (hash_vals_[i] >> part_shift) & (part_cnt - 1);
           }
-          for (int64_t i = 0; OB_SUCC(ret) && i < part_cnt ; i++) {
-            if (OB_FAIL(parts[i]->row_store_.add_batch(dump_vectors_, dump_add_row_selectors_[i],
-                                        dump_add_row_selectors_item_cnt_[i], dump_rows_, nullptr))) {
-              LOG_WARN("add row batch failed", K(ret));
-            } else {
-              // set dump rows hash_val
-              for (int64_t j = 0; j < dump_add_row_selectors_item_cnt_[i]; j++) {
-                *static_cast<uint64_t *>(dump_rows_[j][0].get_extra_payload(parts[i]->row_store_.get_row_meta())) =
-                  hash_vals_[dump_add_row_selectors_[i][j]];
+          if (OB_FAIL(stores_mgr_.add_batch(part_idxes_, dump_vectors_, child_brs, dump_rows_))) {
+            LOG_WARN("add row batch failed", K(ret));
+          } else {
+            for (int64_t i = 0; i < child_brs.size_; i++) {
+              if (nullptr != dump_rows_[i]) {
+                *static_cast<uint64_t *>(dump_rows_[i][0].get_extra_payload(parts[part_idxes_[i]]->
+                    row_store_.get_row_meta())) = hash_vals_[i];
               }
             }
-          }
-        } else {
-          for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; ++i) {
-            if (child_brs.skip_->exist(i)
-                || nullptr != batch_new_rows_[i]
-                || nullptr != batch_old_rows_[i]) {
-              continue;
-            }
-            is_dumped_[i] = true;
-            ++agged_dumped_cnt_;
-            const int64_t part_idx = (hash_vals_[i] >> part_shift) & (part_cnt - 1);
-            ObCompactRow *stored_row = nullptr;
-            if (OB_FAIL(parts[part_idx]->row_store_.add_row(child_->get_spec().output_,
-                                                            i,
-                                                            eval_ctx_,
-                                                            stored_row))) {
-              LOG_WARN("add row failed", K(ret));
-            } else {
-              *static_cast<uint64_t *>(stored_row[0].get_extra_payload(parts[part_idx]->row_store_.get_row_meta())) = hash_vals_[i];
-            }
-            LOG_DEBUG("finish dump", K(part_idx), K(agged_dumped_cnt_), K(agged_row_cnt_),
-                                    K(parts[part_idx]->row_store_.get_row_cnt()), K(i));
           }
         }
       }
@@ -1685,13 +1871,16 @@ int ObHashGroupByVecOp::batch_process_duplicate_data(
       }
       if (OB_SUCC(ret) && 0 < new_group_cnt) {
         int64_t curr_cnt = 0;
+        int64_t agg_size = aggr_processor_.get_aggregate_row_size();
+        bool need_push = ObThreeStageAggrStage::SECOND_STAGE == MY_SPEC.aggr_stage_;
         for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; i++) {
           if (!batch_new_rows_[i]) {
             continue;
           }
-          if (OB_FAIL(alloc_group_row(local_group_rows_.size() - new_group_cnt + curr_cnt,
-                                      batch_new_rows_[i]))) {
-            LOG_WARN("alloc group row failed", K(ret));
+          if (OB_FAIL(aggr_processor_.add_one_aggregate_row(
+                      batch_new_rows_[i], agg_size,
+                      need_push))) {
+            LOG_WARN("failed to init one group", K(ret));
           }
           ++curr_cnt;
         }
@@ -1712,7 +1901,9 @@ int ObHashGroupByVecOp::batch_insert_distinct_data(const ObBatchRows &child_brs)
   if (!is_init_distinct_data_ && OB_FAIL(init_distinct_info(false))) {
     LOG_WARN("failed to init hash partition infras", K(ret));
   } else if (OB_FAIL(distinct_data_set_.calc_hash_value_for_batch(distinct_origin_exprs_,
-                                                                   tmp_brs,
+                                                                   *tmp_brs.skip_,
+                                                                   tmp_brs.size_,
+                                                                   false /* all_rows_active */,
                                                                   //  distinct_skip_,
                                                                    distinct_hash_values_,
                                                                    dup_groupby_exprs_.count(),
@@ -1822,12 +2013,6 @@ int ObHashGroupByVecOp::get_next_batch_distinct_rows(
   return ret;
 }
 
-void ObHashGroupByVecOp::reuse_dump_selectors() {
-  if (nullptr != dump_add_row_selectors_item_cnt_) {
-    memset(dump_add_row_selectors_item_cnt_, 0, sizeof(uint16_t) * MAX_BATCH_DUMP_PART_CNT);
-  }
-}
-
 int ObHashGroupByVecOp::group_child_batch_rows(const ObCompactRow **store_rows,
                                                const RowMeta *meta,
                                                const int64_t input_rows,
@@ -1861,7 +2046,7 @@ int ObHashGroupByVecOp::group_child_batch_rows(const ObCompactRow **store_rows,
       part_shift, loop_cnt, child_brs, part_cnt, parts, est_part_cnt, bloom_filter,
       process_check_dump))) {
     LOG_WARN("failed to batch process duplicate data", K(ret));
-  } else if (no_non_distinct_aggr_) {
+  } else if (can_skip_last_group_) {
     LOG_TRACE("no distinct aggr");
     // no groupby exprs, don't calculate the last duplicate data for non-distinct aggregate
   } else if ((ObThreeStageAggrStage::SECOND_STAGE == MY_SPEC.aggr_stage_ && !use_distinct_data_)
@@ -1872,9 +2057,7 @@ int ObHashGroupByVecOp::group_child_batch_rows(const ObCompactRow **store_rows,
   } else {
     if (nullptr == store_rows && !local_group_rows_.is_sstr_aggr_valid()) {
       ret = calc_groupby_exprs_hash_batch(dup_groupby_exprs_, child_brs);
-      local_group_rows_.prefetch(child_brs, hash_vals_);
     }
-    uint16_t new_groups = 0;
     memset(static_cast<void *>(batch_old_rows_), 0,
            sizeof(aggregate::AggrRowPtr *) * MY_SPEC.max_batch_size_);
     memset(static_cast<void *>(batch_new_rows_), 0,
@@ -1882,22 +2065,25 @@ int ObHashGroupByVecOp::group_child_batch_rows(const ObCompactRow **store_rows,
     if (reorder_aggr_rows_) {
       batch_aggr_rows_table_.reuse();
     }
-    for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; i++) {
-      if (child_brs.skip_->exist(i) || is_dumped_[i]) {
-        if (nullptr != distinct_skip_) {
-          distinct_skip_->set(i);
-        }
-        continue;
-      } else {
-        if (ObThreeStageAggrStage::SECOND_STAGE == MY_SPEC.aggr_stage_ && !use_distinct_data_) {
-          aggr_code = aggr_code_vec->get_int(i);
-          if (aggr_code < MY_SPEC.dist_aggr_group_idxes_.count()) {
-            ++distinct_data_idx;
-            // don't process
-            child_brs.skip_->set(i);
-            continue;
-          } else {
+    if (ObThreeStageAggrStage::SECOND_STAGE == MY_SPEC.aggr_stage_) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; i++) {
+        if (child_brs.skip_->exist(i) || is_dumped_[i]) {
+          if (nullptr != distinct_skip_) {
             distinct_skip_->set(i);
+          }
+          continue;
+        } else {
+          if (!use_distinct_data_) {
+            aggr_code = aggr_code_vec->get_int(i);
+            if (aggr_code < MY_SPEC.dist_aggr_group_idxes_.count()) {
+              ++distinct_data_idx;
+              // don't process
+              child_brs.skip_->set(i);
+              (const_cast<ObBatchRows &>(child_brs)).all_rows_active_ = false;
+              continue;
+            } else {
+              distinct_skip_->set(i);
+            }
           }
         }
       }
@@ -1923,7 +2109,11 @@ int ObHashGroupByVecOp::group_child_batch_rows(const ObCompactRow **store_rows,
                                                 agged_group_cnt_,
                                                 reorder_aggr_rows_
                                                   ? &batch_aggr_rows_table_ : nullptr,
-                                                true))) {
+                                                true,
+                                                new_row_selector_,
+                                                old_row_selector_,
+                                                new_row_selector_cnt_,
+                                                old_row_selector_cnt_))) {
       LOG_WARN("failed to get batch rows", K(ret));
     } else if (!can_append_batch) {
       // need dump
@@ -1935,35 +2125,15 @@ int ObHashGroupByVecOp::group_child_batch_rows(const ObCompactRow **store_rows,
           sql_mem_processor_.set_number_pass(part_id + 1);
         }
       }
-      if (process_check_dump) {
+      if (OB_FAIL(ret)) {
+      } else if (process_check_dump) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected status: check dump is processed", K(ret));
-      } else if (part_cnt <= MAX_BATCH_DUMP_PART_CNT) {
-        reuse_dump_selectors();
-        for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; i++) {
-          if (child_brs.skip_->exist(i)
-              || is_dumped_[i]
-              || nullptr != batch_new_rows_[i]
-              || nullptr != batch_old_rows_[i]) {
-            continue;
-          }
-          ++agged_dumped_cnt_;
-          const int64_t part_idx = (hash_vals_[i] >> part_shift) & (part_cnt - 1);
-          dump_add_row_selectors_[part_idx][dump_add_row_selectors_item_cnt_[part_idx]++] = i;
-        }
-        for (int64_t i = 0; OB_SUCC(ret) && i < part_cnt ; i++) {
-          if (OB_FAIL(parts[i]->row_store_.add_batch(dump_vectors_, dump_add_row_selectors_[i],
-                                                    dump_add_row_selectors_item_cnt_[i], dump_rows_, nullptr))) {
-            LOG_WARN("add row batch failed", K(ret));
-          } else {
-            // set dump rows hash_val
-            for (int64_t j = 0; j < dump_add_row_selectors_item_cnt_[i]; j++) {
-              *static_cast<uint64_t *>(dump_rows_[j][0].get_extra_payload(parts[i]->row_store_.get_row_meta())) =
-                                                                                          hash_vals_[dump_add_row_selectors_[i][j]];
-            }
-          }
-        }
+      } else if (OB_ISNULL(part_idxes_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected part_idxes_: part_idxes_ is null", K(ret));
       } else {
+        MEMSET(part_idxes_, -1, sizeof(int64_t) * child_brs.size_);
         for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; i++) {
           if (child_brs.skip_->exist(i)
               || is_dumped_[i]
@@ -1971,26 +2141,22 @@ int ObHashGroupByVecOp::group_child_batch_rows(const ObCompactRow **store_rows,
               || nullptr != batch_old_rows_[i]) {
             continue;
           }
-          if (OB_SUCC(ret)) {
-            ++agged_dumped_cnt_;
-            const int64_t part_idx = (hash_vals_[i] >> part_shift) & (part_cnt - 1);
-            ObCompactRow *stored_row = nullptr;
-            if (OB_FAIL(parts[part_idx]->row_store_.add_row(child_->get_spec().output_,
-                                                            i,
-                                                            eval_ctx_,
-                                                            stored_row))) {
-              LOG_WARN("add row failed", K(ret));
-            } else {
-              *static_cast<uint64_t *>(stored_row[0].get_extra_payload(parts[part_idx]->row_store_.get_row_meta())) = hash_vals_[i];
+          part_idxes_[i] = (hash_vals_[i] >> part_shift) & (part_cnt - 1);
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(stores_mgr_.add_batch(part_idxes_, dump_vectors_, child_brs, dump_rows_))) {
+          LOG_WARN("add row batch failed", K(ret));
+        } else {
+          for (int64_t i = 0; i < child_brs.size_; i++) {
+            if (nullptr != dump_rows_[i]) {
+              *static_cast<uint64_t *>(dump_rows_[i][0].get_extra_payload(parts[part_idxes_[i]]->
+                  row_store_.get_row_meta())) = hash_vals_[i];
             }
-            LOG_DEBUG("finish dump", K(part_idx), K(agged_dumped_cnt_), K(agged_row_cnt_),
-                                    K(parts[part_idx]->row_store_.get_row_cnt()), K(i));
           }
         }
       }
     }
     force_check_dump = false;
-    new_groups = agged_group_cnt_ - orign_agged_group_cnt;
     if (OB_SUCC(ret) && llc_est_.enabled_) {
       for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; i++) {
         if (batch_new_rows_[i]) {
@@ -1998,16 +2164,12 @@ int ObHashGroupByVecOp::group_child_batch_rows(const ObCompactRow **store_rows,
         }
       }
     }
-    if (OB_SUCC(ret) && new_groups > 0) {
-      int64_t curr_cnt = 0;
-      for (int64_t i = 0; OB_SUCC(ret) && i < child_brs.size_; ++i) {
-        if (!batch_new_rows_[i]) {
-          continue;
-        }
-        if (OB_FAIL(alloc_group_row(local_group_rows_.size() - new_groups + curr_cnt, batch_new_rows_[i]))) {
-          LOG_WARN("alloc group row failed", K(ret));
-        }
-        ++curr_cnt;
+    if (OB_SUCC(ret) && new_row_selector_cnt_ > 0) {
+      int64_t agg_size = aggr_processor_.get_aggregate_row_size();
+      bool need_push = ObThreeStageAggrStage::SECOND_STAGE == MY_SPEC.aggr_stage_;
+      if (OB_FAIL(aggr_processor_.add_batch_aggregate_rows(batch_new_rows_, new_row_selector_,
+                                                           new_row_selector_cnt_, need_push))) {
+        LOG_WARN("failed to add aggr rows", K(ret));
       }
     }
 
@@ -2057,6 +2219,7 @@ int ObHashGroupByVecOp::by_pass_prepare_one_batch(const int64_t batch_size)
   int ret = OB_SUCCESS;
   bool last_group = false;
   bool insert_group_ht = false;
+  bool has_by_pass_agg_row = false;
   LOG_TRACE("by pass prepare one batch", K(batch_size));
   if (ObThreeStageAggrStage::FIRST_STAGE == MY_SPEC.aggr_stage_
       && by_pass_nth_group_ <= MY_SPEC.dist_col_group_idxs_.count()
@@ -2070,6 +2233,7 @@ int ObHashGroupByVecOp::by_pass_prepare_one_batch(const int64_t batch_size)
       LOG_WARN("failed to get next permutation row", K(ret));
     }
   } else if (FALSE_IT(by_pass_nth_group_ = 0)) {
+  } else if (FALSE_IT(has_calc_base_hash_ = false)) {
   } else if (OB_FAIL(by_pass_vec_holder_.restore())) {
     LOG_WARN("failed to restore child batch", K(ret));
   } else if (OB_FAIL(child_->get_next_batch(batch_size, by_pass_child_brs_))) {
@@ -2083,28 +2247,95 @@ int ObHashGroupByVecOp::by_pass_prepare_one_batch(const int64_t batch_size)
   } else if (OB_FAIL(try_check_status())) {
     LOG_WARN("check status failed", K(ret));
   } else if (OB_FAIL(by_pass_get_next_permutation_batch(
-               by_pass_nth_group_, last_group, by_pass_child_brs_, brs_, batch_size, insert_group_ht))) {
+        by_pass_nth_group_, last_group, by_pass_child_brs_, brs_, batch_size, insert_group_ht))) {
     LOG_WARN("failed to get next permutation row", K(ret));
   }
-  if (OB_SUCC(ret) && llc_est_.enabled_) {
+  if (OB_SUCC(ret) &&
+      (llc_est_.enabled_ || (skew_detection_enabled_ && popular_map_.size() > 0))) {
     const ObCompactRow **store_rows = NULL;
     const RowMeta *meta = NULL;
     if (OB_FAIL(eval_groupby_exprs_batch(store_rows, meta, brs_))) {
       LOG_WARN("fail to calc groupby exprs hash batch", K(ret));
     } else if (OB_FAIL(calc_groupby_exprs_hash_batch(dup_groupby_exprs_, brs_))) {
       LOG_WARN("failed to calc groupby expr has", K(ret), K(dup_groupby_exprs_));
-    } else if (OB_FAIL(bypass_add_llc_map_batch(ObThreeStageAggrStage::FIRST_STAGE == MY_SPEC.aggr_stage_ ?
-                                                by_pass_nth_group_ > MY_SPEC.dist_col_group_idxs_.count() : true))) {
+    } else if (llc_est_.enabled_ &&
+      OB_FAIL(bypass_add_llc_map_batch(ObThreeStageAggrStage::FIRST_STAGE == MY_SPEC.aggr_stage_ ?
+                      by_pass_nth_group_ > MY_SPEC.dist_col_group_idxs_.count() : true))) {
       LOG_WARN("failed to add llc map batch", K(ret));
     }
   }
-  if (OB_FAIL(ret) || no_non_distinct_aggr_) {
-    brs_.all_rows_active_ = by_pass_child_brs_->all_rows_active_;
+  if (last_group && can_skip_last_group_) {
+    // in last group and can_skip_last_group_, the hash val will not be calc because skip are all true,
+    // hash_val is wrong, dont do popular_process
+  } else if (OB_SUCC(ret) && skew_detection_enabled_) {
+    memset(static_cast<void *>(batch_old_rows_), 0,
+        sizeof(aggregate::AggrRowPtr *) * MY_SPEC.max_batch_size_);
+    memset(static_cast<void *>(batch_new_rows_), 0,
+        sizeof(aggregate::AggrRowPtr *) * MY_SPEC.max_batch_size_);
+    // TODO : first batch check popular_map_
+    // set batch_new_row_ to nonzero when hash is not in popular_map_, noneed for now
+    int64_t dop = GET_PHY_PLAN_CTX(ctx_)->get_phy_plan()->get_px_dop();
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(local_group_rows_.process_popular_value_batch(&brs_, dup_groupby_exprs_,
+        group_expr_fixed_lengths_, hash_vals_, dop, by_pass_rows_,
+        max(SKEW_TEST_STEP_SIZE * total_load_rows_, MIN_CHECK_POPULAR_VALID_ROWS), agged_row_cnt_,
+        agged_group_cnt_, batch_old_rows_, batch_new_rows_, &popular_map_))) {
+      LOG_WARN("fail to by_pass_process_value_batch", K(ret));
+    } else if (OB_FAIL(aggr_processor_.eval_aggr_param_batch(brs_))) {
+      LOG_WARN("fail to eval aggr param batch", K(ret), K(brs_));
+    }
+    //batch calc aggr for each group
+    int32_t start_agg_id = -1;
+    int32_t end_agg_id = -1;
+    for (int64_t i = 0; i < MY_SPEC.aggr_infos_.count(); ++i) {
+      if (MY_SPEC.aggr_infos_.at(i).param_exprs_.count() == 1) {
+        aggr_vectors_[i] = MY_SPEC.aggr_infos_.at(i).param_exprs_.at(0)->get_vector(eval_ctx_);
+      } else if (MY_SPEC.aggr_infos_.at(i).is_implicit_first_aggr()) {
+        aggr_vectors_[i] = MY_SPEC.aggr_infos_.at(i).expr_->get_vector(eval_ctx_);
+      } else {
+        aggr_vectors_[i] = nullptr;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(aggr_processor_.prepare_adding_one_row())) {
+      LOG_WARN("prepare add one row failed", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < brs_.size_; i++) {
+      if (!batch_old_rows_[i] || brs_.skip_->at(i)) {
+        continue;
+      }
+      by_pass_agg_rows_++;
+      if (start_agg_id != -1 && end_agg_id != -1) { // do nothing
+      } else if (OB_FAIL(ObGroupByVecOp::calculate_3stage_agg_info(
+                      batch_old_rows_[i], local_group_rows_.get_row_meta(),
+                      i, start_agg_id, end_agg_id))) {
+        LOG_WARN("calculate 3stage aggregate info failed", K(ret));
+      } else if (OB_UNLIKELY(start_agg_id == -1 || end_agg_id == -1)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected aggregate idx", K(ret), K(start_agg_id), K(end_agg_id));
+      }
+
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(aggr_processor_.add_one_row(start_agg_id, end_agg_id,
+                                                      batch_old_rows_[i], i,
+                                                      brs_.size_, aggr_vectors_))) {
+        LOG_WARN("fail to process row", K(ret));
+      } else {
+        brs_.set_skip(i);
+        has_by_pass_agg_row = true; // need to set all_rows_active = false
+      }
+    }
+  }
+  if (OB_FAIL(ret) || can_skip_last_group_) {
+    if ((last_group && can_skip_last_group_) || has_by_pass_agg_row) {
+      // in bypass && last_group && can_skip_last_group_, brs_.skip_ will be set_all (all skip)
+      brs_.all_rows_active_ = false;
+    } else {
+      brs_.all_rows_active_ = by_pass_child_brs_->all_rows_active_;
+    }
   } else if (OB_UNLIKELY(by_pass_batch_size_ <= 0)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("by pass group row is not init", K(ret), K(by_pass_batch_size_));
-  } else if (OB_FAIL(aggr_processor_.eval_aggr_param_batch(brs_))) {
-    LOG_WARN("fail to eval aggr param batch", K(ret), K(brs_));
   } else if (OB_ISNULL(brs_.skip_)) {
     ret = OB_ERR_UNEXPECTED;
     SQL_LOG(WARN, "unexpected null skip", K(ret));
@@ -2139,8 +2370,8 @@ int ObHashGroupByVecOp::by_pass_get_next_permutation_batch(int64_t &nth_group, b
   } else if (OB_FAIL(next_duplicate_data_permutation(nth_group, last_group, child_brs,
                                                      insert_group_ht))) {
     LOG_WARN("failed to get next permutation", K(ret));
-  } else if (no_non_distinct_aggr_ && last_group) {
-    my_brs.size_ = 0;
+  } else if (can_skip_last_group_ && last_group) {
+    my_brs.skip_->set_all(child_brs->size_);
   } else {
     CK (dup_groupby_exprs_.count() == all_groupby_exprs_.count());
     LOG_DEBUG("next duplicate data permutation", K(all_groupby_exprs_), K(dup_groupby_exprs_));
@@ -2243,17 +2474,26 @@ int ObHashGroupByVecOp::by_pass_restart_round()
   cur_group_item_idx_ = 0;
   cur_group_item_buf_ = nullptr;
   aggr_processor_.reuse();
-  // if last round is in L2 cache, reuse the bucket
-  // otherwise resize to init size to avoid L2 cache overflow
-  if (bypass_ctrl_.need_resize_hash_table_) {
-    OZ(local_group_rows_.resize(&mem_context_->get_malloc_allocator(), INIT_BKT_SIZE_FOR_ADAPTIVE_GBY));
+  // LOG_INFO("by_pass_restart_round!!!",K(bypass_ctrl_.rebuild_times_), K(bypass_ctrl_.round_times_));
+  if (skew_detection_enabled_ && bypass_ctrl_.by_passing()) {
+    // for popular values, so do not need to be big
+    OZ(local_group_rows_.resize(&mem_context_->get_malloc_allocator(),
+      INIT_BKT_SIZE_FOR_ADAPTIVE_GBY));
   } else {
-    OX(local_group_rows_.reuse());
+    // if last round is in L2 cache, reuse the bucket
+    // otherwise resize to init size to avoid L2 cache overflow
+    if (bypass_ctrl_.need_resize_hash_table_) {
+      OZ(local_group_rows_.resize(&mem_context_->get_malloc_allocator(),
+                                  INIT_BKT_SIZE_FOR_ADAPTIVE_GBY));
+    } else {
+      OX(local_group_rows_.reuse());
+    }
   }
   OZ(reinit_group_store());
   if (OB_SUCC(ret)) {
     bypass_ctrl_.reset_state();
     bypass_ctrl_.inc_rebuild_times();
+    bypass_ctrl_.last_round_processed_cnt_ = bypass_ctrl_.processed_cnt_;
     bypass_ctrl_.need_resize_hash_table_ = false;
     by_pass_vec_holder_.restore();
   }
@@ -2361,27 +2601,63 @@ int ObHashGroupByVecOp::bypass_add_llc_map_batch(bool ready_to_check_ndv) {
   return ret;
 }
 
-int ObHashGroupByVecOp::process_multi_groups(aggregate::AggrRowPtr *agg_rows, const ObBatchRows &brs)
+int ObHashGroupByVecOp::process_multi_groups(aggregate::AggrRowPtr *agg_rows, const ObBatchRows &brs,
+                                             uint16_t *selector, int64_t selector_cnt)
 {
   int ret = OB_SUCCESS;
   int32_t start_agg_id = -1, end_agg_id = -1;
-  for (int i = 0; OB_SUCC(ret) && i < brs.size_; i++) {
-    if ((!agg_rows[i])) { continue; }
-    if (OB_FAIL(ObGroupByVecOp::calculate_3stage_agg_info(
-          agg_rows[i], local_group_rows_.get_row_meta(), i, start_agg_id, end_agg_id))) {
-      LOG_WARN("calculate 3stage aggregate info failed", K(ret));
-    } else if (OB_UNLIKELY(start_agg_id == -1 || end_agg_id == -1)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected aggregate idx", K(ret), K(start_agg_id), K(end_agg_id));
-    } else {
-      break;
+  if (MY_SPEC.aggr_stage_ == ObThreeStageAggrStage::NONE_STAGE) {
+    start_agg_id = 0;
+    end_agg_id = MY_SPEC.aggr_infos_.count();
+  } else {
+    for (int i = 0; OB_SUCC(ret) && i < brs.size_; i++) {
+      if ((!agg_rows[i])) { continue; }
+      if (OB_FAIL(ObGroupByVecOp::calculate_3stage_agg_info(
+            agg_rows[i], local_group_rows_.get_row_meta(), i, start_agg_id, end_agg_id))) {
+        LOG_WARN("calculate 3stage aggregate info failed", K(ret));
+      } else if (OB_UNLIKELY(start_agg_id == -1 || end_agg_id == -1)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected aggregate idx", K(ret), K(start_agg_id), K(end_agg_id));
+      } else {
+        break;
+      }
     }
   }
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(aggr_processor_.add_batch_for_multi_groups(start_agg_id, end_agg_id, agg_rows,
-                                                                brs.size_))) {
+                                                                brs.size_, selector, selector_cnt))) {
     LOG_WARN("failed to calculate multiple groups", K(ret));
   }
+  return ret;
+}
+
+int ObHashGroupByVecOp::init_popular_values()
+{
+  int ret = OB_SUCCESS;
+  // Filter out popular values that meet the definition
+  int dop = GET_PHY_PLAN_CTX(ctx_)->get_phy_plan()->get_px_dop();
+  PopularMapType::iterator iter = popular_map_.begin();
+  for (; OB_SUCC(ret) && iter != popular_map_.end();) {
+    if ((total_load_rows_ != iter->second)
+        && (((iter->second * dop * 1.0) / (total_load_rows_ - iter->second))
+            < SKEW_POPULAR_MAX_RATIO)) {
+      PopularMapType::iterator iter_tmp = iter;
+      iter_tmp++;
+      popular_map_.erase_refactored(iter->first);
+      iter = iter_tmp;
+    } else {
+      LOG_DEBUG("data skew4-1: got a topk popular value", K(ret), K(iter->first), K(iter->second),
+               K(dop), K(total_load_rows_), K(MY_SPEC.id_), K(popular_map_.size()));
+      iter->second = 0;
+      iter++;
+    }
+  }
+  if (popular_map_.size() == 0) {
+    LOG_DEBUG("data skew4: no popular values", K(ret), K(dop), K(total_load_rows_), K(MY_SPEC.id_));
+  } else {
+    op_monitor_info_.otherstat_4_value_ = popular_map_.size();
+  }
+
   return ret;
 }
 

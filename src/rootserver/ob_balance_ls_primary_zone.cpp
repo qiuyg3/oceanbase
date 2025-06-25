@@ -12,12 +12,7 @@
 
 #define USING_LOG_PREFIX RS
 #include "ob_balance_ls_primary_zone.h"
-#include "lib/profile/ob_trace_id.h"
-#include "share/ob_errno.h"
-#include "share/schema/ob_schema_struct.h"//ObTenantSchema
-#include "share/schema/ob_schema_service.h"//ObMultiSchemaService
 #include "share/ls/ob_ls_life_manager.h"//ObLSLifeAgentManager
-#include "share/ls/ob_ls_status_operator.h"//ObLSStatusOperator
 #include "share/ob_primary_zone_util.h"//ObPrimaryZoneUtil
 #include "observer/ob_server_struct.h"//GCTX
 #include "rootserver/ob_tenant_thread_helper.h"//get_zone_priority
@@ -330,8 +325,9 @@ int ObBalanceLSPrimaryZone::try_update_sys_ls_primary_zone(const uint64_t tenant
     LOG_WARN("failed to update ls primary zone", KR(ret), K(primary_zone_info),
         K(new_primary_zone), K(new_zone_priority));
   } else if (is_meta_tenant(tenant_id)) {
-    //user sys ls has same primary zone with meta sys ls
+    //user sys ls and meta sslog ls has same primary zone with meta sys ls
     share::ObLSPrimaryZoneInfo user_primary_zone_info;
+    share::ObLSPrimaryZoneInfo sslog_primary_zone_info;
     share::ObLSStatusOperator status_op;
     const uint64_t user_tenant_id = gen_user_tenant_id(tenant_id);
     if (OB_FAIL(status_op.get_ls_primary_zone_info(user_tenant_id, SYS_LS,
@@ -342,6 +338,16 @@ int ObBalanceLSPrimaryZone::try_update_sys_ls_primary_zone(const uint64_t tenant
         new_zone_priority))) {
       LOG_WARN("failed to update ls primary zone", KR(ret), K(user_primary_zone_info),
           K(new_primary_zone), K(new_zone_priority));
+    } else if (GCTX.is_shared_storage_mode()) {
+      if (OB_FAIL(status_op.get_ls_primary_zone_info(tenant_id, SSLOG_LS,
+          sslog_primary_zone_info, *GCTX.sql_proxy_))) {
+        LOG_WARN("failed to get ls primary_zone info", KR(ret), K(tenant_id), K(user_tenant_id));
+      } else if (OB_FAIL(try_update_ls_primary_zone(
+          sslog_primary_zone_info, new_primary_zone,
+          new_zone_priority))) {
+        LOG_WARN("failed to update ls primary zone", KR(ret), K(sslog_primary_zone_info),
+            K(new_primary_zone), K(new_zone_priority));
+      }
     }
   }
   return ret;

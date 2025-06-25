@@ -405,6 +405,7 @@ public:
         returning_exprs_(),
         returning_strs_(),
         returning_agg_items_(),
+        group_param_exprs_(),
         ignore_(false),
         has_global_index_(false),
         error_log_info_(),
@@ -414,6 +415,8 @@ public:
         pdml_disabled_(false)
   { }
   virtual ~ObDelUpdStmt() { }
+  common::ObIArray<ObRawExpr*> &get_group_param_exprs() { return group_param_exprs_; }
+  const common::ObIArray<ObRawExpr*> &get_group_param_exprs() const { return group_param_exprs_; }
   int deep_copy_stmt_struct(ObIAllocator &allocator,
                             ObRawExprCopier &expr_factory,
                             const ObDMLStmt &other) override;
@@ -480,11 +483,13 @@ public:
   int check_dml_source_from_join();
   bool is_pdml_disabled() const { return pdml_disabled_; }
   void set_pdml_disabled() { pdml_disabled_ = true; }
+  int get_modified_materialized_view_id(uint64_t &mview_id) const;
 protected:
   common::ObSEArray<ObRawExpr*, common::OB_PREALLOCATED_NUM, common::ModulePageAllocator, true> returning_exprs_;
   common::ObSEArray<ObRawExpr*, common::OB_PREALLOCATED_NUM, common::ModulePageAllocator, true> returning_into_exprs_;
   common::ObSEArray<ObString, common::OB_PREALLOCATED_NUM, common::ModulePageAllocator, true> returning_strs_;
   common::ObArray<ObAggFunRawExpr*, common::ModulePageAllocator, true> returning_agg_items_;
+  common::ObSEArray<ObRawExpr*, 16, common::ModulePageAllocator, true> group_param_exprs_;
   bool ignore_;
   bool has_global_index_;
   ObErrLogInfo error_log_info_;

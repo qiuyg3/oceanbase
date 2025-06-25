@@ -12,16 +12,10 @@
 
 #include <gtest/gtest.h>
 #define private public
-#include "lib/roaringbitmap/ob_roaringbitmap.h"
 #include "lib/roaringbitmap/ob_rb_utils.h"
-#include "lib/utility/ob_macro_utils.h"
 
 #undef private
 
-#include <sys/time.h>
-#include <stdexcept>
-#include <exception>
-#include <typeinfo>
 
 namespace oceanbase {
 namespace common {
@@ -113,7 +107,7 @@ TEST_F(TestRoaringBitmap, serialize_deserialize)
   }
   ObString bin_bitmap;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_serialize(allocator, bin_bitmap, rb));
-  ASSERT_EQ(ObRbBinType::BITMAP_32, static_cast<ObRbBinType>(*(bin_bitmap.ptr() + 1)));
+  ASSERT_EQ(ObRbBinType::BITMAP_64, static_cast<ObRbBinType>(*(bin_bitmap.ptr() + 1)));
   ObRoaringBitmap *rb_bitmap;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_deserialize(allocator, bin_bitmap, rb_bitmap));
   ASSERT_EQ(rb->get_version(), rb_bitmap->get_version());
@@ -189,10 +183,16 @@ TEST_F(TestRoaringBitmap, optimize)
   }
   ASSERT_EQ(rb->get_type(), ObRbType::BITMAP);
   ASSERT_EQ(rb->get_cardinality(), 33);
+  // remove 32 value, remain 32 value
   ASSERT_EQ(rb->value_remove(300), OB_SUCCESS);
   ASSERT_EQ(rb->get_cardinality(), 32);
   ASSERT_FALSE(rb->is_contains(300));
   rb->optimize();
+  ASSERT_EQ(rb->get_type(), ObRbType::SET);
+  // remove 1 value, remain 33 value
+  ASSERT_EQ(rb->value_add(300), OB_SUCCESS);
+  ASSERT_EQ(rb->get_cardinality(), 33);
+  ASSERT_EQ(rb->get_type(), ObRbType::BITMAP);
   // remove 32 value, remain 1 value
   for (int i = 0; i < MAX_BITMAP_SET_VALUES; i++) {
     ASSERT_EQ(rb->value_remove(300 + i), OB_SUCCESS);
@@ -261,7 +261,7 @@ TEST_F(TestRoaringBitmap, to_roaring_bin)
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_serialize(allocator, bin_empty, rb));
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::binary_format_convert(allocator, bin_empty, roaring_bin_empty));
   ObRbBinType bin_type_empty;
-  ASSERT_EQ(OB_SUCCESS, ObRbUtils::check_get_bin_type(roaring_bin_empty, bin_type_empty));
+  ASSERT_EQ(OB_SUCCESS, ObRbUtils::get_bin_type(roaring_bin_empty, bin_type_empty));
   ASSERT_EQ(ObRbBinType::BITMAP_32, bin_type_empty);
   ObRoaringBitmap *rb_roaring_empty;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_deserialize(allocator, roaring_bin_empty, rb_roaring_empty));
@@ -276,7 +276,7 @@ TEST_F(TestRoaringBitmap, to_roaring_bin)
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_serialize(allocator, bin_single, rb));
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::binary_format_convert(allocator, bin_single, roaring_bin_single));
   ObRbBinType bin_type_single;
-  ASSERT_EQ(OB_SUCCESS, ObRbUtils::check_get_bin_type(roaring_bin_single, bin_type_single));
+  ASSERT_EQ(OB_SUCCESS, ObRbUtils::get_bin_type(roaring_bin_single, bin_type_single));
   ASSERT_EQ(ObRbBinType::BITMAP_32, bin_type_single);
   ObRoaringBitmap *rb_roaring_single;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_deserialize(allocator, roaring_bin_single, rb_roaring_single));
@@ -292,7 +292,7 @@ TEST_F(TestRoaringBitmap, to_roaring_bin)
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_serialize(allocator, bin_set, rb));
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::binary_format_convert(allocator, bin_set, roaring_bin_set));
   ObRbBinType bin_type_set;
-  ASSERT_EQ(OB_SUCCESS, ObRbUtils::check_get_bin_type(roaring_bin_set, bin_type_set));
+  ASSERT_EQ(OB_SUCCESS, ObRbUtils::get_bin_type(roaring_bin_set, bin_type_set));
   ASSERT_EQ(ObRbBinType::BITMAP_32, bin_type_set);
   ObRoaringBitmap *rb_roaring_set;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_deserialize(allocator, roaring_bin_set, rb_roaring_set));
@@ -311,7 +311,7 @@ TEST_F(TestRoaringBitmap, to_roaring_bin)
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_serialize(allocator, bin_bitmap, rb));
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::binary_format_convert(allocator, bin_bitmap, roaring_bin_bitmap));
   ObRbBinType bin_type_bitmap;
-  ASSERT_EQ(OB_SUCCESS, ObRbUtils::check_get_bin_type(roaring_bin_bitmap, bin_type_bitmap));
+  ASSERT_EQ(OB_SUCCESS, ObRbUtils::get_bin_type(roaring_bin_bitmap, bin_type_bitmap));
   ASSERT_EQ(ObRbBinType::BITMAP_32, bin_type_bitmap);
   ObRoaringBitmap *rb_roaring_bitmap;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_deserialize(allocator, roaring_bin_bitmap, rb_roaring_bitmap));
@@ -329,7 +329,7 @@ TEST_F(TestRoaringBitmap, to_roaring_bin)
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_serialize(allocator, bin_single64, rb64));
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::binary_format_convert(allocator, bin_single64, roaring_bin_single64));
   ObRbBinType bin_type_single64;
-  ASSERT_EQ(OB_SUCCESS, ObRbUtils::check_get_bin_type(roaring_bin_single64, bin_type_single64));
+  ASSERT_EQ(OB_SUCCESS, ObRbUtils::get_bin_type(roaring_bin_single64, bin_type_single64));
   ASSERT_EQ(ObRbBinType::BITMAP_64, bin_type_single64);
   ObRoaringBitmap *rb_roaring_single64;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_deserialize(allocator, roaring_bin_single64, rb_roaring_single64));
@@ -345,7 +345,7 @@ TEST_F(TestRoaringBitmap, to_roaring_bin)
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_serialize(allocator, bin_set64, rb64));
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::binary_format_convert(allocator, bin_set64, roaring_bin_set64));
   ObRbBinType bin_type_set64;
-  ASSERT_EQ(OB_SUCCESS, ObRbUtils::check_get_bin_type(roaring_bin_set64, bin_type_set64));
+  ASSERT_EQ(OB_SUCCESS, ObRbUtils::get_bin_type(roaring_bin_set64, bin_type_set64));
   ASSERT_EQ(ObRbBinType::BITMAP_64, bin_type_set64);
   ObRoaringBitmap *rb_roaring_set64;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_deserialize(allocator, roaring_bin_set64, rb_roaring_set64));
@@ -364,7 +364,7 @@ TEST_F(TestRoaringBitmap, to_roaring_bin)
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_serialize(allocator, bin_bitmap64, rb64));
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::binary_format_convert(allocator, bin_bitmap64, roaring_bin_bitmap64));
   ObRbBinType bin_type_bitmap64;
-  ASSERT_EQ(OB_SUCCESS, ObRbUtils::check_get_bin_type(roaring_bin_bitmap64, bin_type_bitmap64));
+  ASSERT_EQ(OB_SUCCESS, ObRbUtils::get_bin_type(roaring_bin_bitmap64, bin_type_bitmap64));
   ASSERT_EQ(ObRbBinType::BITMAP_64, bin_type_bitmap64);
   ObRoaringBitmap *rb_roaring_bitmap64;
   ASSERT_EQ(OB_SUCCESS, ObRbUtils::rb_deserialize(allocator, roaring_bin_bitmap64, rb_roaring_bitmap64));

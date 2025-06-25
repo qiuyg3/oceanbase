@@ -181,7 +181,7 @@ struct ObQueryHint {
   ObSEArray<const ObHint*, 8, common::ModulePageAllocator, true> outline_trans_hints_; // tranform hints to generate outline data
   ObSEArray<const ObHint*, 8, common::ModulePageAllocator, true> used_trans_hints_;
   ObSEArray<QbNames, 8, common::ModulePageAllocator, true> stmt_id_map_;	//	stmt id -> qb name list, position is stmt id
-  hash::ObHashMap<ObString, int64_t> qb_name_map_;	// qb name -> stmt id
+  hash::ObHashMap<ObString, int64_t, common::hash::NoPthreadDefendMode> qb_name_map_;	// qb name -> stmt id
   int64_t sel_start_id_;
   int64_t set_start_id_;
   int64_t other_start_id_;
@@ -290,22 +290,25 @@ struct LogTableHint
                     parallel_hint_(NULL),
                     use_das_hint_(NULL),
                     use_column_store_hint_(NULL),
+                    union_merge_hint_(NULL),
                     dynamic_sampling_hint_(NULL),
                     is_ds_hint_conflict_(false) {}
   LogTableHint(const TableItem *table) :  table_(table),
                                           parallel_hint_(NULL),
                                           use_das_hint_(NULL),
                                           use_column_store_hint_(NULL),
+                                          union_merge_hint_(NULL),
                                           dynamic_sampling_hint_(NULL),
                                           is_ds_hint_conflict_(false) {}
   int assign(const LogTableHint &other);
-  int init_index_hints(ObSqlSchemaGuard &schema_guard);
+  int init_index_hints(const ObDMLStmt &stmt, ObSqlSchemaGuard &schema_guard);
   bool is_use_index_hint() const { return !index_hints_.empty() && NULL != index_hints_.at(0)
                                           && index_hints_.at(0)->is_use_index_hint(); }
   bool is_valid() const { return !index_list_.empty() || NULL != parallel_hint_
                                 || NULL != use_das_hint_ || !join_filter_hints_.empty()
                                 || dynamic_sampling_hint_ != NULL
-                                || NULL != use_column_store_hint_; }
+                                || NULL != use_column_store_hint_
+                                || NULL != union_merge_hint_; }
   int get_join_filter_hint(const ObRelIds &left_tables,
                            bool part_join_filter,
                            const ObJoinFilterHint *&hint) const;
@@ -319,7 +322,7 @@ struct LogTableHint
   int get_index_prefix(const uint64_t index_id, int64_t &index_prefix) const;
 
   TO_STRING_KV(K_(table), K_(index_list), K_(index_hints),
-               K_(parallel_hint), K_(use_das_hint),
+               K_(parallel_hint), K_(use_das_hint), K_(union_merge_hint),
                K_(join_filter_hints), K_(left_tables),
                KPC(dynamic_sampling_hint_), K(is_ds_hint_conflict_));
 
@@ -329,6 +332,8 @@ struct LogTableHint
   const ObTableParallelHint *parallel_hint_;
   const ObIndexHint *use_das_hint_;
   const ObIndexHint *use_column_store_hint_;
+  const ObUnionMergeHint *union_merge_hint_;
+  common::ObSEArray<uint64_t, 2, common::ModulePageAllocator, true> union_merge_list_;
   ObSEArray<const ObJoinFilterHint*, 1, common::ModulePageAllocator, true> join_filter_hints_;
   ObSEArray<ObRelIds, 1, common::ModulePageAllocator, true> left_tables_; // left table relids in join filter hint
   const ObTableDynamicSamplingHint *dynamic_sampling_hint_;
@@ -383,6 +388,7 @@ struct LogLeadingHint
                                    ObIArray<LeadingInfo> &leading_infos,
                                    TableItem *table,
                                    ObRelIds &table_set);
+  int try_init_leading_info_for_major_refresh_real_time_mview(const ObDMLStmt &stmt);
 
   TO_STRING_KV(K_(leading_tables),
                K_(leading_infos),
@@ -397,7 +403,7 @@ struct ObLogPlanHint
 {
   ObLogPlanHint() { reset(); }
   void reset();
-  int init_normal_hints(const ObIArray<ObHint*> &normal_hints);
+  int init_normal_hints(const ObIArray<ObHint*> &normal_hints, const ObQueryCtx &query_ctx);
 #ifndef OB_BUILD_SPM
   int init_log_plan_hint(ObSqlSchemaGuard &schema_guard,
                          const ObDMLStmt &stmt,
@@ -412,7 +418,7 @@ struct ObLogPlanHint
                            const ObDMLStmt &stmt,
                            const ObQueryHint &query_hint,
                            const ObIArray<ObHint*> &hints);
-  int init_log_table_hints(ObSqlSchemaGuard &schema_guard);
+  int init_log_table_hints(const ObDMLStmt &stmt, ObSqlSchemaGuard &schema_guard);
   int init_log_join_hints();
   int add_join_filter_hint(const ObDMLStmt &stmt,
                            const ObQueryHint &query_hint,
@@ -426,6 +432,9 @@ struct ObLogPlanHint
   int add_index_hint(const ObDMLStmt &stmt,
                      const ObQueryHint &query_hint,
                      const ObIndexHint &index_hint);
+  int add_union_merge_hint(const ObDMLStmt &stmt,
+                           const ObQueryHint &query_hint,
+                           const ObUnionMergeHint &union_merge_hint);
   int add_join_hint(const ObDMLStmt &stmt,
                     const ObQueryHint &query_hint,
                     const ObJoinHint &join_hint);
@@ -451,14 +460,19 @@ struct ObLogPlanHint
                                      bool config_disable,
                                      JoinFilterPushdownHintInfo& info) const;
   int check_use_das(uint64_t table_id, bool &force_das, bool &force_no_das) const;
+  const ObUnionMergeHint *get_union_merge_hint(uint64_t table_id) const;
   int check_use_column_store(uint64_t table_id, bool &force_column_store, bool &force_no_column_store) const;
   int check_use_skip_scan(uint64_t table_id,  uint64_t index_id,
                           bool &force_skip_scan,
                           bool &force_no_skip_scan) const;
+  int check_scan_direction(const ObQueryCtx &ctx,
+                           uint64_t table_id,
+                           uint64_t index_id,
+                           ObOrderDirection &direction) const;
   const LogJoinHint* get_join_hint(const ObRelIds &join_tables) const;
   const ObIArray<LogJoinHint> &get_join_hints() const { return join_hints_; }
   SetAlgo get_valid_set_algo() const;
-  DistAlgo get_valid_set_dist_algo(int64_t *random_none_idx = NULL) const;
+  uint64_t get_valid_set_dist_algo(int64_t *random_none_idx = NULL) const;
   int check_valid_set_left_branch(const ObSelectStmt *select_stmt,
                                   bool &hint_valid,
                                   bool &need_swap) const;
@@ -470,7 +484,19 @@ struct ObLogPlanHint
   int get_aggregation_info(bool &force_use_hash,
                            bool &force_use_merge,
                            bool &force_part_sort,
-                           bool &force_normal_sort) const;
+                           bool &force_normal_sort,
+                           bool &force_basic,
+                           bool &force_partition_wise,
+                           bool &force_dist_hash,
+                           bool &force_pull_to_local,
+                           bool &force_hash_local) const;
+  int get_aggregation_dop(int64_t &dop) const;
+  int get_distinct_info(bool &force_use_hash,
+                        bool &force_use_merge,
+                        bool &force_basic,
+                        bool &force_partition_wise,
+                        bool &force_dist_hash,
+                        bool &force_hash_local) const;
   int get_valid_pq_subquery_hint(const ObIArray<ObString> &sub_qb_names,
                                     const ObPQSubqueryHint *&explicit_hint,
                                     const ObPQSubqueryHint *&implicit_hint) const;
@@ -482,12 +508,8 @@ struct ObLogPlanHint
 
   bool use_late_material() const { return has_enable_hint(T_USE_LATE_MATERIALIZATION); }
   bool no_use_late_material() const { return has_disable_hint(T_USE_LATE_MATERIALIZATION); }
-  bool use_hash_aggregate() const { return has_enable_hint(T_USE_HASH_AGGREGATE); }
-  bool use_merge_aggregate() const { return has_disable_hint(T_USE_HASH_AGGREGATE); }
   bool pushdown_group_by() const { return has_enable_hint(T_GBY_PUSHDOWN); }
   bool no_pushdown_group_by() const { return has_disable_hint(T_GBY_PUSHDOWN); }
-  bool use_hash_distinct() const { return has_enable_hint(T_USE_HASH_DISTINCT); }
-  bool use_merge_distinct() const { return has_disable_hint(T_USE_HASH_DISTINCT); }
   bool pushdown_distinct() const { return has_enable_hint(T_DISTINCT_PUSHDOWN); }
   bool no_pushdown_distinct() const { return has_disable_hint(T_DISTINCT_PUSHDOWN); }
   bool use_distributed_dml() const { return has_enable_hint(T_USE_DISTRIBUTED_DML); }
@@ -497,7 +519,7 @@ struct ObLogPlanHint
 
   TO_STRING_KV(K_(is_outline_data), K_(join_order),
                K_(table_hints), K_(join_hints),
-               K_(normal_hints), K_(enable_index_prefix));
+               K_(normal_hints), K_(optimizer_features_enable_version));
 
   bool is_outline_data_;
 #ifdef OB_BUILD_SPM
@@ -507,7 +529,7 @@ struct ObLogPlanHint
   common::ObSEArray<LogTableHint, 4, common::ModulePageAllocator, true> table_hints_;
   common::ObSEArray<LogJoinHint, 8, common::ModulePageAllocator, true> join_hints_;
   common::ObSEArray<const ObHint*, 8, common::ModulePageAllocator, true> normal_hints_;
-  bool enable_index_prefix_;
+  uint64_t optimizer_features_enable_version_;
 };
 
 }

@@ -9,13 +9,8 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PubL v2 for more details.
  */
-#include "storage/memtable/mvcc/ob_tx_callback_list.h"
-#include "storage/memtable/mvcc/ob_mvcc_ctx.h"
-#include "share/config/ob_server_config.h"
-#include "storage/memtable/ob_memtable_key.h"
-#include "storage/tx/ob_trans_define.h"
+#include "ob_tx_callback_list.h"
 #include "storage/tx/ob_trans_part_ctx.h"
-#include "storage/tx/ob_tx_stat.h"
 
 namespace oceanbase
 {
@@ -27,6 +22,7 @@ ObTxCallbackList::ObTxCallbackList(ObTransCallbackMgr &callback_mgr, const int16
   : id_(id),
     head_(),
     log_cursor_(&head_),
+    log_epoch_(INT64_MAX),
     parallel_start_pos_(NULL),
     length_(0),
     appended_(0),
@@ -68,7 +64,7 @@ void ObTxCallbackList::reset()
   }
   head_.set_prev(&head_);
   head_.set_next(&head_);
-  log_cursor_ = &head_;
+  set_log_cursor_(&head_);
   checksum_ = 0;
   tmp_checksum_ = 0;
   checksum_scn_ = SCN::min_scn();
@@ -130,17 +126,133 @@ int ObTxCallbackList::append_callback(ObITransCallback *callback,
       int64_t data_size = callback->get_data_size();
       data_size_ += data_size;
       if (repos_lc) {
-        log_cursor_ = get_tail();
+        set_log_cursor_(get_tail());
       }
       if (for_replay) {
         ++logged_;
         logged_data_size_ += data_size;
         ++synced_;
       }
-      // Once callback is appended into callback lists, we can not handle the
-      // error after it. So it should never report the error later. What's more,
-      // after_append also should never return the error.
-      (void)callback->after_append_cb(for_replay);
+
+      // NB: It is important to note that once the callback is successfully
+      // appended to the callback_list, it may have already been logged and
+      // freed, making subsequent access potentially unsafe. Therefore, the
+      // rule for append_callback is that the access is not allowed after a
+      // successful append, while the access is permitted after a failure
+      // append
+    }
+  }
+
+  return ret;
+}
+
+// the semantic of the append_callback is atomic which means the cb is removed
+// and no side effect is taken effects if some unexpected failure has happened.
+int ObTxCallbackList::append_callback(ObITransCallback *head,
+                                      ObITransCallback *tail,
+                                      const int64_t length,
+                                      const bool for_replay,
+                                      const bool parallel_replay,
+                                      const bool serial_final)
+{
+  int ret = OB_SUCCESS;
+  // It is important that we should put the before_append_cb and after_append_cb
+  // into the latch guard otherwise the callback may already paxosed and released
+  // before callback it.
+  LockGuard gaurd(*this, LOCK_MODE::LOCK_APPEND);
+
+  if (OB_ISNULL(head) || OB_ISNULL(tail)) {
+    ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "before_append_cb failed", K(ret));
+  } else {
+    // Step1: prepare the callback append(unsubmitted_cnt for memtable and so on)
+    ObITransCallback *last_succeed_cb = nullptr;
+    int64_t data_size = 0;
+    for (ObITransCallback *cb = head;
+         OB_SUCC(ret) && nullptr != cb;
+         cb = cb->get_next()) {
+      if (OB_FAIL(cb->before_append_cb(for_replay))) {
+        TRANS_LOG(WARN, "before_append_cb failed", K(ret), KPC(cb));
+      } else {
+        data_size += cb->get_data_size();
+        last_succeed_cb = cb;
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+#ifdef ENABLE_DEBUG_LOG
+    } else if (OB_FAIL(memtable_set_injection_error())) {
+      TRANS_LOG(WARN, "memtable injection error", K(ret));
+#endif
+    } else {
+      // Tip1: remember whether to reposition the log cursor
+      const bool repos_lc = !for_replay && (log_cursor_ == &head_);
+
+      // Step2: ensure the append position
+      ObITransCallback *append_pos = NULL;
+      if (!for_replay || parallel_replay || serial_final || !parallel_start_pos_) {
+        append_pos = get_tail();
+      } else {
+        append_pos = parallel_start_pos_->get_prev();
+      }
+
+      // Tip2: for replay, do sanity check: scn is incremental
+      if (for_replay
+          && append_pos != &head_  // the head with scn max
+          && append_pos->get_scn() > head->get_scn()) {
+        ret = OB_ERR_UNEXPECTED;
+        TRANS_LOG(ERROR, "replay callback scn out of order", K(ret), KPC(head), KPC(this));
+#ifdef ENABLE_DEBUG_LOG
+        ob_abort();
+#endif
+      } else {
+
+#ifdef ENABLE_DEBUG_LOG
+        memtable_set_injection_sleep();
+#endif
+        // Step4: start to append
+        append_pos->append(head, tail);
+#ifdef ENABLE_DEBUG_LOG
+        memtable_set_injection_sleep();
+#endif
+
+        // Tip3: start parallel replay while not serial finial, remember the position
+        if (for_replay && parallel_replay && !serial_final && !parallel_start_pos_) {
+          ATOMIC_STORE(&parallel_start_pos_, get_tail());
+        }
+
+        // Step5: reposition the log_cursor if necessary
+        if (repos_lc) {
+          set_log_cursor_(head);
+        }
+
+        // Step6: maintain the callbacklist statistics
+        appended_ += length;
+        ATOMIC_FAA(&length_, length);
+        data_size_ += data_size;
+        if (for_replay) {
+          logged_ += length;
+          synced_ += length;
+          logged_data_size_ += data_size;
+        }
+
+        // NB: It is important to note that once the callback is successfully
+        // appended to the callback_list, it may have already been logged and
+        // freed, making subsequent access potentially unsafe. Therefore, the
+        // rule for append_callback is that the access is not allowed after a
+        // successful append, while the access is permitted after a failure
+        // append
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+      // In order to ensure the atomicity of the interface, we need clear the
+      // side-effects of previous callbacks that have called before_append
+      for (ObITransCallback *cb = head;
+           nullptr != cb && last_succeed_cb != cb->get_prev();
+           cb = cb->get_next()) {
+        (void)cb->after_append_fail_cb(for_replay);
+      }
     }
   }
   return ret;
@@ -165,7 +277,7 @@ int64_t ObTxCallbackList::concat_callbacks(ObTxCallbackList &that)
     length_ += cnt;
     appended_ += cnt;
     if (log_cursor_ == &head_) {
-      log_cursor_ = that_head;
+      set_log_cursor_(that_head);
     }
     { // fake callback removement to pass sanity check when reset
       that.length_ = 0;
@@ -261,10 +373,10 @@ int ObTxCallbackList::callback_(ObITxCallbackFunctor &functor,
             TRANS_LOG(ERROR, "remove callback failed", K(ret), KPC(iter), K(deleted));
           } else {
             if (log_cursor_ == iter) {
-              log_cursor_ = next;
+              set_log_cursor_(next);
             }
             if (parallel_start_pos_ == iter) {
-              parallel_start_pos_ = (next == &head_) ? NULL : next;
+              parallel_start_pos_ = (is_reverse || next == &head_) ? NULL : next;
             }
             ++removed_;
             if (iter->need_submit_log()) {
@@ -349,9 +461,7 @@ int ObTxCallbackList::remove_callbacks_for_remove_memtable(
   // hence, acquire iter_latch is not required actually.
   int ret = OB_SUCCESS;
   LockGuard guard(*this, LOCK_MODE::LOCK_ITERATE);
-  const bool skip_checksum = is_skip_checksum_();
-  const share::SCN right_bound = skip_checksum ? share::SCN::max_scn()
-    : (stop_scn.is_max() ? sync_scn_ : stop_scn);
+  const share::SCN right_bound = stop_scn;
   struct Functor final : public ObRemoveSyncCallbacksWCondFunctor {
     Functor(const bool need_remove_data = true, const bool is_reverse = false)
       : ObRemoveSyncCallbacksWCondFunctor(need_remove_data, is_reverse) {}
@@ -384,7 +494,7 @@ int ObTxCallbackList::remove_callbacks_for_remove_memtable(
   functor.right_bound_ = right_bound;
   functor.memtable_set_ = memtable_set;
 
-  if (!skip_checksum) {
+  if (!is_skip_checksum_()) {
     functor.set_checksumer(checksum_scn_, &batch_checksum_);
   }
 
@@ -520,9 +630,9 @@ int ObTxCallbackList::submit_log_succ(const ObCallbackScope &callbacks)
   if (next == &head_) {
     // next is un-stable, need serialize with append
     LockGuard guard(*this, LOCK_MODE::LOCK_APPEND);
-    ATOMIC_STORE(&log_cursor_, (*callbacks.end_)->get_next());
+    set_log_cursor_((*callbacks.end_)->get_next());
   } else {
-    ATOMIC_STORE(&log_cursor_, next);
+    set_log_cursor_(next);
   }
   ATOMIC_AAF(&logged_, (int64_t)callbacks.cnt_);
   ATOMIC_AAF(&logged_data_size_, callbacks.data_size_);
@@ -689,6 +799,24 @@ int ObTxCallbackList::tx_elr_preparing()
   return ret;
 }
 
+int ObTxCallbackList::tx_elr_revoke()
+{
+  int ret = OB_SUCCESS;
+  struct Functor final : public ObITxCallbackFunctor
+  {
+    int operator()(ObITransCallback *callback) {
+      callback->elr_trans_revoke();
+      return OB_SUCCESS;
+    }
+  } functor;
+  LockGuard guard(*this, LOCK_MODE::LOCK_ALL);
+  if (OB_FAIL(callback_(functor, guard.state_))) {
+    TRANS_LOG(WARN, "trans elr revoke failed", K(ret), K(functor));
+  }
+
+  return ret;
+}
+
 int ObTxCallbackList::tx_print_callback()
 {
   int ret = OB_SUCCESS;
@@ -728,10 +856,21 @@ int ObTxCallbackList::replay_fail(const SCN scn, const bool serial_replay)
   functor.scn_ = scn;
 
   LockGuard guard(*this, LOCK_MODE::LOCK_ALL);
+  //
   // for replay fail of serial log, if parallel replay has happened,
   // must reverse traversal from parallel_start_pos_.prev_
-  ObITransCallback *start_pos = (serial_replay && parallel_start_pos_) ? parallel_start_pos_ : get_guard();
-  ObITransCallback *end_pos = get_guard();
+  //
+  // head_ --> ... -> parallel_start_pos_ -> ... -> head_
+  //
+  ObITransCallback *start_pos = NULL;
+  ObITransCallback *end_pos = NULL;
+  if (serial_replay) {
+    start_pos = parallel_start_pos_ ?: get_guard();
+    end_pos = get_guard();
+  } else {
+    start_pos = get_guard();
+    end_pos = parallel_start_pos_ ? parallel_start_pos_->get_prev() : get_guard();
+  }
   if (OB_FAIL(callback_(functor, start_pos, end_pos, guard.state_))) {
     TRANS_LOG(ERROR, "replay fail failed", K(ret), K(functor));
   } else {
@@ -864,7 +1003,13 @@ bool ObTxCallbackList::check_all_redo_flushed(const bool quite) const
 __attribute__((noinline))
 int64_t ObTxCallbackList::get_log_epoch() const
 {
-  return log_cursor_ == &head_ ? INT64_MAX : log_cursor_->get_epoch();
+  return ATOMIC_LOAD(&log_epoch_);
+}
+
+void ObTxCallbackList::set_log_cursor_(ObITransCallback* log_cursor)
+{
+  ATOMIC_STORE(&log_epoch_, (log_cursor == &head_) ? INT64_MAX : log_cursor->get_epoch());
+  ATOMIC_STORE(&log_cursor_, log_cursor);
 }
 
 void ObTxCallbackList::inc_update_sync_scn(const share::SCN scn)

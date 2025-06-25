@@ -40,6 +40,7 @@ public:
   ObIArray<ObRawExpr *>& get_delete_condition() { return delete_condition_exprs_; }
   const ObIArray<ObRawExpr *>& get_delete_condition() const { return delete_condition_exprs_; }
   virtual int prepare_dml_infos() override;
+  virtual int perform_vector_assign_expr_replacement(ObDelUpdStmt *stmt)override;
 private:
   virtual int generate_normal_raw_plan() override;
   int candi_allocate_merge();
@@ -65,6 +66,7 @@ private:
                                            bool &is_multi_part_dml,
                                            ObIArray<std::pair<ObRawExpr*, ObRawExpr*>> &equal_pairs);
   int check_update_insert_sharding_basic(ObLogicalOperator &top,
+                                         uint64_t table_id,
                                          ObShardingInfo *insert_sharding,
                                          ObShardingInfo *update_sharding,
                                          bool &is_basic,
@@ -72,6 +74,7 @@ private:
   bool match_same_partition(const ObShardingInfo &l_sharding_info,
                             const ObShardingInfo &r_sharding_info);
   int generate_equal_constraint(ObLogicalOperator &top,
+                                uint64_t table_id,
                                 ObShardingInfo &insert_sharding,
                                 bool &can_gen_cons,
                                 ObIArray<std::pair<ObRawExpr*, ObRawExpr*>> &equal_pairs);

@@ -13,15 +13,6 @@
 #define USING_LOG_PREFIX SERVER_OMT
 
 #include "ob_tenant_config.h"
-#include "common/ob_common_utility.h"
-#include "lib/net/ob_net_util.h"
-#include "lib/oblog/ob_log.h"
-#include "share/config/ob_server_config.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/schema/ob_multi_version_schema_service.h"
-#include "observer/ob_server_struct.h"
-#include "observer/omt/ob_tenant_config.h"
-#include "observer/omt/ob_tenant_config_mgr.h"
 #include "sql/monitor/flt/ob_flt_control_info_mgr.h"
 #include "share/errsim_module/ob_errsim_module_interface_imp.h"
 
@@ -67,6 +58,17 @@ void ObTenantConfig::print() const
     }
   }
   OB_LOG(INFO, "===================== * stop tenant config report * =======================", K(tenant_id_));
+}
+
+void ObTenantConfig::trace_all_config() const
+{
+  ObConfigContainer::const_iterator it = container_.begin();
+  for (; it != container_.end(); ++it) {
+    if (OB_ISNULL(it->second)) {
+    } else if (it->second->case_compare(it->second->default_str()) != 0) {
+      OPT_TRACE("  ", it->first.str(), " = ", it->second->str());
+    }
+  }
 }
 
 int ObTenantConfig::read_config()
@@ -296,7 +298,7 @@ int ObTenantConfig::update_local(int64_t expected_version, ObMySQLProxy::MySQLRe
   if (OB_SUCC(ret)) {
     if (OB_FAIL(read_config())) {
       LOG_ERROR("Read tenant config failed", K_(tenant_id), K(ret));
-    } else if (save2file && OB_FAIL(config_mgr_->dump2file())) {
+    } else if (save2file && OB_FAIL(config_mgr_->dump2file_unsafe())) {
       LOG_WARN("Dump to file failed", K(ret));
     } else if (OB_FAIL(publish_special_config_after_dump())) {
       LOG_WARN("publish special config after dump failed", K(tenant_id_), K(ret));
@@ -335,10 +337,11 @@ int ObTenantConfig::publish_special_config_after_dump()
       SHARE_LOG(ERROR, "unexpected data_version", KR(ret), K(old_data_version));
     } else if (value_updated && new_data_version <= old_data_version) {
       LOG_INFO("[COMPATIBLE] [DATA_VERSION] no need to update", K(tenant_id_),
-               K(old_data_version), K(new_data_version));
+               "old_data_version", DVP(old_data_version),
+               "new_data_version", DVP(new_data_version));
       // do nothing
     } else {
-      if (!(*pp_item)->set_value((*pp_item)->spfile_str())) {
+      if (!(*pp_item)->set_value_unsafe((*pp_item)->spfile_str())) {
         ret = OB_INVALID_CONFIG;
         LOG_WARN("Invalid config value", K(tenant_id_), K((*pp_item)->spfile_str()), K(ret));
       } else {
@@ -355,7 +358,7 @@ int ObTenantConfig::publish_special_config_after_dump()
   return ret;
 }
 
-int ObTenantConfig::add_extra_config(const char *config_str,
+int ObTenantConfig::add_extra_config_unsafe(const char *config_str,
                                      int64_t version /* = 0 */ ,
                                      bool check_config /* = true */)
 {
@@ -365,6 +368,7 @@ int ObTenantConfig::add_extra_config(const char *config_str,
   char *buf = NULL;
   char *saveptr = NULL;
   char *token = NULL;
+  const char *delimiter = "|\n";
   if (OB_ISNULL(config_str)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("config str is null", K(ret));
@@ -377,7 +381,11 @@ int ObTenantConfig::add_extra_config(const char *config_str,
   } else {
     MEMCPY(buf, config_str, config_str_length);
     buf[config_str_length] = '\0';
-    token = STRTOK_R(buf, ",\n", &saveptr);
+    token = STRTOK_R(buf, delimiter, &saveptr);
+    if (0 == STRLEN(saveptr)) {
+      delimiter = ",\n";
+      token = STRTOK_R(buf, delimiter, &saveptr);
+    }
     const ObString compatible_cfg(COMPATIBLE);
     const ObString enable_compatible_monotonic_cfg(ENABLE_COMPATIBLE_MONOTONIC);
     while (OB_SUCC(ret) && OB_LIKELY(NULL != token)) {
@@ -461,7 +469,7 @@ int ObTenantConfig::add_extra_config(const char *config_str,
                             K(old_data_version), K(new_data_version));
                 }
               }
-            } else if (!(*pp_item)->set_value(value)) {
+            } else if (!(*pp_item)->set_value_unsafe(value)) {
               ret = OB_INVALID_CONFIG;
               LOG_WARN("Invalid config value", K(name), K(value), K(ret));
             } else if (check_config && (!(*pp_item)->check_unit(value) || !(*pp_item)->check())) {
@@ -483,7 +491,7 @@ int ObTenantConfig::add_extra_config(const char *config_str,
             }
           }
         }
-        token = STRTOK_R(NULL, ",\n", &saveptr);
+        token = STRTOK_R(NULL, delimiter, &saveptr);
       }
     }
   }

@@ -77,6 +77,26 @@ public:
   static bool is_invisible_column(uint64_t flag);
   static bool is_cte_generated_column(uint64_t flag);
   static bool is_default_expr_v2_column(uint64_t flag);
+  static bool is_vec_index_column(const uint64_t flag);
+
+  static bool is_vec_ivf_center_id_column(const uint64_t flag);
+  static bool is_vec_ivf_center_vector_column(const uint64_t flag);
+  static bool is_vec_ivf_data_vector_column(const uint64_t flag);
+  static bool is_vec_ivf_meta_id_column(const uint64_t flag);
+  static bool is_vec_ivf_meta_vector_column(const uint64_t flag);
+  static bool is_vec_ivf_pq_center_id_column(const uint64_t flag);
+  static bool is_vec_ivf_pq_center_ids_column(const uint64_t flag);
+
+  static bool is_vec_hnsw_vid_column(const uint64_t flag);
+  static bool is_vec_hnsw_type_column(const uint64_t flag);
+  static bool is_vec_hnsw_vector_column(const uint64_t flag);
+  static bool is_vec_hnsw_scn_column(const uint64_t flag);
+  static bool is_vec_hnsw_key_column(const uint64_t flag);
+  static bool is_vec_hnsw_data_column(const uint64_t flag);
+  static bool is_vec_spiv_dim_column(const uint64_t flag);
+  static bool is_vec_spiv_value_column(const uint64_t flag);
+  static bool is_vec_spiv_vec_column(const uint64_t flag);
+
   static bool is_fulltext_column(const uint64_t flag);
   static bool is_doc_id_column(const uint64_t flag);
   static bool is_word_segment_column(const uint64_t flag);
@@ -198,6 +218,21 @@ public:
              const int64_t schema_version,
              const bool skip_consensus);
 
+  // Use to check if the column of sys table (exclude core table) does exist
+  // by querying __all_column when the column is not accessible.
+  // (attention: the func contains an inner sql)
+  //
+  // @param[in] tenant_id:  target tenant_id
+  // @param[in] table_id:   sys table_id (exclude core table)
+  // @param[in] column_name:   target column name
+  // @param[out] exist:  whether the column really exists
+  // @return: OB_SUCCESS if success
+  static int check_whether_column_exist(
+      const uint64_t tenant_id,
+      const ObObjectID &table_id,
+      const ObString &column_name,
+      bool &exist);
+
   // Use to check if the sys table (exclude core table) does exist
   // by querying __all_table when the table is not accessible.
   //
@@ -213,6 +248,7 @@ public:
       bool &exist);
 
   static int is_drop_column_only(const schema::AlterTableSchema &alter_table_schema, bool &is_drop_col_only);
+  static int check_build_old_version_column_group(const share::schema::ObTableSchema &table_schema, bool &build_old_version_cg);
 
 private:
   static int get_tenant_variable(schema::ObSchemaGetterGuard &schema_guard,
@@ -364,6 +400,7 @@ public:
     SET_COMMENT = 1,
     CREATE_INDEX = 2,
     CREATE_VIEW = 3,
+    DROP_TABLE = 4,
     MAX_TYPE // can not > 32
   };
 
@@ -375,6 +412,7 @@ public:
   int is_parallel_ddl(const ObParallelDDLType type, bool &is_parallel);
   static int is_parallel_ddl_enable(const ObParallelDDLType ddl_type, const uint64_t tenant_id, bool &is_parallel);
   static int string_to_ddl_type(const ObString &ddl_string, ObParallelDDLType &ddl_type);
+  static int generate_parallel_ddl_control_config_for_create_tenant(ObSqlString &config_value);
 private:
   bool check_mode_valid_(uint8_t mode) { return mode > MASK ? false : true; }
   uint64_t value_;

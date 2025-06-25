@@ -12,16 +12,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/cmd/ob_partition_executor_utils.h"
-#include "share/object/ob_obj_cast.h"
-#include "lib/mysqlclient/ob_mysql_proxy.h"
-#include "share/ob_common_rpc_proxy.h"
-#include "sql/resolver/ddl/ob_create_index_stmt.h"
 #include "sql/engine/ob_exec_context.h"
-#include "sql/engine/ob_physical_plan.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "sql/code_generator/ob_expr_generator_impl.h"
-#include "sql/parser/ob_parser.h"
-#include "sql/ob_sql_utils.h"
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
 #include "sql/resolver/ddl/ob_create_tablegroup_stmt.h"
 
@@ -377,11 +368,7 @@ int ObPartitionExecutorUtils::cast_list_expr_to_obj(
           auto &list_row_values = is_subpart
                                   ? subpartition_array[i]->list_row_values_
                                   : partition_array[i]->list_row_values_;
-          InnerPartListVectorCmp part_list_vector_op;
-          lib::ob_sort(list_row_values.begin(),  list_row_values.end(), part_list_vector_op);
-          if (OB_FAIL(part_list_vector_op.get_ret())) {
-            LOG_WARN("fail to sort list row values", K(ret));
-          }
+          ret = list_row_values.sort_array();
         }
       }
     }
@@ -699,7 +686,7 @@ int ObPartitionExecutorUtils::expr_cal_and_cast(
     const stmt::StmtType &stmt_type,
     bool is_list_part,
     ObExecContext &ctx,
-    const sql::ObExprResType &dst_res_type,
+    const sql::ObRawExprResType &dst_res_type,
     const ObCollationType fun_collation_type,
     ObRawExpr *expr,
     ObObj &value_obj)
@@ -795,7 +782,7 @@ int ObPartitionExecutorUtils::expr_cal_and_cast_with_check_varchar_len(
     const stmt::StmtType &stmt_type,
     bool is_list_part,
     ObExecContext &ctx,
-    const ObExprResType &dst_res_type,
+    const ObRawExprResType &dst_res_type,
     ObRawExpr *expr,
     ObObj &value_obj)
 {
@@ -806,11 +793,14 @@ int ObPartitionExecutorUtils::expr_cal_and_cast_with_check_varchar_len(
   const ObCollationType fun_collation_type = dst_res_type.get_collation_type();
   if (OB_FAIL(ObSQLUtils::wrap_expr_ctx(stmt_type, ctx, ctx.get_allocator(), expr_ctx))) {
     LOG_WARN("Failed to wrap expr ctx", K(ret));
+  } else if (OB_FAIL(ObSQLUtils::get_default_cast_mode(ctx.get_my_session()->get_stmt_type(),
+                                                  ctx.get_my_session(), expr_ctx.cast_mode_))) {
+    LOG_WARN("get_default_cast_mode failed", K(ret));
   } else {
     //CREATE TABLE t1 (a date) PARTITION BY RANGE (TO_DAYS(a)) (PARTITION p311 VALUES LESS THAN (TO_DAYS('abc')))
     //TO_DAYS('abc')跟mysql兼容，不论session中设置的cast_mode是什么，这里都需要为WARN_ON_FAIL
     //因为abc是无效参数，让to_days返回NULL
-    expr_ctx.cast_mode_ = CM_WARN_ON_FAIL; //always set to WARN_ON_FAIL to allow calculate
+    expr_ctx.cast_mode_ |= CM_WARN_ON_FAIL; //always set to WARN_ON_FAIL to allow calculate
     EXPR_SET_CAST_CTX_MODE(expr_ctx);
     ObNewRow tmp_row;
     RowDesc row_desc;
@@ -1205,11 +1195,7 @@ int ObPartitionExecutorUtils::cast_list_expr_to_obj(
             auto &list_row_values = is_subpart
                                     ? subpartition_array[i]->list_row_values_
                                     : partition_array[i]->list_row_values_;
-            InnerPartListVectorCmp part_list_vector_op;
-            lib::ob_sort(list_row_values.begin(), list_row_values.end(), part_list_vector_op);
-            if (OB_FAIL(part_list_vector_op.get_ret())) {
-              LOG_WARN("fail to sort list row values", K(ret));
-            }
+            ret = list_row_values.sort_array();
           }
         }
       }

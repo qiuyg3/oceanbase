@@ -14,7 +14,6 @@
 
 #include "sql/engine/px/datahub/components/ob_dh_range_dist_wf.h"
 #include "sql/engine/px/ob_px_util.h"
-#include "sql/engine/window_function/ob_window_function_op.h"
 #include "sql/engine/window_function/ob_window_function_vec_op.h"
 
 namespace oceanbase
@@ -348,17 +347,11 @@ OB_DEF_SERIALIZE_SIZE(RDWinFuncPXPartialInfo)
   OB_UNIS_ADD_LEN(sqc_id_);
   OB_UNIS_ADD_LEN(thread_id_);
   OB_UNIS_ADD_LEN(row_meta_);
-  int32_t first_row_size = 0, last_row_size = 0;
+  int32_t first_row_size = first_row_ != nullptr ? first_row_->get_row_size() : 0;
+  int32_t last_row_size = last_row_ != nullptr ? last_row_->get_row_size() : 0;
   OB_UNIS_ADD_LEN(first_row_size);
-  if (first_row_ != nullptr) {
-    first_row_size = first_row_->get_row_size();
-  }
   len += first_row_size;
-
   OB_UNIS_ADD_LEN(last_row_size);
-  if (last_row_ != nullptr) {
-    last_row_size = last_row_->get_row_size();
-  }
   len += last_row_size;
   return len;
 }
@@ -394,7 +387,7 @@ OB_DEF_DESERIALIZE(RDWinFuncPXPartialInfo)
 {
   int ret = OB_SUCCESS;
   LST_DO_CODE(OB_UNIS_DECODE, sqc_id_, thread_id_, row_meta_);
-  int64_t row_size = 0;
+  int32_t row_size = 0;
   OB_UNIS_DECODE(row_size);
   void *row_buf = nullptr;
   if (row_size > 0) {
@@ -566,7 +559,7 @@ int RDWinFuncPXPieceMsgCtx::send_whole_msg(common::ObIArray<ObPxSqcMeta *> &sqcs
     if (OB_FAIL(wf->rd_generate_patch(*this, eval_ctx))) {
       LOG_WARN("generate patch failed", K(ret));
     } else {
-      std::sort(infos_.begin(), infos_.end(), __part_info_cmp_op());
+      lib::ob_sort(infos_.begin(), infos_.end(), __part_info_cmp_op());
     }
     RDWinFuncPXWholeMsg *responses = nullptr;
     if (OB_SUCC(ret)) {

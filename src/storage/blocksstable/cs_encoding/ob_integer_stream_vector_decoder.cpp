@@ -13,7 +13,6 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_integer_stream_vector_decoder.h"
-#include "storage/blocksstable/encoding/ob_encoding_query_util.h"
 #include "ob_cs_decoding_util.h"
 #include "storage/blocksstable/encoding/ob_icolumn_decoder.h"
 
@@ -532,6 +531,7 @@ int ObIntegerStreamVecDecoder::decode_vector(
       break;
     }
     case VEC_TC_DATE:
+    case VEC_TC_MYSQL_DATE:
     case VEC_TC_DEC_INT32:
     case VEC_TC_FLOAT: {
       ret = DECODE_VECTOR_(uint32_t);
@@ -539,6 +539,7 @@ int ObIntegerStreamVecDecoder::decode_vector(
     }
     case VEC_TC_INTEGER:
     case VEC_TC_DATETIME:
+    case VEC_TC_MYSQL_DATETIME:
     case VEC_TC_TIME:
     case VEC_TC_UNKNOWN:
     case VEC_TC_INTERVAL_YM:
@@ -548,7 +549,8 @@ int ObIntegerStreamVecDecoder::decode_vector(
     case VEC_TC_BIT:
     case VEC_TC_ENUM_SET:
 
-    case VEC_TC_DOUBLE: {
+    case VEC_TC_DOUBLE:
+    case VEC_TC_FIXED_DOUBLE: {
       ret = DECODE_VECTOR_(uint64_t);
       break;
     }

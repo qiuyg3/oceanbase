@@ -28,6 +28,7 @@ namespace oceanbase
 {
 namespace sql
 {
+class ObOperator;
 
 // 用于统计一段代码的执行时间
 class TimingGuard
@@ -47,7 +48,7 @@ private:
   int64_t begin_;
 };
 
-class ObMonitorNode final : public common::ObDLinkBase<ObMonitorNode>
+class ObMonitorNode
 {
   friend class ObPlanMonitorNodeList;
   typedef common::ObCurTraceId::TraceId TraceId;
@@ -59,6 +60,7 @@ public:
       output_batches_(0),
       skipped_rows_count_(0),
       op_type_(PHY_INVALID),
+      op_(nullptr),
       rt_node_id_(OB_INVALID_ID),
       open_time_(0),
       first_row_time_(0),
@@ -75,23 +77,33 @@ public:
       otherstat_4_value_(0),
       otherstat_5_value_(0),
       otherstat_6_value_(0),
+      otherstat_7_value_(0),
+      otherstat_8_value_(0),
+      otherstat_9_value_(0),
+      otherstat_10_value_(0),
       otherstat_1_id_(0),
       otherstat_2_id_(0),
       otherstat_3_id_(0),
       otherstat_4_id_(0),
       otherstat_5_id_(0),
       otherstat_6_id_(0),
+      otherstat_7_id_(0),
+      otherstat_8_id_(0),
+      otherstat_9_id_(0),
+      otherstat_10_id_(0),
       enable_rich_format_(false),
       workarea_mem_(0),
       workarea_max_mem_(0),
       workarea_tempseg_(0),
-      workarea_max_tempseg_(0)
+      workarea_max_tempseg_(0),
+      plan_hash_value_(common::OB_INVALID_ID)
   {
     TraceId* trace_id = common::ObCurTraceId::get_trace_id();
     if (NULL != trace_id) {
       trace_id_ = *trace_id;
     }
     thread_id_ = GETTID();
+    sql_id_[0] = '\0';
   }
   explicit ObMonitorNode(const ObMonitorNode &that) = default;
   ~ObMonitorNode() = default;
@@ -100,6 +112,7 @@ public:
     *this = that;
     return common::OB_SUCCESS;
   }
+  void set_op(ObOperator *op) { op_ = op; }
   void set_operator_type(ObPhyOperatorType type) { op_type_ = type; }
   void set_operator_id(int64_t op_id) { op_id_ = op_id; }
   void set_tenant_id(int64_t tenant_id) { tenant_id_ = tenant_id; }
@@ -112,10 +125,13 @@ public:
   const TraceId& get_trace_id() const { return trace_id_; }
   int64_t get_thread_id() { return thread_id_; }
   int64_t get_rt_node_id() { return rt_node_id_;}
-  int add_rt_monitor_node(ObMonitorNode *node);
   void set_rich_format(bool v) { enable_rich_format_ = v; }
   void update_memory(int64_t delta_size);
   void update_tempseg(int64_t delta_size);
+  uint64_t calc_db_time();
+  void covert_to_static_node();
+  int set_sql_id(const ObString &sql_id);
+  void set_plan_hash_value(uint64_t plan_hash_value) { plan_hash_value_ = plan_hash_value; }
   TO_STRING_KV(K_(tenant_id), K_(op_id), "op_name", get_operator_name(), K_(thread_id));
 public:
   int64_t tenant_id_;
@@ -124,6 +140,7 @@ public:
   int64_t output_batches_; // for batch
   int64_t skipped_rows_count_; // for batch
   ObPhyOperatorType op_type_;
+  ObOperator *op_;
 private:
   int64_t thread_id_;
   TraceId trace_id_;
@@ -146,17 +163,27 @@ public:
   int64_t otherstat_4_value_;
   int64_t otherstat_5_value_;
   int64_t otherstat_6_value_;
+  int64_t otherstat_7_value_;
+  int64_t otherstat_8_value_;
+  int64_t otherstat_9_value_;
+  int64_t otherstat_10_value_;
   int16_t otherstat_1_id_;
   int16_t otherstat_2_id_;
   int16_t otherstat_3_id_;
   int16_t otherstat_4_id_;
   int16_t otherstat_5_id_;
   int16_t otherstat_6_id_;
+  int16_t otherstat_7_id_;
+  int16_t otherstat_8_id_;
+  int16_t otherstat_9_id_;
+  int16_t otherstat_10_id_;
   bool enable_rich_format_;
   int64_t workarea_mem_;
   int64_t workarea_max_mem_;
   int64_t workarea_tempseg_;
   int64_t workarea_max_tempseg_;
+  char sql_id_[common::OB_MAX_SQL_ID_LENGTH + 1];
+  uint64_t plan_hash_value_;
 };
 
 
@@ -198,8 +225,9 @@ public:
   public:
     ObMonitorNodeTraverseCall(common::ObIArray<ObMonitorNode> &node_array) :
         node_array_(node_array), ret_(OB_SUCCESS) {}
-  int operator() (common::hash::HashMapPair<ObMonitorNodeKey,
-      ObMonitorNode *> &entry);
+    int operator() (common::hash::HashMapPair<ObMonitorNodeKey,
+        ObMonitorNode *> &entry);
+    int recursive_add_node_to_array(ObMonitorNode &node);
     common::ObIArray<ObMonitorNode> &node_array_;
     int ret_;
   };
@@ -270,6 +298,7 @@ public:
 private:
   int init(uint64_t tenant_id, const int64_t tenant_mem_size);
   void destroy();
+  int release_record(int64_t release_cnt, bool is_destroyed = false);
 private:
   common::ObConcurrentFIFOAllocator allocator_;//alloc mem for string buf
   common::ObRaQueue queue_;

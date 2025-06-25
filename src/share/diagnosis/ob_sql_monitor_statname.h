@@ -19,6 +19,8 @@ SQL_MONITOR_STATNAME_DEF(HASH_SLOT_TOTAL_COUNT, sql_monitor_statname::INT, "tota
 SQL_MONITOR_STATNAME_DEF(HASH_BUCKET_COUNT, sql_monitor_statname::INT, "bucket size",  "total hash bucket count")
 SQL_MONITOR_STATNAME_DEF(HASH_NON_EMPTY_BUCKET_COUNT, sql_monitor_statname::INT, "non-empty bucket count", "non-empty hash bucket count")
 SQL_MONITOR_STATNAME_DEF(HASH_ROW_COUNT, sql_monitor_statname::INT, "total row count", "total row count building hash table")
+SQL_MONITOR_STATNAME_DEF(HASH_POPULAR_MAP_SIZE, sql_monitor_statname::INT, "popular hash group item cnt", "size of popular map")
+SQL_MONITOR_STATNAME_DEF(HASH_BY_PASS_AGG_CNT, sql_monitor_statname::INT, "agg row cnt when bypass", "hit count of popular map")
 // DTL
 SQL_MONITOR_STATNAME_DEF(DTL_LOOP_TOTAL_MISS, sql_monitor_statname::INT, "dtl miss count", "the total count of dtl loop miss")
 SQL_MONITOR_STATNAME_DEF(DTL_LOOP_TOTAL_MISS_AFTER_DATA, sql_monitor_statname::INT, "dtl miss count after data", "the total count of dtl loop miss after get data")
@@ -32,10 +34,15 @@ SQL_MONITOR_STATNAME_DEF(JOIN_FILTER_READY_TIMESTAMP, sql_monitor_statname::TIME
 SQL_MONITOR_STATNAME_DEF(JOIN_FILTER_ID, sql_monitor_statname::INT, "filter id", "join filter id in plan")
 SQL_MONITOR_STATNAME_DEF(JOIN_FILTER_LENGTH, sql_monitor_statname::INT, "filter length", "join filter length")
 SQL_MONITOR_STATNAME_DEF(JOIN_FILTER_BIT_SET, sql_monitor_statname::INT, "filter bitset", "join filter bitset")
+SQL_MONITOR_STATNAME_DEF(JOIN_FILTER_BY_BASS_COUNT_BEFORE_READY, sql_monitor_statname::INT, "by-pass row count", "by-pass row count before filter ready")
 
 // PDML
 SQL_MONITOR_STATNAME_DEF(PDML_PARTITION_FLUSH_TIME, sql_monitor_statname::INT, "clock time cost write storage", "total time cost writing data to storage by pdml op")
-SQL_MONITOR_STATNAME_DEF(PDML_PARTITION_FLUSH_COUNT, sql_monitor_statname::INT, "times write to storage", "total times writing data to storage by pdml op")
+SQL_MONITOR_STATNAME_DEF(PDML_GET_ROW_COUNT_FROM_CHILD_OP, sql_monitor_statname::INT, "clock time cost write storage", "total time cost writing data to storage by pdml op")
+SQL_MONITOR_STATNAME_DEF(PDML_WRITE_DAS_BUFF_ROW_COUNT, sql_monitor_statname::INT, "row_count write to das buff", "total row count writing data to das buff by pdml op")
+SQL_MONITOR_STATNAME_DEF(PDML_SKIP_ROW_COUNT, sql_monitor_statname::INT, "the count of skip write", "total row count which is not needed to write to storage by pdml op")
+SQL_MONITOR_STATNAME_DEF(PDML_STORAGE_RETURN_ROW_COUNT, sql_monitor_statname::INT, "row_count storage return", "total write row count storage return to pdml op")
+
 // reshuffle
 SQL_MONITOR_STATNAME_DEF(EXCHANGE_DROP_ROW_COUNT, sql_monitor_statname::INT, "drop row count", "total row dropped by exchange out op for unmatched partition")
 // MONITORING DUMP
@@ -48,19 +55,25 @@ SQL_MONITOR_STATNAME_DEF(MEMORY_DUMP, sql_monitor_statname::CAPACITY, "memory du
 // GI
 SQL_MONITOR_STATNAME_DEF(FILTERED_GRANULE_COUNT, sql_monitor_statname::INT, "filtered granule count", "filtered granule count in GI op")
 SQL_MONITOR_STATNAME_DEF(TOTAL_GRANULE_COUNT, sql_monitor_statname::INT, "total granule count", "total granule count in GI op")
-// sort
+// DDL
+SQL_MONITOR_STATNAME_DEF(DDL_TASK_ID, sql_monitor_statname::INT, "ddl task id", "sort ddl task id")
+// SORT
 SQL_MONITOR_STATNAME_DEF(SORT_SORTED_ROW_COUNT, sql_monitor_statname::INT, "sorted row count", "sorted row count in sort op")
 SQL_MONITOR_STATNAME_DEF(SORT_MERGE_SORT_ROUND, sql_monitor_statname::INT, "merge sort round", "merge sort round in sort op")
 SQL_MONITOR_STATNAME_DEF(SORT_INMEM_SORT_TIME, sql_monitor_statname::INT, "in memory sort time", "time taken by in memory sort")
 SQL_MONITOR_STATNAME_DEF(SORT_DUMP_DATA_TIME, sql_monitor_statname::INT, "sort dump data time", "time taken by dump data")
+SQL_MONITOR_STATNAME_DEF(ROW_COUNT, sql_monitor_statname::INT, "row count", "row count in sort op")
+SQL_MONITOR_STATNAME_DEF(SORT_EXPECTED_ROUND_COUNT, sql_monitor_statname::INT, "expected sort round count", "expected sort round count in sort op")
+SQL_MONITOR_STATNAME_DEF(MERGE_SORT_START_TIME, sql_monitor_statname::INT, "merge sort start time", "merge sort start time")
+SQL_MONITOR_STATNAME_DEF(COMPRESS_TYPE, sql_monitor_statname::INT, "COMPRESS_TYPE", "COMPRESS_TYPE")
 // SSTABLE INSERT
-SQL_MONITOR_STATNAME_DEF(DDL_TASK_ID, sql_monitor_statname::INT, "ddl task id", "sort ddl task id")
 SQL_MONITOR_STATNAME_DEF(SSTABLE_INSERT_ROW_COUNT, sql_monitor_statname::INT, "sstable insert row count", "sstable insert row count")
 SQL_MONITOR_STATNAME_DEF(SSTABLE_INSERT_CG_ROW_COUNT, sql_monitor_statname::INT, "sstable insert cg_row count", "sstable insert cg row count")
 // Table Scan stat
 SQL_MONITOR_STATNAME_DEF(IO_READ_BYTES, sql_monitor_statname::CAPACITY, "total io bytes read from disk", "total io bytes read from storage")
-SQL_MONITOR_STATNAME_DEF(TOTAL_READ_BYTES, sql_monitor_statname::CAPACITY, "total bytes processed by storage", "total bytes processed by storage, including memtable")
-SQL_MONITOR_STATNAME_DEF(TOTAL_READ_ROW_COUNT, sql_monitor_statname::INT, "total rows processed by storage", "total rows processed by storage, including memtable")
+SQL_MONITOR_STATNAME_DEF(SSSTORE_READ_BYTES, sql_monitor_statname::CAPACITY, "total bytes processed by ssstore", "total bytes processed by ssstore")
+SQL_MONITOR_STATNAME_DEF(SSSTORE_READ_ROW_COUNT, sql_monitor_statname::INT, "total rows processed by ssstore", "total rows processed by ssstore")
+SQL_MONITOR_STATNAME_DEF(MEMSTORE_READ_ROW_COUNT, sql_monitor_statname::INT, "total rows processed by memstore", "total rows processed by memstore")
 
 //end
 SQL_MONITOR_STATNAME_DEF(MONITOR_STATNAME_END, sql_monitor_statname::INVALID, "monitor end", "monitor stat name end")

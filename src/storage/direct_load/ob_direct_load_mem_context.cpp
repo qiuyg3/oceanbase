@@ -12,9 +12,10 @@
 
 #define USING_LOG_PREFIX STORAGE
 
-#include "storage/direct_load/ob_direct_load_mem_context.h"
-#include "storage/direct_load/ob_direct_load_mem_loader.h"
+#include "ob_direct_load_mem_context.h"
+#include "src/storage/direct_load/ob_direct_load_mem_worker.h"
 #include "storage/direct_load/ob_direct_load_mem_dump.h"
+#include "observer/table_load/ob_table_load_service.h"
 
 namespace oceanbase
 {
@@ -87,15 +88,26 @@ void ObDirectLoadMemContext::reset()
 {
   table_data_desc_.reset();
   datum_utils_ = nullptr;
-  need_sort_ = false;
-  mem_load_task_count_ = 0;
-  column_count_ = 0;
+  dml_row_handler_ = nullptr;
   file_mgr_ = nullptr;
-  fly_mem_chunk_count_ = 0;
-  finish_compact_count_ = 0;
-  mem_dump_task_count_ = 0;
-  has_error_ = false;
+  table_mgr_ = nullptr;
+  dup_action_ = ObLoadDupActionType::LOAD_INVALID_MODE;
 
+  exe_mode_ = observer::ObTableLoadExeMode::MAX_TYPE;
+  merge_count_per_round_ = 0;
+  max_mem_chunk_count_ = 0;
+  mem_chunk_size_ = 0;
+  heap_table_mem_chunk_size_ = 0;
+
+  total_thread_cnt_ = 0;
+  dump_thread_cnt_ = 0;
+  load_thread_cnt_ = 0;
+
+  finish_load_thread_cnt_ = 0;
+  running_dump_task_cnt_ = 0;
+  fly_mem_chunk_count_ = 0;
+
+  // release mem_loader_queue_
   ObArray<ObDirectLoadMemWorker *> loader_array;
   loader_array.set_tenant_id(MTL_ID());
   mem_loader_queue_.pop_all(loader_array);
@@ -105,37 +117,33 @@ void ObDirectLoadMemContext::reset()
       tmp->~ObDirectLoadMemWorker(); //是由area_allocator分配的，所以不需要free
     }
   }
+  loader_array.reset();
 
-  ObArray<ObDirectLoadExternalMultiPartitionRowChunk *> chunk_array;
-  chunk_array.set_tenant_id(MTL_ID());
-  mem_chunk_queue_.pop_all(chunk_array);
-  for (int64_t i = 0; i < chunk_array.count(); i ++) {
-    ObDirectLoadExternalMultiPartitionRowChunk *chunk = chunk_array.at(i);
-    if (chunk != nullptr) {
-      chunk->~ObDirectLoadExternalMultiPartitionRowChunk();
-      ob_free(chunk);
-    }
-  }
-
+  // release mem_dump_queue_
   int64_t queue_size = mem_dump_queue_.size();
   for (int64_t i = 0; i < queue_size; i ++) {
     void *p = nullptr;
     mem_dump_queue_.pop(p);
     if (p != nullptr) {
-      ObDirectLoadMemDump *mem_dump = (ObDirectLoadMemDump *)p;
+      ObDirectLoadMemDump *mem_dump = static_cast<ObDirectLoadMemDump *>(p);
       mem_dump->~ObDirectLoadMemDump();
       ob_free(mem_dump);
     }
   }
 
-  for (int64_t i = 0; i < tables_.count(); i ++) {
-    ObIDirectLoadPartitionTable *table = tables_.at(i);
-    if (table != nullptr) {
-      table->~ObIDirectLoadPartitionTable(); //table是由allocator_分配的，是area allocator，不用free
-    }
+  // release mem_chunk_queue_
+  ObArray<ObDirectLoadExternalMultiPartitionRowChunk *> chunk_array;
+  chunk_array.set_tenant_id(MTL_ID());
+  mem_chunk_queue_.pop_all(chunk_array);
+  for (int64_t i = 0; i < chunk_array.count(); i ++) {
+    ObDirectLoadExternalMultiPartitionRowChunk *chunk = chunk_array.at(i);
+    release_chunk(chunk);
   }
-  tables_.reset();
-  allocator_.reset();
+  chunk_array.reset();
+
+  tables_handle_.reset();
+
+  has_error_ = false;
 }
 
 ObDirectLoadMemContext::~ObDirectLoadMemContext()
@@ -147,7 +155,7 @@ int ObDirectLoadMemContext::init()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(mem_dump_queue_.init(1024))) {
-    STORAGE_LOG(WARN, "fail to init mem dump queue", KR(ret));
+    LOG_WARN("fail to init mem dump queue", KR(ret));
   }
   return ret;
 }
@@ -155,17 +163,13 @@ int ObDirectLoadMemContext::init()
 int ObDirectLoadMemContext::add_tables_from_table_builder(ObIDirectLoadPartitionTableBuilder &builder)
 {
   int ret = OB_SUCCESS;
-  lib::ObMutexGuard guard(mutex_);
-  ObArray<ObIDirectLoadPartitionTable *> table_array;
-  table_array.set_tenant_id(MTL_ID());
-  if (OB_SUCC(ret)) {
-    if (OB_FAIL(builder.get_tables(table_array, allocator_))) {
-      LOG_WARN("fail to get tables", KR(ret));
-    }
-  }
-  for (int64_t i = 0; OB_SUCC(ret) && i < table_array.count(); i ++) {
-    if (OB_FAIL(tables_.push_back(table_array.at(i)))) {
-      LOG_WARN("fail to push table", KR(ret));
+  ObDirectLoadTableHandleArray tables_handle;
+  if (OB_FAIL(builder.get_tables(tables_handle, table_mgr_))) {
+    LOG_WARN("fail to get tables", KR(ret));
+  } else {
+    lib::ObMutexGuard guard(mutex_);
+    if (OB_FAIL(tables_handle_.add(tables_handle))) {
+      LOG_WARN("fail to add tables", KR(ret));
     }
   }
   return ret;
@@ -175,15 +179,64 @@ int ObDirectLoadMemContext::add_tables_from_table_compactor(
   ObIDirectLoadTabletTableCompactor &compactor)
 {
   int ret = OB_SUCCESS;
-  lib::ObMutexGuard guard(mutex_);
-  ObIDirectLoadPartitionTable *table = nullptr;
-  if (OB_FAIL(compactor.get_table(table, allocator_))) {
+  ObDirectLoadTableHandle table;
+  if (OB_FAIL(compactor.get_table(table, table_mgr_))) {
     LOG_WARN("fail to get table", KR(ret));
-  } else if (OB_FAIL(tables_.push_back(table))) {
-    LOG_WARN("fail to push table", KR(ret));
+  } else {
+    lib::ObMutexGuard guard(mutex_);
+    if (OB_FAIL(tables_handle_.add(table))) {
+      LOG_WARN("fail to push table", KR(ret));
+    }
   }
   return ret;
 }
 
+int ObDirectLoadMemContext::acquire_chunk(ChunkType *&chunk)
+{
+  int ret = OB_SUCCESS;
+  while (fly_mem_chunk_count_ >= max_mem_chunk_count_ && OB_LIKELY(!has_error_)) {
+    usleep(50000);
+  }
+  if (OB_UNLIKELY(has_error_)) {
+    ret = OB_CANCELED;
+  } else {
+    chunk = nullptr;
+    ObMemAttr mem_attr(MTL_ID(), "TLD_MemChunk");
+    int64_t sort_memory = 0;
+    if (exe_mode_ == observer::ObTableLoadExeMode::MAX_TYPE) {
+      sort_memory = mem_chunk_size_;
+    } else if (OB_FAIL(observer::ObTableLoadService::get_sort_memory(sort_memory))) {
+      LOG_WARN("fail to get sort memory", KR(ret));
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(chunk = OB_NEW(ChunkType, mem_attr))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("fail to new ObDirectLoadExternalMultiPartitionRowChunk", KR(ret));
+      } else if (OB_FAIL(chunk->init(MTL_ID(), sort_memory))) {
+        LOG_WARN("fail to init external sort", KR(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+      if (nullptr != chunk) {
+        OB_DELETE(ChunkType, mem_attr, chunk);
+        chunk = nullptr;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ATOMIC_INC(&fly_mem_chunk_count_);
+    }
+  }
+  return ret;
 }
+
+void ObDirectLoadMemContext::release_chunk(ChunkType *chunk)
+{
+  if (chunk != nullptr) {
+    chunk->~ChunkType();
+    ob_free(chunk);
+    ATOMIC_DEC(&fly_mem_chunk_count_);
+  }
 }
+
+} // namespace storage
+} // namespace oceanbase

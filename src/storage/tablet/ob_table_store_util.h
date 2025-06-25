@@ -21,7 +21,10 @@ namespace share
 {
 class SCN;
 }
-
+namespace blocksstable
+{
+class ObSSTable;
+}
 namespace storage
 {
 class ObTabletTableStore;
@@ -35,7 +38,7 @@ class ObSSTableArray
 public:
   friend class ObTabletTableStore;
   ObSSTableArray() : cnt_(0), sstable_array_(nullptr), serialize_table_type_(false), is_inited_(false) {}
-  virtual ~ObSSTableArray() {}
+  virtual ~ObSSTableArray() { reset(); }
 
   void reset();
   int init(
@@ -56,6 +59,7 @@ public:
   // Attention ! should only be called by COSSTable
   int init_empty_array_for_cg(common::ObArenaAllocator &allocator, const int64_t count);
   int add_tables_for_cg(common::ObArenaAllocator &allocator, const ObIArray<ObITable *> &tables);
+  int add_tables_for_cg_without_deep_copy(const ObIArray<ObITable *> &tables);
 
   int64_t get_deep_copy_size() const;
   int deep_copy(char *dst_buf, const int64_t buf_size, int64_t &pos, ObSSTableArray &dst_array) const;
@@ -85,6 +89,10 @@ public:
   TO_STRING_KV(K_(cnt), KP_(sstable_array), K_(serialize_table_type), K_(is_inited));
 private:
   int get_all_tables(ObIArray<ObITable *> &tables) const;
+  // construct major_tables with old sstable array and input tables_array, but filter twin sstable of new_co_major
+  int replace_twin_majors_and_build_new(
+      const ObIArray<ObITable *> &tables_array,
+      ObIArray<ObITable *> &major_tables) const;
   int inc_meta_ref_cnt(bool &inc_success) const;
   int inc_data_ref_cnt(bool &inc_success) const;
   void dec_meta_ref_cnt() const;
@@ -248,6 +256,8 @@ struct ObTableStoreUtil
 
   static bool check_include_by_scn_range(const ObITable &ltable, const ObITable &rtable);
   static bool check_intersect_by_scn_range(const ObITable &ltable, const ObITable &rtable);
+
+  static int check_has_backup_macro_block(const ObITable *table, bool &has_backup_macro);
 };
 
 } // storage

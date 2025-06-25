@@ -193,6 +193,7 @@ struct ColValue
   bool is_json() const { return value_.is_json(); }
   bool is_geometry() const { return value_.is_geometry(); }
   bool is_roaringbitmap() const { return value_.is_roaringbitmap(); }
+  bool is_collection() const { return value_.is_collection_sql_type(); }
   common::ObObjType get_obj_type() const { return value_.get_type(); }
 
   int add_child(ColValue *child) {return children_.add(child);}
@@ -230,7 +231,7 @@ public:
       const ObLogAllDdlOperationSchemaInfo *all_ddl_operation_table_schema_info = NULL) = 0;
   // Parse the column data based on ObTableSchema
   virtual int parse_cols( const ObCDCLobAuxTableSchemaInfo &lob_aux_table_schema_info) = 0;
-  virtual int parse_ext_info_log(ObString &ext_info_log) = 0;
+  virtual int parse_ext_info_log(ObLobId &lob_id, ObString &ext_info_log) = 0;
   int get_cols(
       ColValueList **rowkey_cols,
       ColValueList **new_cols,
@@ -367,7 +368,7 @@ public:
       const ObLogAllDdlOperationSchemaInfo *all_ddl_operation_table_schema_info = NULL);
   // Parse the column data based on ObTableSchema
   int parse_cols(const ObCDCLobAuxTableSchemaInfo &lob_aux_table_schema_info);
-  int parse_ext_info_log(ObString &ext_info_log);
+  int parse_ext_info_log(ObLobId &lob_id, ObString &ext_info_log);
   uint64_t hash(const uint64_t hash) const { return row_key_.murmurhash(hash); }
   void set_table_id(const uint64_t table_id) { table_id_ = table_id; }
   uint64_t get_table_id() const { return table_id_; }
@@ -437,7 +438,7 @@ public:
 
   // Parse the column data based on ObTableSchema
   int parse_cols(const ObCDCLobAuxTableSchemaInfo &lob_aux_table_schema_info);
-  int parse_ext_info_log(ObString &ext_info_log);
+  int parse_ext_info_log(ObLobId &lob_id, ObString &ext_info_log);
   uint64_t hash(const uint64_t hash) const { return rowkey_.murmurhash(hash); }
   uint64_t get_table_id() const { return table_id_; }
   blocksstable::ObDmlRowFlag get_dml_flag() const { return dml_flag_; }
@@ -524,7 +525,7 @@ public:
   bool is_insert() const { return row_.get_dml_flag().is_insert(); }
   bool is_update() const { return row_.get_dml_flag().is_update(); }
   bool is_delete() const { return row_.get_dml_flag().is_delete(); }
-  bool is_put() const { return row_.get_dml_flag().is_delete_insert(); }
+  bool is_put() const { return row_.get_dml_flag().is_upsert(); }
 
   // Parse the column data
   // If obj2str_helper is empty, then no conversion of obj to string
@@ -1343,7 +1344,7 @@ private:
       const int64_t data_len);
 
   int check_dml_redo_node_ready_and_handle_();
-  int handle_unserved_trans_();
+  int handle_unserved_trans_(bool &can_be_reverted);
   void set_unserved_() { serve_state_ = UNSERVED; }
   bool is_data_ready() const { return ATOMIC_LOAD(&is_data_ready_); }
 
@@ -1356,7 +1357,18 @@ private:
       const MultiDataSourceNode &multi_data_source_node,
       ObCDCTabletChangeInfo &tablet_change_info);
 
+  int treeify_redo_list_(); // try to convert sorted_redo_list and fetched_log_entry_arr to tree
+  int untreeify_redo_list_(); // try to convert sorted_redo_list and fetched_log_entry_arr to list
+
 private:
+
+  // allocator used to alloc:
+  // LogEntryNode/RollbackNode
+  // DdlRedoLogNode/DmlRedoLogNode/mutator_row_data
+  // trace_id/trace_info/part_trans_info_str_/participant_
+  // MutatorRow(DDL)/DdlStmtTask
+  ObSmallArena            allocator_;
+  ObLfFIFOAllocator       log_entry_task_base_allocator_;
   ServedState             serve_state_;
   // trans basic info
   uint64_t                cluster_id_;            // cluster ID
@@ -1437,14 +1449,6 @@ private:
   int64_t                 output_br_count_by_turn_; // sorted br count in each statistic round
 
   ObArray<TICUpdateInfo>  tic_update_infos_; // table id cache update info
-
-  // allocator used to alloc:
-  // LogEntryNode/RollbackNode
-  // DdlRedoLogNode/DmlRedoLogNode/mutator_row_data
-  // trace_id/trace_info/part_trans_info_str_/participant_
-  // MutatorRow(DDL)/DdlStmtTask
-  ObSmallArena            allocator_;
-  ObLfFIFOAllocator       log_entry_task_base_allocator_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(PartTransTask);

@@ -53,7 +53,8 @@ const int64_t LINKED_MACRO_BLOCK_HEADER_MAGIC = 1019;
 
 const int64_t MICRO_BLOCK_HEADER_VERSION_1 = 1;
 const int64_t MICRO_BLOCK_HEADER_VERSION_2 = 2;
-const int64_t MICRO_BLOCK_HEADER_VERSION = MICRO_BLOCK_HEADER_VERSION_2;
+const int64_t MICRO_BLOCK_HEADER_VERSION_3 = 3;
+const int64_t MICRO_BLOCK_HEADER_VERSION = MICRO_BLOCK_HEADER_VERSION_3;
 const int64_t LINKED_MACRO_BLOCK_HEADER_VERSION = 1;
 const int64_t BF_MACRO_BLOCK_HEADER_VERSION = 1;
 const int64_t BF_MICRO_BLOCK_HEADER_VERSION = 1;
@@ -222,6 +223,7 @@ struct ObColumnHeader
     HAS_EXTEND_VALUE = 0x2,
     BIT_PACKING = 0x4,
     LAST_VAR_FIELD = 0x8,
+    IS_TRANS_VERSION = 0x10,
     MAX_ATTRIBUTE,
   };
   static constexpr int8_t OB_COLUMN_HEADER_V1 = 0;
@@ -462,6 +464,9 @@ struct ObMicroBlockEncodingCtx
   common::ObRowStoreType row_store_type_;
   bool need_calc_column_chksum_;
   ObCompressorType compressor_type_;
+  uint64_t encoding_granularity_;
+  uint64_t minimum_rows_;
+  share::schema::ObSemiStructEncodingType semistruct_encoding_type_;
 
   ObMicroBlockEncodingCtx() : macro_block_size_(0), micro_block_size_(0),
     rowkey_column_cnt_(0), column_cnt_(0), col_descs_(nullptr),
@@ -470,16 +475,19 @@ struct ObMicroBlockEncodingCtx
     previous_encodings_(), previous_cs_encoding_(),
     column_encodings_(nullptr), major_working_cluster_version_(0),
     row_store_type_(ENCODING_ROW_STORE), need_calc_column_chksum_(false),
-    compressor_type_(INVALID_COMPRESSOR)
+    compressor_type_(INVALID_COMPRESSOR), encoding_granularity_(UINT64_MAX),
+    minimum_rows_(1),
+    semistruct_encoding_type_()
   {
     previous_encodings_.set_attr(ObMemAttr(MTL_ID(), "MicroEncodeCtx"));
   }
   bool is_valid() const;
+  bool is_enable_semistruct_encoding() const { return semistruct_encoding_type_.is_enable_semistruct_encoding();}
   TO_STRING_KV(K_(macro_block_size), K_(micro_block_size), K_(rowkey_column_cnt),
       K_(column_cnt), KP_(col_descs), K_(estimate_block_size), K_(real_block_size),
       K_(micro_block_cnt), K_(encoder_opt), K_(previous_encodings), KP_(column_encodings),
       K_(major_working_cluster_version), K_(row_store_type), K_(need_calc_column_chksum),
-      K_(compressor_type));
+      K_(compressor_type), K_(encoding_granularity), K_(minimum_rows), K_(semistruct_encoding_type));
 };
 
 template <typename T, int64_t MAX_COUNT, int64_t BLOCK_SIZE>
@@ -744,7 +752,8 @@ public:
 
   OB_INLINE bool is_valid() const
   {
-    return column_cnt_ > 0 && rowkey_cnt_ >= 0;
+    return column_cnt_ > 0 && rowkey_cnt_ >= 0
+      && ObColClusterInfoMask::is_valid_offset_type((ObColClusterInfoMask::BYTES_LEN)offset_type_);
   }
 
   static const int64_t ROW_HEADER_VERSION_1 = 0;
@@ -970,7 +979,8 @@ public:
                K_(sweep_cost_time),
                KTIME_(start_time),
                KTIME_(last_end_time),
-               K_(hold_info));
+               K_(hold_info),
+               K_(mark_finished));
 public:
   int64_t total_block_count_;
   int64_t reserved_block_count_;
@@ -991,6 +1001,7 @@ public:
   int64_t start_time_;
   int64_t last_end_time_;
   ObSimpleMacroBlockInfo hold_info_;
+  bool mark_finished_;
 };
 
 /****************************** following codes are inline functions ****************************/
@@ -1093,7 +1104,6 @@ public:
   int64_t master_key_id_;
   const char *encrypt_key_;
 };
-
 }//end namespace blocksstable
 }//end namespace oceanbase
 #endif

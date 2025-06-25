@@ -16,16 +16,8 @@
 #define private public
 #define UNITTEST
 
-#include <vector>
-#include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
-#include "storage/tx/ob_trans_ctx_mgr.h"
 #include "storage/tx/ob_trans_part_ctx.h"
-#include "storage/tx_table/ob_tx_ctx_memtable_mgr.h"
-#include "storage/tx/ob_tx_log_adapter.h"
-#include "storage/checkpoint/ob_data_checkpoint.h"
 #include "storage/mock_ob_log_handler.h"
-#include "storage/ls/ob_ls_tx_service.h"
-#include "storage/ls/ob_ls.h"
 #include "logservice/ob_log_handler.h"
 
 namespace oceanbase
@@ -139,7 +131,7 @@ protected:
                                   ls_id_,
                                   &ls_.tx_table_,
                                   ls_.get_lock_table(),
-                                  (ObITsMgr *)(0x01),
+                                  (ObTsMgr *)(0x01),
                                   MTL(transaction::ObTransService*),
                                   &palf_param,
                                   nullptr));
@@ -148,7 +140,7 @@ protected:
                                   ls_id_,
                                   &ls_.tx_table_,
                                   ls_.get_lock_table(),
-                                  (ObITsMgr *)(0x01),
+                                  (ObTsMgr *)(0x01),
                                   MTL(transaction::ObTransService*),
                                   &palf_param,
                                   nullptr));
@@ -202,7 +194,8 @@ int64_t TestTxCtxTable::ref_count_;
 TEST_F(TestTxCtxTable, test_tx_ctx_memtable_mgr)
 {
   EXPECT_EQ(0, TestTxCtxTable::ref_count_);
-  EXPECT_EQ(OB_SUCCESS, mt_mgr_->create_memtable(CreateMemtableArg(0, SCN::min_scn(), SCN::min_scn(), false, false)));
+  CreateMemtableArg arg;
+  EXPECT_EQ(OB_SUCCESS, mt_mgr_->create_memtable(arg));
 
   EXPECT_EQ(1, TestTxCtxTable::ref_count_);
 
@@ -326,7 +319,7 @@ TEST_F(TestTxCtxTable, test_tx_ctx_memtable_mgr)
                                           TestTxCtxTable::ls_id_,
                                           &ls_.tx_table_,
                                           &ls_.lock_table_,
-                                          (ObITsMgr *)(0x01),
+                                          (ObTsMgr *)(0x01),
                                           MTL(transaction::ObTransService*),
                                           &palf_param,
                                           nullptr));
@@ -406,7 +399,7 @@ int ObLSTxCtxMgr::init(const int64_t tenant_id,
                        const ObLSID &ls_id,
                        ObTxTable *tx_table,
                        ObLockTable *lock_table,
-                       ObITsMgr *ts_mgr,
+                       ObTsMgr *ts_mgr,
                        ObTransService *txs,
                        ObITxLogParam *param,
                        ObITxLogAdapter *log_adapter)
@@ -466,7 +459,7 @@ int main(int argc, char **argv)
 {
   system("rm -rf test_tx_ctx_table.log*");
   OB_LOGGER.set_file_name("test_tx_ctx_table.log");
-  OB_LOGGER.set_log_level("INFO");
+  OB_LOGGER.set_log_level("DEBUG");
   STORAGE_LOG(INFO, "begin unittest: test tx ctx table");
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
